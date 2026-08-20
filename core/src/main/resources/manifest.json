@@ -1,0 +1,32 @@
+{
+    "Group": "dev.hynergy",
+    "Name": "core",
+    "Version": "0.0.1-dev",
+    "Description": "# Hynergy\n\nHynergy is a mod for Hytale. It adds energy networks to the game world.\n\n## Status\n\nHynergy is in early development. The engine design is complete. The\nimplementation is not.",
+    "Authors": [
+        {
+            "Name": "Seyager"
+        },
+        {
+            "Name": "Matrix848"
+        },
+        {
+            "Name": "Blovien"
+        },
+        {
+            "Name": "RikuTatsu"
+        }
+    ],
+    "Website": "https://hynergy.dev",
+    "ServerVersion": ">=0.6.0-pre.12.2 <0.7.0",
+    "Dependencies": {
+        "Hytale:AssetModule": "*"
+    },
+    "OptionalDependencies": {},
+    "DisabledByDefault": false,
+    "Main": "dev.hynergy.HynergyPlugin",
+    "IncludesAssetPack": true,
+    "UpdateChecker": {
+        "CurseForge": ""
+    }
+}

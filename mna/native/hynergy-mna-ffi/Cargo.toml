@@ -1,0 +1,10 @@
+[package]
+name = "hynergy-mna-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "hynergy_mna"
+crate-type = ["cdylib"]
+
+[dependencies]
