@@ -5,9 +5,17 @@ plugins {
 
 group = property("group").toString()
 
+val mnaProject = rootProject.project(":mna")
+
 tasks.named<Jar>("jar") {
   archiveBaseName.set(project.property("mod_name").toString())
   archiveVersion.set(project.property("version").toString())
+  duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+  // Bundle MNA into the mod artifact so its FFI classes and platform natives
+  // share the plugin classloader instead of relying on a separately installed
+  // library JAR.
+  from(mnaProject.tasks.named<Jar>("jar").map { zipTree(it.archiveFile) })
 }
 
 java {
@@ -22,7 +30,7 @@ hytaleTools {
     modId = "core"
     modDescription = property("mod_description").toString()
     modUrl = property("mod_url").toString()
-    mainClass = "dev.hynergy.CoreMod"
+    mainClass = "dev.hynergy.HynergyPlugin"
     modCredits = property("mod_author").toString()
     manifestDependencies = property("manifest_dependencies").toString()
     manifestOptionalDependencies = property("manifest_opt_dependencies").toString()
@@ -36,4 +44,8 @@ hytaleTools {
 
 repositories {
     mavenCentral()
+}
+
+dependencies {
+    implementation(project(":mna"))
 }

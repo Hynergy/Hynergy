@@ -12,3 +12,4 @@ run/
 .vscode
 mna/native/target/
 *target/
+core/src/main/resources/manifest.json
