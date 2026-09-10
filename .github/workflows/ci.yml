@@ -22,10 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v4
+        uses: gradle/actions/wrapper-validation@v6
 
   rust:
     name: Rust checks
@@ -36,7 +36,7 @@ jobs:
         working-directory: mna/native
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -64,7 +64,7 @@ jobs:
           - macos-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set up Java 26
         uses: actions/setup-java@v5
@@ -84,7 +84,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Run MNA integration tests
         shell: bash
@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set up Java 26
         uses: actions/setup-java@v5
@@ -114,7 +114,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Build repository
         run: ./gradlew build --stacktrace
