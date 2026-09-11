@@ -37,4 +37,8 @@ impl Engine {
         self.definition_registry.register(id, definition)?;
         Ok(())
     }
+
+    pub fn new_world(&mut self) {
+        self.universe.push(World::new())
+    }
 }
