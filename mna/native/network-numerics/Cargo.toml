@@ -1,0 +1,11 @@
+[package]
+name = "network-numerics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+network-ir = { path = "../network-ir" }
+thiserror = "2.0.20"
+
+[dev-dependencies]
+approx = "0.5.1"

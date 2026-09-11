@@ -1,0 +1,10 @@
+[package]
+name = "network-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+network-model = { path = "../network-model" }
+slab = "0.4.12"
+smallvec = "1.16.0"
+thiserror = "2.0.20"
