@@ -1,11 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-    "hynergy-mna-ffi",
-    "hynergy-engine",
-    "hynergy-model",
-    "hynergy-protocol",
-]
+members = ["hynergy-mna-ffi", "hynergy-engine", "hynergy-model", "hynergy-protocol", "hynergy-ids", ]
 
 [workspace.package]
 version = "0.0.1-dev"

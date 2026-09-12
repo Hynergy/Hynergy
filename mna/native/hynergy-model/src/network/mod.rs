@@ -6,11 +6,11 @@ mod wires;
 
 pub use connection::ConnectionType;
 
-use self::connection::ConnectionRef;
-use self::slot::{AttachTerminalError, DeviceSlot, WireSlot};
 use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
-use crate::ids::define_non_zero_id;
+use crate::network::connection::ConnectionRef;
+use crate::network::slot::{AttachTerminalError, DeviceSlot, WireSlot};
 use crate::parameter::{ParameterConstraintError, ParameterId};
+use hynergy_ids::define_non_zero_id;
 use std::num::NonZeroU32;
 use thiserror::Error;
 

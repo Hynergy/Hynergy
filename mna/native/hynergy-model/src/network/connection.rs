@@ -1,5 +1,5 @@
-use super::WireId;
 use crate::device::definition::{DeviceId, TerminalId};
+use crate::network::WireId;
 use std::num::{NonZeroU32, NonZeroU64};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

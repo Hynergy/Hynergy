@@ -1,6 +1,6 @@
 use crate::circuit::{Circuit, NodeId};
-use crate::ids::{define_id, define_non_zero_id};
 use crate::parameter::ParameterConstraints;
+use hynergy_ids::{define_id, define_non_zero_id};
 use smallvec::SmallVec;
 use std::num::NonZeroU32;
 

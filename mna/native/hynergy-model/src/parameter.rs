@@ -1,4 +1,4 @@
-use crate::ids::define_id;
+use hynergy_ids::define_id;
 use thiserror::Error;
 
 define_id!(ParameterId);

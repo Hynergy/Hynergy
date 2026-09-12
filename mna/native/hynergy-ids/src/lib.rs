@@ -1,16 +1,17 @@
+#[macro_export]
 macro_rules! define_id {
     ($($name:ident $(: $ty:ty)?),* $(,)?) => {
         $(
-            define_id!(@one $name $(: $ty)?);
+            $crate::define_id!(@one $name $(: $ty)?);
         )*
     };
 
     (@one $name:ident : $ty:ty) => {
-        define_id!(@impl $name, $ty);
+        $crate::define_id!(@impl $name, $ty);
     };
 
     (@one $name:ident) => {
-        define_id!(@impl $name, u32);
+        $crate::define_id!(@impl $name, u32);
     };
 
     (@impl $name:ident, $ty:ty) => {
@@ -43,21 +44,20 @@ macro_rules! define_id {
     };
 }
 
-pub(crate) use define_id;
-
+#[macro_export]
 macro_rules! define_non_zero_id {
     ($($name:ident $(: $ty:ty)?),* $(,)?) => {
         $(
-            define_non_zero_id!(@one $name $(: $ty)?);
+            $crate::define_non_zero_id!(@one $name $(: $ty)?);
         )*
     };
 
     (@one $name:ident : $ty:ty) => {
-        define_non_zero_id!(@impl $name, $ty);
+        $crate::define_non_zero_id!(@impl $name, $ty);
     };
 
     (@one $name:ident) => {
-        define_non_zero_id!(@impl $name, std::num::NonZeroU32);
+        $crate::define_non_zero_id!(@impl $name, std::num::NonZeroU32);
     };
 
     (@impl $name:ident, $ty:ty) => {
@@ -90,5 +90,3 @@ macro_rules! define_non_zero_id {
         }
     };
 }
-
-pub(crate) use define_non_zero_id;

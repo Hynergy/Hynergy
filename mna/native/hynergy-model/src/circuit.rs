@@ -1,6 +1,6 @@
 use crate::device::definition::DefinitionId;
-use crate::ids::define_id;
 use crate::parameter::ParameterId;
+use hynergy_ids::define_id;
 use smallvec::SmallVec;
 
 define_id!(NodeId, ElementId);

@@ -10,6 +10,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hynergy-ids"
+version = "0.0.1-dev"
+
+[[package]]
 name = "hynergy-mna-ffi"
 version = "0.0.1-dev"
 dependencies = [
@@ -21,6 +25,7 @@ dependencies = [
 name = "hynergy-model"
 version = "0.0.1-dev"
 dependencies = [
+ "hynergy-ids",
  "smallvec",
  "thiserror",
 ]

@@ -1,5 +1,3 @@
-mod ids;
-
 pub mod circuit;
 pub mod device {
     pub mod builder;

@@ -1,3 +1,5 @@
+pub mod topology;
+
 use hynergy_model::device::definition::{DefinitionId, DeviceDefinition};
 use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
 use hynergy_model::network::Network;
