@@ -1,5 +1,6 @@
 pub mod topology;
 
+use crate::topology::DerivedTopology;
 use hynergy_model::device::definition::{DefinitionId, DeviceDefinition};
 use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
 use hynergy_model::network::Network;
@@ -49,4 +50,5 @@ impl Engine {
 #[derive(Debug, Default, Clone)]
 pub struct World {
     _network: Network,
+    _derived_topology: DerivedTopology,
 }

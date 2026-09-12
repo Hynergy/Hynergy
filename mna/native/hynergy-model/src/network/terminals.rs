@@ -46,7 +46,9 @@ impl Network {
         Ok(())
     }
 
-    pub fn connect_terminals(
+    #[deprecated]
+    #[allow(unused)]
+    fn connect_terminals(
         &mut self,
         device_a: DeviceId,
         terminal_a: TerminalId,
@@ -133,7 +135,9 @@ impl Network {
         Ok(())
     }
 
-    pub fn disconnect_terminals(
+    #[deprecated]
+    #[allow(unused)]
+    fn disconnect_terminals(
         &mut self,
         device_a: DeviceId,
         terminal_a: TerminalId,

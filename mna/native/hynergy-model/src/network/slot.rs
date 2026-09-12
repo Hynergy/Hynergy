@@ -10,7 +10,7 @@ pub(super) enum AttachTerminalError {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct DeviceSlot {
+pub struct DeviceSlot {
     definition_id: DefinitionId,
     terminals: SmallVec<[Option<ConnectionRef>; 4]>,
     parameters: SmallVec<[Option<f64>; 1]>,
@@ -61,19 +61,19 @@ impl DeviceSlot {
     }
 
     #[inline]
-    pub(super) fn terminals(&self) -> &[Option<ConnectionRef>] {
+    pub fn terminals(&self) -> &[Option<ConnectionRef>] {
         &self.terminals
     }
 
     #[inline]
     #[cfg(test)]
-    pub(super) fn parameters(&self) -> &[Option<f64>] {
+    pub fn parameters(&self) -> &[Option<f64>] {
         &self.parameters
     }
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct WireSlot(SmallVec<[ConnectionRef; 2]>);
+pub struct WireSlot(SmallVec<[ConnectionRef; 2]>);
 
 impl WireSlot {
     #[inline]

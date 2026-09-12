@@ -4,10 +4,10 @@ mod slot;
 mod terminals;
 mod wires;
 
+pub use connection::ConnectionRef;
 pub use connection::ConnectionType;
 
 use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
-use crate::network::connection::ConnectionRef;
 use crate::network::slot::{AttachTerminalError, DeviceSlot, WireSlot};
 use crate::parameter::{ParameterConstraintError, ParameterId};
 use hynergy_ids::define_non_zero_id;
@@ -159,6 +159,16 @@ impl Network {
                 device.detach_terminal(terminal);
             }
         }
+    }
+
+    #[inline]
+    pub fn wires(&self) -> &[Option<WireSlot>] {
+        &self.wires
+    }
+
+    #[inline]
+    pub fn devices(&self) -> &[Option<DeviceSlot>] {
+        &self.devices
     }
 }
 

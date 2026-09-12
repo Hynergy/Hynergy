@@ -2,18 +2,18 @@ use crate::device::definition::{DeviceId, TerminalId};
 use crate::network::WireId;
 use std::num::{NonZeroU32, NonZeroU64};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConnectionType {
     Wire,
     Device,
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct ConnectionRef(NonZeroU64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectionRef(NonZeroU64);
 
 impl ConnectionRef {
-    pub(super) const TYPE_BIT: u32 = 1 << 31;
+    pub const TYPE_BIT: u32 = 1 << 31;
     const PORT_MASK: u32 = Self::TYPE_BIT - 1;
 
     #[inline]
