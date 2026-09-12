@@ -2,10 +2,9 @@ use crate::circuit::{Circuit, NodeId};
 use crate::parameter::ParameterConstraints;
 use hynergy_ids::{define_id, define_non_zero_id};
 use smallvec::SmallVec;
-use std::num::NonZeroU32;
 
 define_id!(TerminalId);
-define_non_zero_id!(DefinitionId: NonZeroU32, DeviceId);
+define_non_zero_id!(DefinitionId, DeviceId);
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,7 +20,7 @@ pub enum PrimitiveElementKind {
 impl From<PrimitiveElementKind> for DefinitionId {
     fn from(kind: PrimitiveElementKind) -> Self {
         let raw = kind as u32 + 1;
-        DefinitionId::new(NonZeroU32::new(raw).expect("primitive definition IDs start at one"))
+        DefinitionId::try_from(raw).expect("primitive definition IDs start at one")
     }
 }
 

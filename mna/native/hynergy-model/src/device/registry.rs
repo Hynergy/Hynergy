@@ -1,7 +1,6 @@
 use crate::circuit::NodeId;
 use crate::device::definition::{DefinitionId, DeviceBody, DeviceDefinition, PrimitiveElementKind};
 use crate::parameter::{Bound, ParameterConstraints};
-use std::num::NonZeroU32;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,9 +106,8 @@ impl DefinitionRegistry {
             .ok_or(RegisterDeviceError::DefinitionIdExhausted)?;
 
         let raw = u32::try_from(next).map_err(|_| RegisterDeviceError::DefinitionIdExhausted)?;
-        let id = DefinitionId::new(
-            NonZeroU32::new(raw).ok_or(RegisterDeviceError::DefinitionIdExhausted)?,
-        );
+        let id =
+            DefinitionId::try_from(raw).map_err(|_| RegisterDeviceError::DefinitionIdExhausted)?;
 
         match definition.body() {
             DeviceBody::Primitive(kind) => {
@@ -171,7 +169,7 @@ mod tests {
         ];
 
         for (kind, raw) in expected {
-            assert_eq!(DefinitionId::from(kind).id().get(), raw);
+            assert_eq!(DefinitionId::from(kind).get(), raw);
         }
     }
 

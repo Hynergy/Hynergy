@@ -168,10 +168,9 @@ mod tests {
     use crate::device::definition::{DefinitionId, DeviceId, PrimitiveElementKind, TerminalId};
     use crate::device::registry::DefinitionRegistry;
     use crate::parameter::{ParameterConstraintError, ParameterId};
-    use std::num::NonZeroU32;
 
     fn device_id(raw: u32) -> DeviceId {
-        DeviceId::new(NonZeroU32::new(raw).unwrap())
+        DeviceId::try_from(raw).unwrap()
     }
 
     #[test]

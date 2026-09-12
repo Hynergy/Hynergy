@@ -4,7 +4,6 @@ use hynergy_model::device::builder::{DeviceDefinitionBuilder, DeviceDefinitionBu
 use hynergy_model::device::definition::{DefinitionId, DeviceDefinition};
 use hynergy_model::device::registry::RegisterDeviceError;
 use hynergy_model::parameter::{Bound, ParameterConstraints, ParameterId};
-use std::num::NonZeroU32;
 
 pub const DEFINITION_BUFFER_VERSION: u16 = 1;
 pub const DEFINITION_BUFFER_MAGIC: [u8; 4] = *b"HYDF";
@@ -252,8 +251,7 @@ fn decode_element(decoder: &mut Decoder<'_>) -> Result<Element, DefinitionRegist
         ));
     }
 
-    let device =
-        DefinitionId::new(NonZeroU32::new(id).expect("definition ID was validated as non-zero"));
+    let device = DefinitionId::try_from(id).expect("definition ID was validated as non-zero");
 
     let terminal_count_offset = decoder.offset();
     let terminal_count = decoder.read_u32()? as usize;
@@ -669,9 +667,7 @@ mod tests {
 
         let definition = engine
             .definitions()
-            .get(DefinitionId::new(
-                NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
-            ))
+            .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
             .unwrap();
         assert_eq!(definition.terminals().len(), 0);
         assert_eq!(definition.parameters().len(), 0);
@@ -702,9 +698,7 @@ mod tests {
 
         let definition = engine
             .definitions()
-            .get(DefinitionId::new(
-                NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
-            ))
+            .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
             .unwrap();
         assert_eq!(definition.terminals().len(), 2);
         assert_eq!(definition.parameters().len(), 1);
@@ -908,9 +902,7 @@ mod tests {
         assert!(
             engine
                 .definitions()
-                .get(DefinitionId::new(
-                    NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
-                ))
+                .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE,).unwrap())
                 .is_none()
         );
     }
@@ -948,9 +940,7 @@ mod tests {
             assert!(
                 engine
                     .definitions()
-                    .get(DefinitionId::new(
-                        NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
-                    ))
+                    .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
                     .is_none()
             );
         }
