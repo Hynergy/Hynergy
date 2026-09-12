@@ -8,5 +8,5 @@ name = "hynergy_mna"
 crate-type = ["cdylib"]
 
 [dependencies]
-network-engine = { path = "../network-engine" }
-network-protocol = { path = "../network-protocol" }
+hynergy-engine = { path = "../hynergy-engine" }
+hynergy-protocol = { path = "../hynergy-protocol" }

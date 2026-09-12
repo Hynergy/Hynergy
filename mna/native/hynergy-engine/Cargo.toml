@@ -1,0 +1,7 @@
+[package]
+name = "hynergy-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hynergy-model = { path = "../hynergy-model" }

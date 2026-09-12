@@ -1,8 +1,6 @@
-use crate::world::World;
-use network_model::devices::registry::DefinitionRegistry;
-use network_model::devices::{DefinitionId, DeviceDefinition, RegisterDeviceError};
-
-pub mod world;
+use hynergy_model::device::definition::{DefinitionId, DeviceDefinition};
+use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
+use hynergy_model::network::Network;
 
 pub struct Engine {
     definition_registry: DefinitionRegistry,
@@ -25,20 +23,28 @@ impl Engine {
         }
     }
 
+    #[inline]
     pub fn definitions(&self) -> &DefinitionRegistry {
         &self.definition_registry
     }
 
+    #[inline]
     pub fn register_definition(
         &mut self,
-        id: DefinitionId,
         definition: DeviceDefinition,
-    ) -> Result<(), RegisterDeviceError> {
-        self.definition_registry.register(id, definition)?;
-        Ok(())
+    ) -> Result<DefinitionId, RegisterDeviceError> {
+        self.definition_registry.register(definition)
     }
 
-    pub fn new_world(&mut self) {
-        self.universe.push(World::new())
+    #[inline]
+    pub fn new_world(&mut self) -> u32 {
+        let id = self.universe.len();
+        self.universe.push(World::default());
+        id as u32
     }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct World {
+    _network: Network,
 }

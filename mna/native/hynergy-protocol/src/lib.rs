@@ -1,8 +1,10 @@
-use network_engine::Engine;
-use network_model::circuits::{CircuitBuilderError, Element, ValueRef};
-use network_model::devices::builder::DeviceDefinitionBuilder;
-use network_model::devices::{DefinitionId, DeviceDefinition, RegisterDeviceError};
-use network_model::{Bound, NodeId, ParameterConstraints, ParameterId};
+use hynergy_engine::Engine;
+use hynergy_model::circuit::{Element, NodeId, ValueRef};
+use hynergy_model::device::builder::{DeviceDefinitionBuilder, DeviceDefinitionBuilderError};
+use hynergy_model::device::definition::{DefinitionId, DeviceDefinition};
+use hynergy_model::device::registry::RegisterDeviceError;
+use hynergy_model::parameter::{Bound, ParameterConstraints, ParameterId};
+use std::num::NonZeroU32;
 
 pub const DEFINITION_BUFFER_VERSION: u16 = 1;
 pub const DEFINITION_BUFFER_MAGIC: [u8; 4] = *b"HYDF";
@@ -115,16 +117,17 @@ pub fn register_definition_buffer(
     engine: &mut Engine,
     input: &[u8],
 ) -> Result<(), DefinitionRegistrationError> {
-    let (id, definition) = decode_definition(engine, input)?;
+    let definition = decode_definition(engine, input)?;
     engine
-        .register_definition(id, definition)
+        .register_definition(definition)
+        .map(|_| ())
         .map_err(map_registry_error)
 }
 
 fn decode_definition(
     engine: &Engine,
     input: &[u8],
-) -> Result<(DefinitionId, DeviceDefinition), DefinitionRegistrationError> {
+) -> Result<DeviceDefinition, DefinitionRegistrationError> {
     let mut decoder = Decoder::new(input, 0, u32::MAX);
     let magic_offset = decoder.offset();
     let magic = decoder.read_array::<4>()?;
@@ -234,10 +237,7 @@ fn decode_definition(
         ));
     }
 
-    Ok((
-        unsafe { DefinitionId::new_unchecked(id) },
-        builder.build_definition(),
-    ))
+    Ok(builder.build_definition())
 }
 
 fn decode_element(decoder: &mut Decoder<'_>) -> Result<Element, DefinitionRegistrationError> {
@@ -252,7 +252,8 @@ fn decode_element(decoder: &mut Decoder<'_>) -> Result<Element, DefinitionRegist
         ));
     }
 
-    let device = unsafe { DefinitionId::new_unchecked(id) };
+    let device =
+        DefinitionId::new(NonZeroU32::new(id).expect("definition ID was validated as non-zero"));
 
     let terminal_count_offset = decoder.offset();
     let terminal_count = decoder.read_u32()? as usize;
@@ -408,32 +409,37 @@ fn require_empty_payload(
 }
 
 fn map_builder_error(
-    error: CircuitBuilderError,
+    error: DeviceDefinitionBuilderError,
     command_index: u32,
     command_offset: usize,
 ) -> DefinitionRegistrationError {
     let kind = match error {
-        CircuitBuilderError::UnknownDefinition { .. } => {
+        DeviceDefinitionBuilderError::UnknownDefinition { .. } => {
             DefinitionRegistrationErrorKind::UnknownDevice
         }
-        CircuitBuilderError::TerminalCountMismatch { .. } => {
+        DeviceDefinitionBuilderError::TerminalCountMismatch { .. } => {
             DefinitionRegistrationErrorKind::TerminalCountMismatch
         }
-        CircuitBuilderError::ParameterCountMismatch { .. } => {
+        DeviceDefinitionBuilderError::ParameterCountMismatch { .. } => {
             DefinitionRegistrationErrorKind::ParameterCountMismatch
         }
-        CircuitBuilderError::NodeOutOfRange { .. } => {
+        DeviceDefinitionBuilderError::NodeOutOfRange { .. } => {
             DefinitionRegistrationErrorKind::NodeOutOfRange
         }
-        CircuitBuilderError::ParameterOutOfRange { .. } => {
+        DeviceDefinitionBuilderError::ParameterOutOfRange { .. } => {
             DefinitionRegistrationErrorKind::ParameterOutOfRange
         }
-        CircuitBuilderError::ParameterConstraint { .. } => {
+        DeviceDefinitionBuilderError::ParameterConstraint { .. } => {
             DefinitionRegistrationErrorKind::ParameterConstraintViolation
         }
-        CircuitBuilderError::NodeIdExhausted => DefinitionRegistrationErrorKind::NodeIdExhausted,
-        CircuitBuilderError::ParameterIdExhausted => {
+        DeviceDefinitionBuilderError::NodeIdExhausted => {
+            DefinitionRegistrationErrorKind::NodeIdExhausted
+        }
+        DeviceDefinitionBuilderError::ParameterIdExhausted => {
             DefinitionRegistrationErrorKind::ParameterIdExhausted
+        }
+        DeviceDefinitionBuilderError::ElementIdExhausted => {
+            DefinitionRegistrationErrorKind::InvalidDefinition
         }
     };
     DefinitionRegistrationError::command(kind, command_index, command_offset)
@@ -527,8 +533,8 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use network_model::Bound;
-    use network_model::devices::DeviceBody;
+    use hynergy_model::device::definition::DeviceBody;
+    use hynergy_model::parameter::Bound;
 
     const BUFFER_MAGIC: [u8; 4] = *b"HYDF";
     const BUFFER_VERSION: u16 = 1;
@@ -663,7 +669,9 @@ mod tests {
 
         let definition = engine
             .definitions()
-            .get(unsafe { DefinitionId::new_unchecked(Engine::COMPOSITE_DEFINITION_ID_BASE) })
+            .get(DefinitionId::new(
+                NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
+            ))
             .unwrap();
         assert_eq!(definition.terminals().len(), 0);
         assert_eq!(definition.parameters().len(), 0);
@@ -694,7 +702,9 @@ mod tests {
 
         let definition = engine
             .definitions()
-            .get(unsafe { DefinitionId::new_unchecked(Engine::COMPOSITE_DEFINITION_ID_BASE) })
+            .get(DefinitionId::new(
+                NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
+            ))
             .unwrap();
         assert_eq!(definition.terminals().len(), 2);
         assert_eq!(definition.parameters().len(), 1);
@@ -898,7 +908,9 @@ mod tests {
         assert!(
             engine
                 .definitions()
-                .get(unsafe { DefinitionId::new_unchecked(Engine::COMPOSITE_DEFINITION_ID_BASE) })
+                .get(DefinitionId::new(
+                    NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
+                ))
                 .is_none()
         );
     }
@@ -936,9 +948,9 @@ mod tests {
             assert!(
                 engine
                     .definitions()
-                    .get(unsafe {
-                        DefinitionId::new_unchecked(Engine::COMPOSITE_DEFINITION_ID_BASE)
-                    })
+                    .get(DefinitionId::new(
+                        NonZeroU32::new(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap(),
+                    ))
                     .is_none()
             );
         }

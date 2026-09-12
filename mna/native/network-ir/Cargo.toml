@@ -1,4 +1,0 @@
-[package]
-name = "network-ir"
-version.workspace = true
-edition.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "network-model"
+name = "hynergy-model"
 version.workspace = true
 edition.workspace = true
 

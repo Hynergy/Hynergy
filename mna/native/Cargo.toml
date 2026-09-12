@@ -2,11 +2,9 @@
 resolver = "3"
 members = [
     "hynergy-mna-ffi",
-    "network-engine",
-    "network-ir",
-    "network-model",
-    "network-numerics",
-    "network-protocol",
+    "hynergy-engine",
+    "hynergy-model",
+    "hynergy-protocol",
 ]
 
 [workspace.package]

@@ -1,5 +1,5 @@
-use network_engine::Engine;
-use network_protocol::{DefinitionRegistrationError, DefinitionRegistrationErrorKind};
+use hynergy_engine::Engine;
+use hynergy_protocol::{DefinitionRegistrationError, DefinitionRegistrationErrorKind};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub const ABI_VERSION: u32 = 1;
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
         let registration = catch_unwind(AssertUnwindSafe(|| {
             let engine = unsafe { &mut *engine };
             let input = unsafe { std::slice::from_raw_parts(input, input_len) };
-            network_protocol::register_definition_buffer(engine, input)
+            hynergy_protocol::register_definition_buffer(engine, input)
         }));
         match registration {
             Ok(Ok(())) => DefinitionRegistrationResult::success(),

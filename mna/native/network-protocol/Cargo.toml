@@ -1,8 +1,0 @@
-[package]
-name = "network-protocol"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-network-engine = { path = "../network-engine" }
-network-model = { path = "../network-model" }
