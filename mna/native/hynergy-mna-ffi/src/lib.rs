@@ -64,20 +64,32 @@ impl DefinitionRegistrationResult {
     }
 }
 
+/// Returns the ABI version that this library implements.
+///
+/// The caller must check this value before it calls other ABI functions.
 #[unsafe(no_mangle)]
 pub extern "C" fn hynergy_abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// Creates an engine.
+///
+/// The returned pointer owns the engine. The caller must pass the pointer to
+/// [`hynergy_engine_destroy`] when the engine is no longer necessary.
 #[unsafe(no_mangle)]
 pub extern "C" fn hynergy_engine_create() -> *mut Engine {
     Box::into_raw(Box::new(Engine::new()))
 }
 
+/// Destroys an engine and all resources that it owns.
+///
+/// This function has no effect if `engine` is null.
+///
 /// # Safety
 ///
 /// `engine` must have been returned by `hynergy_engine_create`,
-/// and it must not have been destroyed previously.
+/// and it must not have been destroyed previously. The caller must prevent
+/// concurrent access to the engine during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut Engine) {
     if !engine.is_null() {
@@ -87,13 +99,24 @@ pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut Engine) {
     }
 }
 
+/// Registers the device definition in a definition command buffer.
+///
+/// The function writes the operation result to `result` and returns the same
+/// status code. A successful result uses `u32::MAX` for `command_index` and
+/// `byte_offset`.
+///
+/// The function returns `NullResult` without processing the input if `result`
+/// is null. It reports other invalid pointers through `result`. It catches a
+/// Rust panic and reports `InternalPanic`.
+///
 /// # Safety
 ///
-/// `engine` must be null or point to a live [`Engine`] with exclusive access
-/// for the call. `input` must point to `input_len` readable bytes. `result`
-/// must point to writable, non-overlapping storage for one
-/// [`DefinitionRegistrationResult`]. The caller must prevent concurrent use
-/// of the same engine.
+/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
+/// access for this call. If `input` is not null, it must point to `input_len`
+/// readable bytes. If `result` is not null, it must point to writable storage
+/// for one [`DefinitionRegistrationResult`]. The input, result, and engine
+/// storage must not overlap. The caller must prevent concurrent use of the
+/// same engine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_register_definition(
     engine: *mut Engine,
@@ -145,6 +168,134 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
         result.write(output);
     }
     code
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WorldCreationResult {
+    pub code: u32,
+    pub world_id: u32,
+}
+
+/// Creates a world and returns its engine-assigned ID in `result`.
+///
+/// The engine owns the new world. The caller must use the returned world ID
+/// for later world operations.
+///
+/// This function is not implemented. The caller must not call it.
+///
+/// # Safety
+///
+/// `engine` must point to a live [`Engine`] with exclusive access for this
+/// call. `result` must point to writable storage for one
+/// [`WorldCreationResult`]. The result and engine storage must not overlap.
+/// The caller must prevent concurrent use of the same engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_engine_create_world(
+    engine: *mut Engine,
+    result: *mut WorldCreationResult,
+) -> u32 {
+    todo!("world creation is not implemented")
+}
+
+/// Destroys a world and all resources that the world owns.
+///
+/// `world_id` must identify a live world that belongs to `engine`. The ID is
+/// invalid after this call succeeds.
+///
+/// This function is not implemented. The caller must not call it.
+///
+/// # Safety
+///
+/// `engine` must point to a live [`Engine`] with exclusive access for this
+/// call. The caller must prevent concurrent use of the same engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_engine_destroy_world(engine: *mut Engine, world_id: u32) -> u32 {
+    todo!("world destruction is not implemented")
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CommandResult {
+    pub code: u32,
+    pub command_index: u32,
+    pub byte_offset: u32,
+    pub applied_command_count: u32,
+}
+
+/// Applies a world command buffer in command order.
+///
+/// The operation is not atomic. If a command fails, all earlier successful
+/// commands remain applied. The function stops at the first failure. It writes
+/// the failure location and the applied command count to `result`.
+///
+/// This function is not implemented. The caller must not call it.
+///
+/// # Safety
+///
+/// `engine` must point to a live [`Engine`] with exclusive access for this
+/// call. `input` must point to `input_len` readable bytes. `result` must point
+/// to writable storage for one [`CommandResult`]. The input, result, and
+/// engine storage must not overlap. The caller must prevent concurrent use of
+/// the same engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_world_apply_commands(
+    engine: *mut Engine,
+    world_id: u32,
+    input: *const u8,
+    input_len: usize,
+    result: *mut CommandResult,
+) -> u32 {
+    todo!("world command buffers are not implemented")
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Publication {
+    pub subscription_id: u32,
+    pub status: u32,
+    pub value: f64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SolveResult {
+    pub code: u32,
+    pub publication_count: u32,
+    pub required_capacity: u32,
+    pub dirty_island_count: u32,
+    pub solved_island_count: u32,
+    pub failed_island_count: u32,
+}
+
+/// Solves the dirty islands in a world and writes subscription publications.
+///
+/// The function writes at most `publication_capacity` records to
+/// `publications`. It writes the operation summary to `result`. It does not
+/// publish records for unchanged islands.
+///
+/// If the publication capacity is too small, the function reports the
+/// required capacity in `result`. It does not solve an island or publish a
+/// record in this case.
+///
+/// This function is not implemented. The caller must not call it.
+///
+/// # Safety
+///
+/// `engine` must point to a live [`Engine`] with exclusive access for this
+/// call. If `publication_capacity` is not zero, `publications` must point to
+/// writable storage for that number of [`Publication`] records. `result` must
+/// point to writable storage for one [`SolveResult`]. The publication, result,
+/// and engine storage must not overlap. The caller must prevent concurrent use
+/// of the same engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_world_solve(
+    engine: *mut Engine,
+    world_id: u32,
+    publications: *mut Publication,
+    publication_capacity: u32,
+    result: *mut SolveResult,
+) -> u32 {
+    todo!("world solving is not implemented")
 }
 
 fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegistrationResult {
