@@ -1,6 +1,6 @@
 pub mod topology;
 
-use crate::topology::DerivedTopology;
+use crate::topology::{DerivedTopology, TraversalScratch};
 use hynergy_model::device::definition::{DefinitionId, DeviceDefinition, DeviceId, TerminalId};
 use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
 use hynergy_model::network::{Network, NetworkModelError, WireId};
@@ -47,10 +47,21 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct World {
     network: Network,
     derived_topology: DerivedTopology,
+    topology_scratch: TraversalScratch,
+}
+
+impl Clone for World {
+    fn clone(&self) -> Self {
+        Self {
+            network: self.network.clone(),
+            derived_topology: self.derived_topology.clone(),
+            topology_scratch: TraversalScratch::default(),
+        }
+    }
 }
 
 impl World {
@@ -68,7 +79,8 @@ impl World {
 
     pub fn remove_wire(&mut self, wire: WireId) -> Result<(), NetworkModelError> {
         self.network.remove_wire(wire)?;
-        self.derived_topology.remove_wire(&self.network, wire);
+        self.derived_topology
+            .remove_wire(&self.network, &mut self.topology_scratch, wire);
         self.debug_validate_topology();
         Ok(())
     }
@@ -79,7 +91,8 @@ impl World {
         wire_b: WireId,
     ) -> Result<(), NetworkModelError> {
         self.network.connect_wires(wire_a, wire_b)?;
-        self.derived_topology.connect_wires(wire_a, wire_b);
+        self.derived_topology
+            .connect_wires(&self.network, wire_a, wire_b);
         self.debug_validate_topology();
         Ok(())
     }
@@ -90,8 +103,12 @@ impl World {
         wire_b: WireId,
     ) -> Result<(), NetworkModelError> {
         self.network.disconnect_wires(wire_a, wire_b)?;
-        self.derived_topology
-            .disconnect_wires(&self.network, wire_a, wire_b);
+        self.derived_topology.disconnect_wires(
+            &self.network,
+            &mut self.topology_scratch,
+            wire_a,
+            wire_b,
+        );
         self.debug_validate_topology();
         Ok(())
     }
@@ -109,8 +126,17 @@ impl World {
     }
 
     pub fn remove_device(&mut self, device: DeviceId) -> Result<(), NetworkModelError> {
+        let affected_nets = self.derived_topology.device_nets(&self.network, device);
+
         self.network.remove_device(device)?;
-        self.derived_topology.remove_device(&self.network, device);
+
+        self.derived_topology.remove_device(
+            &self.network,
+            &mut self.topology_scratch,
+            device,
+            &affected_nets,
+        );
+
         self.debug_validate_topology();
         Ok(())
     }
@@ -122,7 +148,8 @@ impl World {
         terminal: TerminalId,
     ) -> Result<(), NetworkModelError> {
         self.network.attach_terminal(wire, device, terminal)?;
-        self.derived_topology.attach_terminal(wire, device);
+        self.derived_topology
+            .attach_terminal(&self.network, wire, device);
         self.debug_validate_topology();
         Ok(())
     }
@@ -134,8 +161,12 @@ impl World {
         terminal: TerminalId,
     ) -> Result<(), NetworkModelError> {
         self.network.detach_terminal(wire, device, terminal)?;
-        self.derived_topology
-            .detach_terminal(&self.network, wire, device);
+        self.derived_topology.detach_terminal(
+            &self.network,
+            &mut self.topology_scratch,
+            wire,
+            device,
+        );
         self.debug_validate_topology();
         Ok(())
     }

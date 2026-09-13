@@ -21,6 +21,9 @@ pub enum NetworkModelError {
     #[error("provided id {id:#?} exceeds max bound {upper_bound:#?}")]
     IdOutOfBound { id: NonZeroU32, upper_bound: usize },
 
+    #[error("id {id:#?} exceeds the 31-bit ID limit")]
+    IdExceeds31Bit { id: NonZeroU32 },
+
     #[error("id {id:#?} is already assigned")]
     IdAlreadyAssigned { id: NonZeroU32 },
 

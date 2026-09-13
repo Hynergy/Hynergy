@@ -3,6 +3,7 @@ use super::{ConnectionType, Network, NetworkModelError};
 use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
 use crate::device::registry::DefinitionRegistry;
 use crate::parameter::ParameterId;
+use hynergy_ids::MAX_PACKED_ID;
 
 impl Network {
     pub fn add_device(
@@ -11,6 +12,10 @@ impl Network {
         id: DeviceId,
         definition_id: DefinitionId,
     ) -> Result<(), NetworkModelError> {
+        if id.get() > MAX_PACKED_ID {
+            return Err(NetworkModelError::IdExceeds31Bit { id: id.id() });
+        }
+
         let index = id.index();
         let len = self.devices.len();
 

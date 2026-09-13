@@ -110,25 +110,21 @@ macro_rules! define_non_zero_id {
         pub struct $name($nonzero);
 
         impl $name {
-            /// Creates an ID from its non-zero representation.
             #[inline]
             pub const fn new(id: $nonzero) -> Self {
                 Self(id)
             }
 
-            /// Returns the underlying non-zero value.
             #[inline]
             pub const fn id(self) -> $nonzero {
                 self.0
             }
 
-            /// Returns the underlying primitive integer.
             #[inline]
             pub const fn get(self) -> $primitive {
                 self.0.get()
             }
 
-            /// Returns the corresponding zero-based index.
             #[inline]
             pub const fn index(self) -> usize {
                 (self.get() - 1) as usize
@@ -176,3 +172,5 @@ macro_rules! define_non_zero_id {
         }
     };
 }
+
+pub const MAX_PACKED_ID: u32 = 0x7fff_ffff;

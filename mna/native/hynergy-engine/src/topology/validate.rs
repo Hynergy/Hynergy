@@ -1,4 +1,4 @@
-use crate::topology::DerivedTopology;
+use crate::topology::{DerivedTopology, NetId};
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::{Network, WireId};
 use std::num::NonZeroU32;
@@ -90,6 +90,13 @@ impl DerivedTopology {
             network.wires().len(),
             "wire map must mirror Network wire slots"
         );
+
+        assert_eq!(
+            self.net_island_map.len(),
+            self.nets.slot_count(),
+            "net -> island map must mirror the stable NetId slot space"
+        );
+
         assert_eq!(
             self.device_island_map.len(),
             network.devices().len(),
@@ -104,13 +111,21 @@ impl DerivedTopology {
     fn assert_membership_maps(&self, network: &Network) {
         let mut seen_wires = vec![false; network.wires().len()];
         let mut seen_devices = vec![false; network.devices().len()];
-        let mut seen_island_nets = vec![false; self.nets.slot_count()];
 
         for (net_id, net) in self.nets.iter() {
             assert!(
                 !net.wires.is_empty(),
                 "live nets must contain at least one wire"
             );
+
+            let island_id = self.net_island_map[net_id.index()];
+
+            if let Some(island_id) = island_id {
+                assert!(
+                    self.islands.get(island_id).is_some(),
+                    "live net references a retired island"
+                );
+            }
 
             for &wire in &net.wires {
                 assert!(
@@ -120,26 +135,29 @@ impl DerivedTopology {
                         .is_some_and(|slot| slot.is_some()),
                     "net references a removed or out-of-range wire"
                 );
+
                 assert_eq!(
                     self.wire_net_map[wire.index()],
                     Some(net_id),
                     "wire -> net map disagrees with Net::wires"
                 );
+
                 assert!(
                     !seen_wires[wire.index()],
                     "wire appears in more than one net"
                 );
+
                 seen_wires[wire.index()] = true;
             }
+        }
 
-            if let Some(island_id) = net.island {
-                let island = self
-                    .islands
-                    .get(island_id)
-                    .expect("net references a retired island");
-                assert!(
-                    island.nets.contains(&net_id),
-                    "Net::island disagrees with IslandTopology::nets"
+        for index in 0..self.nets.slot_count() {
+            let net_id = net_id(index);
+
+            if self.nets.get(net_id).is_none() {
+                assert_eq!(
+                    self.net_island_map[index], None,
+                    "retired NetId still has an IslandId"
                 );
             }
         }
@@ -148,15 +166,22 @@ impl DerivedTopology {
             match slot {
                 Some(_) => {
                     assert!(seen_wires[index], "live wire is missing from derived nets");
+
+                    let net_id =
+                        self.wire_net_map[index].expect("live wire must have a derived NetId");
+
                     assert!(
-                        self.wire_net_map[index].is_some(),
-                        "live wire has no derived NetId"
+                        self.nets.get(net_id).is_some(),
+                        "live wire references a retired NetId"
                     );
                 }
-                None => assert_eq!(
-                    self.wire_net_map[index], None,
-                    "removed wire still has a derived NetId"
-                ),
+
+                None => {
+                    assert_eq!(
+                        self.wire_net_map[index], None,
+                        "removed wire still has a derived NetId"
+                    );
+                }
             }
         }
 
@@ -174,33 +199,19 @@ impl DerivedTopology {
                         .is_some_and(|slot| slot.is_some()),
                     "island references a removed or out-of-range device"
                 );
+
                 assert_eq!(
                     self.device_island_map[device.index()],
                     Some(island_id),
                     "device -> island map disagrees with IslandTopology::devices"
                 );
+
                 assert!(
                     !seen_devices[device.index()],
                     "device appears in more than one island"
                 );
-                seen_devices[device.index()] = true;
-            }
 
-            for &net_id in &island.nets {
-                let net = self
-                    .nets
-                    .get(net_id)
-                    .expect("island references a retired net");
-                assert_eq!(
-                    net.island,
-                    Some(island_id),
-                    "IslandTopology::nets disagrees with Net::island"
-                );
-                assert!(
-                    !seen_island_nets[net_id.index()],
-                    "net appears in more than one island"
-                );
-                seen_island_nets[net_id.index()] = true;
+                seen_devices[device.index()] = true;
             }
         }
 
@@ -211,24 +222,23 @@ impl DerivedTopology {
                         seen_devices[index],
                         "live device is missing from derived islands"
                     );
+
+                    let island_id = self.device_island_map[index]
+                        .expect("live device must have a derived IslandId");
+
                     assert!(
-                        self.device_island_map[index].is_some(),
-                        "live device has no derived IslandId"
+                        self.islands.get(island_id).is_some(),
+                        "live device references a retired IslandId"
                     );
                 }
-                None => assert_eq!(
-                    self.device_island_map[index], None,
-                    "removed device still has a derived IslandId"
-                ),
-            }
-        }
 
-        for (net_id, net) in self.nets.iter() {
-            assert_eq!(
-                seen_island_nets[net_id.index()],
-                net.island.is_some(),
-                "island membership presence disagrees with Net::island"
-            );
+                None => {
+                    assert_eq!(
+                        self.device_island_map[index], None,
+                        "removed device still has a derived IslandId"
+                    );
+                }
+            }
         }
     }
 
@@ -243,17 +253,25 @@ impl DerivedTopology {
                 continue;
             }
 
-            let wire = wire_id(index);
+            let start = wire_id(index);
+
             let expected_net = self.wire_net_map[index].expect("live wire must have a NetId");
+
+            assert!(
+                self.nets.get(expected_net).is_some(),
+                "wire component references a retired NetId"
+            );
+
             assert!(
                 !seen_components[expected_net.index()],
                 "one NetId represents multiple disconnected wire components"
             );
+
             seen_components[expected_net.index()] = true;
             component_count += 1;
 
             visited[index] = true;
-            stack.push(wire);
+            stack.push(start);
 
             while let Some(current) = stack.pop() {
                 assert_eq!(
@@ -269,6 +287,7 @@ impl DerivedTopology {
                     let Some(neighbor) = connection.as_wire() else {
                         continue;
                     };
+
                     if !visited[neighbor.index()] {
                         visited[neighbor.index()] = true;
                         stack.push(neighbor);
@@ -297,33 +316,47 @@ impl DerivedTopology {
             }
 
             let device = device_id(index);
+
             let expected_island =
                 self.device_island_map[index].expect("live device must have a derived IslandId");
+
+            assert!(
+                self.islands.get(expected_island).is_some(),
+                "device references a retired IslandId"
+            );
+
             assert!(
                 !seen_islands[expected_island.index()],
                 "one IslandId represents multiple disconnected primitive components"
             );
+
             seen_islands[expected_island.index()] = true;
             component_count += 1;
 
             visited_devices[index] = true;
+
             stack.push(
                 PrimitiveVertex::try_from(device)
-                    .expect("DeviceId should never exceed 31-bit non-zero representation"),
+                    .expect("DeviceId must fit the packed 31-bit vertex representation"),
             );
 
             while let Some(vertex) = stack.pop() {
                 match vertex.vertex_type() {
                     PrimitiveVertexType::Wire => {
-                        let wire = vertex.as_wire().expect("vertex is a wire");
+                        let wire = vertex.as_wire().expect("wire vertex must decode as WireId");
 
                         let net_id = self.wire_net_map[wire.index()]
                             .expect("live wire must have a derived NetId");
-                        let net = self.nets.get(net_id).expect("wire NetId must be live");
+
+                        assert!(
+                            self.nets.get(net_id).is_some(),
+                            "wire reachable from a device references a retired NetId"
+                        );
+
                         assert_eq!(
-                            net.island,
+                            self.net_island_map[net_id.index()],
                             Some(expected_island),
-                            "wire reachable from a device belongs to the wrong island"
+                            "net reachable from a device belongs to the wrong island"
                         );
 
                         for connection in network
@@ -333,22 +366,31 @@ impl DerivedTopology {
                             if let Some(neighbor) = connection.as_wire() {
                                 if !visited_wires[neighbor.index()] {
                                     visited_wires[neighbor.index()] = true;
+
                                     stack.push(PrimitiveVertex::try_from(neighbor).expect(
-                                        "WireId should never exceed 31-bit non-zero representation",
+                                        "WireId must fit the packed 31-bit vertex representation",
                                     ));
                                 }
-                            } else if let Some((neighbor, _)) = connection.as_terminal()
+
+                                continue;
+                            }
+
+                            if let Some((neighbor, _)) = connection.as_terminal()
                                 && !visited_devices[neighbor.index()]
                             {
                                 visited_devices[neighbor.index()] = true;
+
                                 stack.push(PrimitiveVertex::try_from(neighbor).expect(
-                                    "DeviceId should never exceed 31-bit non-zero representation",
+                                    "DeviceId must fit the packed 31-bit vertex representation",
                                 ));
                             }
                         }
                     }
+
                     PrimitiveVertexType::Device => {
-                        let current = vertex.as_device().expect("vertex is a device");
+                        let current = vertex
+                            .as_device()
+                            .expect("device vertex must decode as DeviceId");
 
                         assert_eq!(
                             self.device_island_map[current.index()],
@@ -356,23 +398,32 @@ impl DerivedTopology {
                             "connected devices disagree on IslandId"
                         );
 
-                        let device_slot = network.devices()[current.index()]
-                            .as_ref()
+                        let device_slot = network
+                            .devices()
+                            .get(current.index())
+                            .and_then(Option::as_ref)
                             .expect("visited device must exist");
+
                         for connection in device_slot.terminals().iter().flatten().copied() {
                             if let Some(wire) = connection.as_wire()
                                 && !visited_wires[wire.index()]
                             {
                                 visited_wires[wire.index()] = true;
+
                                 stack.push(PrimitiveVertex::try_from(wire).expect(
-                                    "WireId should never exceed 31-bit non-zero representation",
+                                    "WireId must fit the packed 31-bit vertex representation",
                                 ));
-                            } else if let Some((neighbor, _)) = connection.as_terminal()
+
+                                continue;
+                            }
+
+                            if let Some((neighbor, _)) = connection.as_terminal()
                                 && !visited_devices[neighbor.index()]
                             {
                                 visited_devices[neighbor.index()] = true;
+
                                 stack.push(PrimitiveVertex::try_from(neighbor).expect(
-                                    "DeviceId should never exceed 31-bit non-zero representation",
+                                    "DeviceId must fit the packed 31-bit vertex representation",
                                 ));
                             }
                         }
@@ -386,10 +437,16 @@ impl DerivedTopology {
                 continue;
             }
 
-            let net_id = self.wire_net_map[index].expect("live wire must have a NetId");
-            let net = self.nets.get(net_id).expect("wire NetId must be live");
+            let net_id = self.wire_net_map[index].expect("live wire must have a derived NetId");
+
+            assert!(
+                self.nets.get(net_id).is_some(),
+                "islandless wire references a retired NetId"
+            );
+
             assert_eq!(
-                net.island, None,
+                self.net_island_map[net_id.index()],
+                None,
                 "wire component with no reachable device must be islandless"
             );
         }
@@ -402,12 +459,20 @@ impl DerivedTopology {
     }
 }
 
+#[inline]
 fn wire_id(index: usize) -> WireId {
     WireId::try_from(u32::try_from(index + 1).expect("wire index must fit WireId"))
         .expect("wire IDs are one-based")
 }
 
+#[inline]
 fn device_id(index: usize) -> DeviceId {
     DeviceId::try_from(u32::try_from(index + 1).expect("device index must fit DeviceId"))
         .expect("device IDs are one-based")
+}
+
+#[inline]
+fn net_id(index: usize) -> NetId {
+    NetId::try_from(u32::try_from(index + 1).expect("net index must fit NetId"))
+        .expect("net IDs are one-based")
 }

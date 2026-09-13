@@ -67,7 +67,7 @@ impl ConnectionRef {
     }
 
     #[inline]
-    pub(super) fn connection_type(self) -> ConnectionType {
+    pub fn connection_type(self) -> ConnectionType {
         if self.0.get() as u32 & Self::TYPE_BIT != 0 {
             ConnectionType::Device
         } else {

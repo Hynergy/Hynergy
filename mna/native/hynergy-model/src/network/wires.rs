@@ -1,9 +1,14 @@
 use super::connection::ConnectionRef;
 use super::slot::WireSlot;
 use super::{Network, NetworkModelError, WireId};
+use hynergy_ids::MAX_PACKED_ID;
 
 impl Network {
     pub fn add_wire(&mut self, id: WireId) -> Result<(), NetworkModelError> {
+        if id.get() > MAX_PACKED_ID {
+            return Err(NetworkModelError::IdExceeds31Bit { id: id.id() });
+        }
+
         let index = id.index();
         let len = self.wires.len();
 
