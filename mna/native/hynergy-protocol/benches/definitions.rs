@@ -165,9 +165,9 @@ fn bench_definitions(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .sample_size(20)
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(3));
+        .sample_size(60)
+        .warm_up_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(8));
     targets = bench_definitions
 }
 
