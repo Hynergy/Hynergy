@@ -455,7 +455,10 @@ mod tests {
 
         let first = world_command(WORLD_COMMAND_ADD_WIRE, &1_u32.to_le_bytes());
 
-        let malformed = world_command(WORLD_COMMAND_ADD_WIRE, &[2, 0]);
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(&WORLD_COMMAND_ADD_WIRE.to_le_bytes());
+        malformed.extend_from_slice(&4_u32.to_le_bytes());
+        malformed.extend_from_slice(&[2, 0]);
 
         let error = apply_world_command_buffer(
             &mut engine,
