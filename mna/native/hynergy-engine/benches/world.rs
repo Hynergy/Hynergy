@@ -112,8 +112,8 @@ fn two_island_world(devices_per_side: usize) -> World {
     world.add_wire(right_wire).unwrap();
 
     for index in 0..devices_per_side {
-        let left_device = device(index + 1);
-        let right_device = device(devices_per_side + index + 1);
+        let left_device = device(index * 2 + 1);
+        let right_device = device(index * 2 + 2);
 
         world
             .add_device(&definitions, left_device, admittance())
