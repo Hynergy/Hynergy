@@ -170,6 +170,18 @@ impl Network {
     pub fn devices(&self) -> &[Option<DeviceSlot>] {
         &self.devices
     }
+
+    #[inline]
+    pub fn wire_connections(&self, wire: WireId) -> Result<&[ConnectionRef], NetworkModelError> {
+        self.wires
+            .get(wire.index())
+            .and_then(Option::as_ref)
+            .map(WireSlot::connections)
+            .ok_or(NetworkModelError::IdNotAssigned {
+                ty: ConnectionType::Wire,
+                id: wire.id(),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +238,39 @@ mod tests {
                 &[Some(1.0)]
             );
         }
+    }
+
+    #[test]
+    fn wire_connections_exposes_typed_read_only_connections() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let wire_a = super::WireId::try_from(1).unwrap();
+        let wire_b = super::WireId::try_from(2).unwrap();
+        let device = device_id(1);
+        let terminal = TerminalId::new(0);
+
+        network.add_wire(wire_a).unwrap();
+        network.add_wire(wire_b).unwrap();
+        network.connect_wires(wire_a, wire_b).unwrap();
+        network
+            .add_device(
+                &definitions,
+                device,
+                DefinitionId::from(PrimitiveElementKind::Admittance),
+            )
+            .unwrap();
+        network.attach_terminal(wire_a, device, terminal).unwrap();
+
+        let connections = network.wire_connections(wire_a).unwrap();
+        assert!(
+            connections
+                .iter()
+                .any(|connection| connection.as_wire() == Some(wire_b))
+        );
+        assert!(
+            connections
+                .iter()
+                .any(|connection| connection.as_terminal() == Some((device, terminal)))
+        );
     }
 }

@@ -39,6 +39,24 @@ impl ConnectionRef {
     }
 
     #[inline]
+    pub fn as_wire(self) -> Option<WireId> {
+        (self.connection_type() == ConnectionType::Wire).then(|| {
+            let id = NonZeroU32::new((self.0.get() >> 32) as u32)
+                .expect("packed connection IDs are non-zero");
+            WireId::from(id)
+        })
+    }
+
+    #[inline]
+    pub fn as_terminal(self) -> Option<(DeviceId, TerminalId)> {
+        (self.connection_type() == ConnectionType::Device).then(|| {
+            let id = NonZeroU32::new((self.0.get() >> 32) as u32)
+                .expect("packed connection IDs are non-zero");
+            (DeviceId::from(id), TerminalId::new(self.port()))
+        })
+    }
+
+    #[inline]
     pub(super) fn index(self) -> usize {
         (self.0.get() >> 32) as usize - 1
     }
@@ -62,5 +80,31 @@ impl From<WireId> for ConnectionRef {
     #[inline]
     fn from(id: WireId) -> Self {
         Self::new(id.into(), 0, ConnectionType::Wire).expect("a wire always uses a valid zero port")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionRef;
+    use crate::device::definition::{DeviceId, TerminalId};
+    use crate::network::WireId;
+
+    #[test]
+    fn wire_connection_decodes_only_as_wire() {
+        let wire = WireId::try_from(3).unwrap();
+        let connection = ConnectionRef::from(wire);
+
+        assert_eq!(connection.as_wire(), Some(wire));
+        assert_eq!(connection.as_terminal(), None);
+    }
+
+    #[test]
+    fn terminal_connection_decodes_only_as_terminal() {
+        let device = DeviceId::try_from(2).unwrap();
+        let terminal = TerminalId::new(7);
+        let connection = ConnectionRef::terminal(device, terminal).unwrap();
+
+        assert_eq!(connection.as_wire(), None);
+        assert_eq!(connection.as_terminal(), Some((device, terminal)));
     }
 }
