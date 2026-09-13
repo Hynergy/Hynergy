@@ -15,6 +15,7 @@ pub enum DefinitionRegistrationCode {
     NullInput = 2,
     NullResult = 3,
     InputTooLarge = 4,
+
     InvalidMagic = 5,
     UnsupportedVersion = 6,
     InvalidFlags = 7,
@@ -24,7 +25,10 @@ pub enum DefinitionRegistrationCode {
     InvalidCount = 11,
     UnknownValueKind = 12,
     TrailingBytes = 13,
-    UnknownDevice = 20,
+    InvalidReserved = 14,
+    InvalidDefinitionId = 15,
+
+    UnknownDefinition = 20,
     TerminalCountMismatch = 21,
     ParameterCountMismatch = 22,
     NodeOutOfRange = 23,
@@ -32,8 +36,9 @@ pub enum DefinitionRegistrationCode {
     ParameterConstraintViolation = 25,
     NodeIdExhausted = 26,
     ParameterIdExhausted = 27,
-    DeviceIdExhausted = 28,
+    DefinitionIdExhausted = 28,
     InvalidDefinition = 29,
+
     InternalPanic = u32::MAX,
 }
 
@@ -43,14 +48,16 @@ pub struct DefinitionRegistrationResult {
     pub code: u32,
     pub command_index: u32,
     pub byte_offset: u32,
+    pub definition_id: u32,
 }
 
 impl DefinitionRegistrationResult {
-    const fn success() -> Self {
+    const fn success(definition_id: u32) -> Self {
         Self {
             code: DefinitionRegistrationCode::Success as u32,
             command_index: u32::MAX,
             byte_offset: u32::MAX,
+            definition_id,
         }
     }
 
@@ -63,6 +70,7 @@ impl DefinitionRegistrationResult {
             code: code as u32,
             command_index,
             byte_offset,
+            definition_id: u32::MAX,
         }
     }
 }
@@ -104,13 +112,12 @@ pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut Engine) {
 
 /// Registers the device definition in a definition command buffer.
 ///
-/// The function writes the operation result to `result` and returns the same
-/// status code. A successful result uses `u32::MAX` for `command_index` and
-/// `byte_offset`.
+/// On success, `definition_id` contains the engine-assigned definition ID.
+/// The caller must use that ID in later operations that reference this
+/// definition, including world `AddDevice` commands.
 ///
-/// The function returns `NullResult` without processing the input if `result`
-/// is null. It reports other invalid pointers through `result`. It catches a
-/// Rust panic and reports `InternalPanic`.
+/// A successful result uses `u32::MAX` for `command_index` and `byte_offset`.
+/// A failed result uses `u32::MAX` for `definition_id`.
 ///
 /// # Safety
 ///
@@ -156,7 +163,7 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
             hynergy_protocol::register_definition_buffer(engine, input)
         }));
         match registration {
-            Ok(Ok(())) => DefinitionRegistrationResult::success(),
+            Ok(Ok(definition_id)) => DefinitionRegistrationResult::success(definition_id.get()),
             Ok(Err(error)) => map_registration_error(error),
             Err(_) => DefinitionRegistrationResult::failure(
                 DefinitionRegistrationCode::InternalPanic,
@@ -477,6 +484,9 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
             DefinitionRegistrationCode::UnsupportedVersion
         }
         DefinitionRegistrationErrorKind::InvalidFlags => DefinitionRegistrationCode::InvalidFlags,
+        DefinitionRegistrationErrorKind::InvalidReserved => {
+            DefinitionRegistrationCode::InvalidReserved
+        }
         DefinitionRegistrationErrorKind::TruncatedInput => {
             DefinitionRegistrationCode::TruncatedInput
         }
@@ -491,7 +501,9 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
             DefinitionRegistrationCode::UnknownValueKind
         }
         DefinitionRegistrationErrorKind::TrailingBytes => DefinitionRegistrationCode::TrailingBytes,
-        DefinitionRegistrationErrorKind::UnknownDevice => DefinitionRegistrationCode::UnknownDevice,
+        DefinitionRegistrationErrorKind::UnknownDefinition => {
+            DefinitionRegistrationCode::UnknownDefinition
+        }
         DefinitionRegistrationErrorKind::TerminalCountMismatch => {
             DefinitionRegistrationCode::TerminalCountMismatch
         }
@@ -513,14 +525,17 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
         DefinitionRegistrationErrorKind::ParameterIdExhausted => {
             DefinitionRegistrationCode::ParameterIdExhausted
         }
-        DefinitionRegistrationErrorKind::DeviceIdExhausted => {
-            DefinitionRegistrationCode::DeviceIdExhausted
+        DefinitionRegistrationErrorKind::DefinitionIdExhausted => {
+            DefinitionRegistrationCode::DefinitionIdExhausted
         }
         DefinitionRegistrationErrorKind::InvalidDefinition => {
             DefinitionRegistrationCode::InvalidDefinition
         }
-        _ => DefinitionRegistrationCode::InvalidDefinition,
+        DefinitionRegistrationErrorKind::InvalidDefinitionId => {
+            DefinitionRegistrationCode::InvalidDefinitionId
+        }
     };
+
     DefinitionRegistrationResult::failure(code, error.command_index(), error.byte_offset())
 }
 
@@ -566,7 +581,7 @@ mod tests {
         bytes.extend_from_slice(b"HYDF");
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&Engine::COMPOSITE_DEFINITION_ID_BASE.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes
     }
@@ -609,6 +624,7 @@ mod tests {
             code: 0xaaaa_aaaa,
             command_index: 0xbbbb_bbbb,
             byte_offset: 0xcccc_cccc,
+            definition_id: 0xdddd_dddd,
         }
     }
 
@@ -659,7 +675,7 @@ mod tests {
 
     #[test]
     fn result_layouts_are_stable() {
-        assert_eq!(size_of::<DefinitionRegistrationResult>(), 12);
+        assert_eq!(size_of::<DefinitionRegistrationResult>(), 16);
         assert_eq!(
             align_of::<DefinitionRegistrationResult>(),
             align_of::<u32>()
@@ -685,6 +701,49 @@ mod tests {
     }
 
     #[test]
+    fn definition_registration_returns_assigned_ids() {
+        let engine = hynergy_engine_create();
+        let bytes = definition_buffer();
+
+        let mut first = definition_result_sentinel();
+        let mut second = definition_result_sentinel();
+
+        assert_eq!(
+            register(engine, &bytes, &mut first),
+            DefinitionRegistrationCode::Success as u32
+        );
+
+        assert_eq!(
+            register(engine, &bytes, &mut second),
+            DefinitionRegistrationCode::Success as u32
+        );
+
+        assert_eq!(
+            first,
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::Success as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                definition_id: Engine::COMPOSITE_DEFINITION_ID_BASE,
+            }
+        );
+
+        assert_eq!(
+            second,
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::Success as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                definition_id: Engine::COMPOSITE_DEFINITION_ID_BASE + 1,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
     fn definition_registration_reports_success() {
         let engine = hynergy_engine_create();
         let bytes = definition_buffer();
@@ -699,6 +758,7 @@ mod tests {
                 code: DefinitionRegistrationCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
+                definition_id: u32::MAX
             }
         );
 
@@ -724,6 +784,7 @@ mod tests {
                 code: DefinitionRegistrationCode::InvalidMagic as u32,
                 command_index: u32::MAX,
                 byte_offset: 0,
+                definition_id: u32::MAX
             }
         );
 
@@ -768,6 +829,7 @@ mod tests {
                 code: DefinitionRegistrationCode::NullEngine as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
+                definition_id: u32::MAX
             }
         );
     }
@@ -787,6 +849,7 @@ mod tests {
                 code: DefinitionRegistrationCode::NullInput as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
+                definition_id: u32::MAX
             }
         );
 

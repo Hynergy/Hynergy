@@ -49,14 +49,15 @@ pub enum DefinitionRegistrationErrorKind {
     InvalidMagic,
     UnsupportedVersion,
     InvalidFlags,
-    InvalidDeviceId,
+    InvalidReserved,
     TruncatedInput,
     UnknownCommand,
     InvalidCommandLength,
     InvalidCount,
+    InvalidDefinitionId,
     UnknownValueKind,
     TrailingBytes,
-    UnknownDevice,
+    UnknownDefinition,
     TerminalCountMismatch,
     ParameterCountMismatch,
     NodeOutOfRange,
@@ -64,7 +65,7 @@ pub enum DefinitionRegistrationErrorKind {
     ParameterConstraintViolation,
     NodeIdExhausted,
     ParameterIdExhausted,
-    DeviceIdExhausted,
+    DefinitionIdExhausted,
     InvalidDefinition,
 }
 
@@ -122,11 +123,11 @@ impl DefinitionRegistrationError {
 pub fn register_definition_buffer(
     engine: &mut Engine,
     input: &[u8],
-) -> Result<(), DefinitionRegistrationError> {
+) -> Result<DefinitionId, DefinitionRegistrationError> {
     let definition = decode_definition(engine, input)?;
+
     engine
         .register_definition(definition)
-        .map(|_| ())
         .map_err(map_registry_error)
 }
 
@@ -162,12 +163,13 @@ fn decode_definition(
         ));
     }
 
-    let id_offset = decoder.offset();
-    let id = decoder.read_u32().map_err(truncated_header)?;
-    if id == 0 {
+    let reserved_offset = decoder.offset();
+    let reserved = decoder.read_u32().map_err(truncated_header)?;
+
+    if reserved != 0 {
         return Err(DefinitionRegistrationError::header(
-            DefinitionRegistrationErrorKind::InvalidDeviceId,
-            id_offset,
+            DefinitionRegistrationErrorKind::InvalidReserved,
+            reserved_offset,
         ));
     }
 
@@ -257,19 +259,17 @@ fn decode_element(
     command_index: u32,
 ) -> Result<Element, DefinitionRegistrationError> {
     let id_offset = decoder.offset();
-    let id = decoder
+    let raw_definition = decoder
         .read_u32()
         .map_err(|e| truncated(e, command_index))?;
 
-    if id == 0 {
-        return Err(DefinitionRegistrationError::command(
-            DefinitionRegistrationErrorKind::InvalidDeviceId,
+    let definition = DefinitionId::try_from(raw_definition).map_err(|_| {
+        DefinitionRegistrationError::command(
+            DefinitionRegistrationErrorKind::InvalidDefinitionId,
             command_index,
             id_offset,
-        ));
-    }
-
-    let device = DefinitionId::try_from(id).expect("definition ID was validated as non-zero");
+        )
+    })?;
 
     let terminal_count_offset = decoder.offset();
     let terminal_count = decoder
@@ -328,7 +328,7 @@ fn decode_element(
         parameters.push(value);
     }
 
-    Ok(Element::new(device, terminals, parameters))
+    Ok(Element::new(definition, terminals, parameters))
 }
 
 fn decode_constraints(
@@ -453,7 +453,7 @@ fn map_builder_error(
 ) -> DefinitionRegistrationError {
     let kind = match error {
         DeviceDefinitionBuilderError::UnknownDefinition { .. } => {
-            DefinitionRegistrationErrorKind::UnknownDevice
+            DefinitionRegistrationErrorKind::UnknownDefinition
         }
         DeviceDefinitionBuilderError::TerminalCountMismatch { .. } => {
             DefinitionRegistrationErrorKind::TerminalCountMismatch
@@ -486,14 +486,16 @@ fn map_builder_error(
 fn map_registry_error(error: RegisterDeviceError) -> DefinitionRegistrationError {
     let kind = match error {
         RegisterDeviceError::DefinitionIdExhausted => {
-            DefinitionRegistrationErrorKind::DeviceIdExhausted
+            DefinitionRegistrationErrorKind::DefinitionIdExhausted
         }
+
         RegisterDeviceError::PrimitiveRegistrationForbidden { .. }
-        | RegisterDeviceError::TerminalCountExceedsNodeCount { .. } => {
+        | RegisterDeviceError::TerminalCountExceedsNodeCount { .. }
+        | RegisterDeviceError::UnknownDefinition { .. } => {
             DefinitionRegistrationErrorKind::InvalidDefinition
         }
-        _ => DefinitionRegistrationErrorKind::InvalidDefinition,
     };
+
     DefinitionRegistrationError::header(kind, u32::MAX as usize)
 }
 
@@ -541,12 +543,13 @@ mod tests {
         bytes
     }
 
-    fn definition_buffer(id: u32, commands: &[Vec<u8>]) -> Vec<u8> {
+    fn definition_buffer(reserved: u32, commands: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = Vec::new();
+
         bytes.extend_from_slice(&DEFINITION_BUFFER_MAGIC);
         bytes.extend_from_slice(&DEFINITION_BUFFER_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&reserved.to_le_bytes());
         bytes.extend_from_slice(&(commands.len() as u32).to_le_bytes());
 
         for command in commands {
@@ -662,13 +665,12 @@ mod tests {
     fn empty_definition_registers() {
         let mut engine = Engine::new();
 
-        register_definition_buffer(
-            &mut engine,
-            &definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]),
-        )
-        .unwrap();
+        let definition_id =
+            register_definition_buffer(&mut engine, &definition_buffer(0, &[])).unwrap();
 
-        let definition = registered_definition(&engine);
+        assert_eq!(definition_id.get(), Engine::COMPOSITE_DEFINITION_ID_BASE);
+
+        let definition = engine.definitions().get(definition_id).unwrap();
 
         assert!(matches!(definition.body(), DeviceBody::Composite(_)));
         assert!(definition.terminals().is_empty());
@@ -731,7 +733,7 @@ mod tests {
 
     #[test]
     fn invalid_header_fields_report_their_offsets() {
-        let valid = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+        let valid = definition_buffer(0, &[]);
 
         let mut invalid_magic = valid.clone();
         invalid_magic[0] = b'X';
@@ -742,8 +744,8 @@ mod tests {
         let mut invalid_flags = valid.clone();
         invalid_flags[6..8].copy_from_slice(&1_u16.to_le_bytes());
 
-        let mut invalid_id = valid;
-        invalid_id[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        let mut invalid_reserved = valid;
+        invalid_reserved[8..12].copy_from_slice(&1_u32.to_le_bytes());
 
         for (bytes, kind, offset) in [
             (
@@ -762,8 +764,8 @@ mod tests {
                 6,
             ),
             (
-                invalid_id,
-                DefinitionRegistrationErrorKind::InvalidDeviceId,
+                invalid_reserved,
+                DefinitionRegistrationErrorKind::InvalidReserved,
                 8,
             ),
         ] {
@@ -965,7 +967,7 @@ mod tests {
 
         assert_error(
             &bytes,
-            DefinitionRegistrationErrorKind::InvalidDeviceId,
+            DefinitionRegistrationErrorKind::InvalidDefinitionId,
             0,
             22,
         );
@@ -1030,7 +1032,7 @@ mod tests {
                     DEFINITION_COMMAND_ADD_ELEMENT,
                     &element_payload(99, &[], &[]),
                 )],
-                DefinitionRegistrationErrorKind::UnknownDevice,
+                DefinitionRegistrationErrorKind::UnknownDefinition,
             ),
             (
                 vec![
@@ -1162,5 +1164,21 @@ mod tests {
             0,
             DEFINITION_HEADER_LENGTH as u32,
         );
+    }
+
+    #[test]
+    fn registration_returns_engine_assigned_definition_ids() {
+        let mut engine = Engine::new();
+
+        let first = register_definition_buffer(&mut engine, &definition_buffer(0, &[])).unwrap();
+
+        let second = register_definition_buffer(&mut engine, &definition_buffer(0, &[])).unwrap();
+
+        assert_eq!(first.get(), Engine::COMPOSITE_DEFINITION_ID_BASE);
+
+        assert_eq!(second.get(), Engine::COMPOSITE_DEFINITION_ID_BASE + 1);
+
+        assert!(engine.definitions().get(first).is_some());
+        assert!(engine.definitions().get(second).is_some());
     }
 }

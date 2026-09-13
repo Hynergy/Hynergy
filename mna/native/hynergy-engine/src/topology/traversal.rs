@@ -102,7 +102,6 @@ impl From<DeviceId> for IslandVertex {
     }
 }
 
-use smallvec::SmallVec;
 
 pub(super) fn wire_components(
     topology: &DerivedTopology,
@@ -180,10 +179,6 @@ pub(super) fn island_components(
         .get(island_id)
         .expect("island repair requires a live island");
 
-    let mut visited_nets = vec![false; topology.nets.slot_count()];
-    let mut visited_devices = vec![false; network.devices().len()];
-
-    let mut stack = SmallVec::<[IslandVertex; 16]>::new();
     let mut components = Vec::new();
 
     for &device_id in &island.devices {
@@ -308,16 +303,6 @@ fn walk_island_component(
     }
 
     component
-}
-
-#[inline(always)]
-fn mark_new(visited: &mut [bool], index: usize) -> bool {
-    if visited[index] {
-        false
-    } else {
-        visited[index] = true;
-        true
-    }
 }
 
 #[derive(Debug, Default)]

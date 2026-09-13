@@ -160,8 +160,11 @@ impl Network {
             return Err(NetworkModelError::NotConnected);
         }
 
-        debug_assert!(a_slot.remove_connection(a_to_b));
-        debug_assert!(b_slot.remove_connection(b_to_a));
+        let result = a_slot.remove_connection(a_to_b);
+        debug_assert!(result);
+        let result = b_slot.remove_connection(b_to_a);
+        debug_assert!(result);
+
         Ok(())
     }
 }
