@@ -34,6 +34,7 @@ where
     I: DenseId,
 {
     #[inline]
+    #[allow(dead_code)]
     pub(super) fn len(&self) -> usize {
         self.values.len()
     }

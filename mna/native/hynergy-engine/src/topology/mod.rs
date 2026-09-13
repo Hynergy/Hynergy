@@ -17,12 +17,12 @@ define_non_zero_id!(NetId, IslandId);
 impl DenseId for NetId {
     #[inline]
     fn from_slot(slot: usize) -> Self {
-        assert!(slot as u32 <= hynergy_ids::MAX_PACKED_ID);
+        assert!(
+            slot < hynergy_ids::MAX_PACKED_ID as usize,
+            "31-bit NetId space exhausted"
+        );
 
-        let raw = slot
-            .checked_add(1)
-            .and_then(|value| u32::try_from(value).ok())
-            .expect("31-bit NetId space exhausted");
+        let raw = u32::try_from(slot + 1).expect("31-bit NetId space exhausted");
 
         NetId::try_from(raw).expect("NetId values are one-based")
     }
@@ -49,7 +49,7 @@ impl DenseId for IslandId {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DerivedTopology {
     nets: DenseIdStore<NetId, Net>,
     wire_net_map: Vec<Option<NetId>>,
@@ -57,6 +57,18 @@ pub(crate) struct DerivedTopology {
     islands: DenseIdStore<IslandId, IslandTopology>,
     net_island_map: Vec<Option<IslandId>>,
     device_island_map: Vec<Option<IslandId>>,
+
+    invalidation: WorldInvalidation,
+}
+
+impl PartialEq for DerivedTopology {
+    fn eq(&self, other: &Self) -> bool {
+        self.nets == other.nets
+            && self.wire_net_map == other.wire_net_map
+            && self.islands == other.islands
+            && self.net_island_map == other.net_island_map
+            && self.device_island_map == other.device_island_map
+    }
 }
 
 impl DerivedTopology {
@@ -120,6 +132,18 @@ impl DerivedTopology {
             }
         }
 
+        topology.invalidation.clear();
+
+        let live_islands: Vec<_> = topology
+            .islands
+            .iter()
+            .map(|(island_id, _)| island_id)
+            .collect();
+
+        for island_id in live_islands {
+            topology.invalidation.mark_topology_dirty(island_id);
+        }
+
         #[cfg(any(test, debug_assertions))]
         topology.assert_consistent(network);
 
@@ -131,7 +155,10 @@ impl DerivedTopology {
         ensure_slot(&mut self.wire_net_map, wire.index());
         debug_assert!(self.wire_net_map[wire.index()].is_none());
 
-        let net_id = self.nets.insert(Net { wires: vec![wire] });
+        let net_id = self.nets.insert(Net {
+            wires: vec![wire],
+            terminal_devices: Vec::new(),
+        });
 
         debug_assert_eq!(net_id.index(), self.net_island_map.len());
         self.net_island_map.push(None);
@@ -148,7 +175,9 @@ impl DerivedTopology {
             devices: vec![device],
             revision: 0,
         });
+
         self.device_island_map[device.index()] = Some(island_id);
+        self.invalidation.mark_topology_dirty(island_id);
     }
 
     pub(crate) fn connect_wires(&mut self, network: &Network, wire_a: WireId, wire_b: WireId) {
@@ -218,17 +247,23 @@ impl DerivedTopology {
             self.wire_net_map[wire.index()] = Some(dst_net_id);
         }
 
-        self.nets
+        let dst_net = self
+            .nets
             .get_mut(dst_net_id)
-            .expect("destination net must survive source removal")
-            .wires
-            .extend(src_net.wires);
+            .expect("destination net must survive source removal");
+
+        dst_net.wires.extend(src_net.wires);
+        dst_net.terminal_devices.extend(src_net.terminal_devices);
 
         if bump_final_island {
+            let island = final_island.expect("same-island net merge must have an island");
+
             self.islands
-                .get_mut(final_island.expect("same-island net merge must have an island"))
+                .get_mut(island)
                 .expect("merged net must reference a live island")
                 .bump_revision();
+
+            self.invalidation.mark_topology_dirty(island);
         }
     }
 
@@ -236,13 +271,22 @@ impl DerivedTopology {
         let net_id = self.wire_net(wire);
         let device_island = self.device_island(device);
 
+        self.nets
+            .get_mut(net_id)
+            .expect("attached wire must reference a live net")
+            .terminal_devices
+            .push(device);
+
         match self.net_island(net_id) {
             None => {
                 self.net_island_map[net_id.index()] = Some(device_island);
+
                 self.islands
                     .get_mut(device_island)
                     .expect("device must reference a live island")
                     .bump_revision();
+
+                self.invalidation.mark_topology_dirty(device_island);
             }
 
             Some(island) if island == device_island => {
@@ -250,6 +294,8 @@ impl DerivedTopology {
                     .get_mut(island)
                     .expect("device/net island must be live")
                     .bump_revision();
+
+                self.invalidation.mark_topology_dirty(island);
             }
 
             Some(island) => {
@@ -273,6 +319,22 @@ impl DerivedTopology {
             Some(island_id),
             "detached terminal's net and device must have belonged to the same island"
         );
+
+        {
+            let net = self
+                .nets
+                .get_mut(net_id)
+                .expect("detached wire must reference a live net");
+
+            let position = net
+                .terminal_devices
+                .iter()
+                .position(|&member| member == device)
+                .expect("net must contain an incidence for the detached terminal");
+
+            // Multiplicity matters: remove exactly one attached terminal.
+            net.terminal_devices.swap_remove(position);
+        }
 
         self.repair_island(network, scratch, island_id, std::slice::from_ref(&net_id));
     }
@@ -329,11 +391,25 @@ impl DerivedTopology {
     pub(crate) fn remove_device(
         &mut self,
         network: &Network,
-
         scratch: &mut TraversalScratch,
         device: DeviceId,
         affected_nets: &[NetId],
     ) {
+        for &net_id in affected_nets {
+            let net = self
+                .nets
+                .get_mut(net_id)
+                .expect("removed device's attached net must remain live");
+
+            let position = net
+                .terminal_devices
+                .iter()
+                .position(|&member| member == device)
+                .expect("attached net must contain removed device incidence");
+
+            net.terminal_devices.swap_remove(position);
+        }
+
         let island_id = self
             .device_island_map
             .get_mut(device.index())
@@ -397,26 +473,34 @@ impl DerivedTopology {
         let keep_index = components
             .iter()
             .enumerate()
-            .max_by_key(|(_, component)| component.len())
+            .max_by_key(|(_, component)| component.wires.len())
             .map(|(index, _)| index)
             .expect("non-empty component list must have a largest member");
 
         let kept = components.swap_remove(keep_index);
 
-        for &wire in &kept {
+        for &wire in &kept.wires {
             self.wire_net_map[wire.index()] = Some(net_id);
         }
 
-        self.nets
-            .get_mut(net_id)
-            .expect("old NetId must survive a non-empty repartition")
-            .wires = kept;
+        {
+            let net = self
+                .nets
+                .get_mut(net_id)
+                .expect("old NetId must survive a non-empty repartition");
+
+            net.wires = kept.wires;
+            net.terminal_devices = kept.terminal_devices;
+        }
 
         let mut resulting_nets = SmallVec::with_capacity(components.len() + 1);
         resulting_nets.push(net_id);
 
         for component in components {
-            let new_id = self.nets.insert(Net { wires: component });
+            let new_id = self.nets.insert(Net {
+                wires: component.wires,
+                terminal_devices: component.terminal_devices,
+            });
 
             debug_assert_eq!(new_id.index(), self.net_island_map.len());
             self.net_island_map.push(old_island);
@@ -476,6 +560,8 @@ impl DerivedTopology {
                 .remove(island_id)
                 .expect("empty repaired island must still be live");
 
+            self.invalidation.mark_retired(island_id);
+
             return;
         }
 
@@ -501,6 +587,8 @@ impl DerivedTopology {
             island.devices = kept.devices;
             island.revision = next_revision;
         }
+
+        self.invalidation.mark_topology_dirty(island_id);
 
         for component in components {
             let nets = component.nets;
@@ -537,6 +625,8 @@ impl DerivedTopology {
 
                 device_island_map[device_id.index()] = Some(new_island_id);
             }
+
+            self.invalidation.mark_topology_dirty(new_island_id);
         }
     }
 
@@ -591,8 +681,12 @@ impl DerivedTopology {
             .islands
             .get_mut(dst_id)
             .expect("destination island must survive source removal");
+
         dst.devices.extend(src.devices);
         dst.bump_revision();
+
+        self.invalidation.mark_retired(src_id);
+        self.invalidation.mark_topology_dirty(dst_id);
 
         dst_id
     }
@@ -638,7 +732,7 @@ impl DerivedTopology {
     }
 
     #[inline]
-    fn device_island(&self, device: DeviceId) -> IslandId {
+    pub(crate) fn device_island(&self, device: DeviceId) -> IslandId {
         self.device_island_map[device.index()].expect("live device must have a derived IslandId")
     }
 
@@ -675,6 +769,24 @@ impl DerivedTopology {
     pub(crate) fn islands(&self) -> impl ExactSizeIterator<Item = (IslandId, &IslandTopology)> {
         self.islands.iter()
     }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn invalidation(&self) -> &WorldInvalidation {
+        &self.invalidation
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn clear_invalidation(&mut self) {
+        self.invalidation.clear();
+    }
+
+    #[inline]
+    pub(crate) fn mark_device_numerical_dirty(&mut self, device: DeviceId) {
+        let island = self.device_island(device);
+        self.invalidation.mark_numerical_dirty(island);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -705,6 +817,7 @@ impl IslandTopology {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Net {
     wires: Vec<WireId>,
+    terminal_devices: Vec<DeviceId>,
 }
 
 impl Net {
@@ -729,6 +842,74 @@ fn wire_id(index: usize) -> WireId {
 fn device_id(index: usize) -> DeviceId {
     DeviceId::try_from(u32::try_from(index + 1).expect("device index must fit DeviceId"))
         .expect("device IDs are one-based")
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct WorldInvalidation {
+    topology_dirty: SmallVec<[IslandId; 4]>,
+    numerical_dirty: SmallVec<[IslandId; 4]>,
+    retired: SmallVec<[IslandId; 4]>,
+}
+
+impl WorldInvalidation {
+    #[inline]
+    fn mark_topology_dirty(&mut self, island: IslandId) {
+        if self.retired.contains(&island) {
+            return;
+        }
+
+        self.numerical_dirty.retain(|dirty| *dirty != island);
+
+        if !self.topology_dirty.contains(&island) {
+            self.topology_dirty.push(island);
+        }
+    }
+
+    #[inline]
+    fn mark_numerical_dirty(&mut self, island: IslandId) {
+        if self.retired.contains(&island) || self.topology_dirty.contains(&island) {
+            return;
+        }
+
+        if !self.numerical_dirty.contains(&island) {
+            self.numerical_dirty.push(island);
+        }
+    }
+
+    #[inline]
+    fn mark_retired(&mut self, island: IslandId) {
+        self.topology_dirty.retain(|dirty| *dirty != island);
+        self.numerical_dirty.retain(|dirty| *dirty != island);
+
+        if !self.retired.contains(&island) {
+            self.retired.push(island);
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.topology_dirty.clear();
+        self.numerical_dirty.clear();
+        self.retired.clear();
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn topology_dirty_islands(&self) -> &[IslandId] {
+        &self.topology_dirty
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn numerical_dirty_islands(&self) -> &[IslandId] {
+        &self.numerical_dirty
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn retired_islands(&self) -> &[IslandId] {
+        &self.retired
+    }
 }
 
 #[cfg(test)]
@@ -1540,5 +1721,109 @@ mod tests {
         assert_eq!(NetId::try_from(1).unwrap().get(), 1);
 
         assert_eq!(IslandId::try_from(1).unwrap().get(), 1);
+    }
+
+    #[test]
+    fn net_terminal_incidence_preserves_device_multiplicity() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut topology = DerivedTopology::default();
+        let mut scratch = TraversalScratch::default();
+
+        let w = wire(1);
+        let d = device(1);
+
+        add_wire(&mut network, &mut topology, w);
+
+        add_device(
+            &mut network,
+            &mut topology,
+            &definitions,
+            d,
+            PrimitiveElementKind::Admittance,
+        );
+
+        attach(&mut network, &mut topology, w, d, 0);
+        attach(&mut network, &mut topology, w, d, 1);
+
+        let net_id = topology.wire_net(w);
+
+        assert_eq!(
+            topology
+                .net(net_id)
+                .unwrap()
+                .terminal_devices
+                .iter()
+                .filter(|&&device| device == d)
+                .count(),
+            2
+        );
+
+        detach(&mut network, &mut topology, &mut scratch, w, d, 0);
+
+        assert_eq!(
+            topology
+                .net(net_id)
+                .unwrap()
+                .terminal_devices
+                .iter()
+                .filter(|&&device| device == d)
+                .count(),
+            1
+        );
+
+        assert_eq!(topology.net_island(net_id), Some(topology.device_island(d)));
+    }
+
+    #[test]
+    fn island_merge_records_dirty_survivor_and_retired_source() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut topology = DerivedTopology::default();
+
+        let a = wire(1);
+        let b = wire(2);
+        let da = device(1);
+        let db = device(2);
+
+        add_wire(&mut network, &mut topology, a);
+        add_wire(&mut network, &mut topology, b);
+
+        add_device(
+            &mut network,
+            &mut topology,
+            &definitions,
+            da,
+            PrimitiveElementKind::Admittance,
+        );
+        add_device(
+            &mut network,
+            &mut topology,
+            &definitions,
+            db,
+            PrimitiveElementKind::Admittance,
+        );
+
+        attach(&mut network, &mut topology, a, da, 0);
+        attach(&mut network, &mut topology, b, db, 0);
+
+        let old_a = topology.device_island(da);
+        let old_b = topology.device_island(db);
+
+        topology.clear_invalidation();
+
+        connect(&mut network, &mut topology, a, b);
+
+        let survivor = topology.device_island(da);
+        assert_eq!(survivor, topology.device_island(db));
+
+        let retired = if survivor == old_a { old_b } else { old_a };
+
+        assert_eq!(
+            topology.invalidation().topology_dirty_islands(),
+            &[survivor]
+        );
+        assert_eq!(topology.invalidation().retired_islands(), &[retired]);
+        assert!(topology.invalidation().numerical_dirty_islands().is_empty());
     }
 }

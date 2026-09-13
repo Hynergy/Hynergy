@@ -127,6 +127,8 @@ impl DerivedTopology {
                 );
             }
 
+            let mut expected_terminal_devices = Vec::new();
+
             for &wire in &net.wires {
                 assert!(
                     network
@@ -147,7 +149,33 @@ impl DerivedTopology {
                     "wire appears in more than one net"
                 );
 
+                for connection in network
+                    .wire_connections(wire)
+                    .expect("wire in live net must exist")
+                {
+                    if let Some((device, _)) = connection.as_terminal() {
+                        expected_terminal_devices.push(device);
+                    }
+                }
+
                 seen_wires[wire.index()] = true;
+            }
+
+            let mut actual_terminal_devices = net.terminal_devices.clone();
+
+            expected_terminal_devices.sort_unstable_by_key(|device| device.index());
+            actual_terminal_devices.sort_unstable_by_key(|device| device.index());
+
+            assert_eq!(
+                actual_terminal_devices, expected_terminal_devices,
+                "Net terminal incidence disagrees with Network wire connections"
+            );
+
+            if !net.terminal_devices.is_empty() {
+                assert!(
+                    island_id.is_some(),
+                    "a net with attached terminals must belong to an island"
+                );
             }
         }
 

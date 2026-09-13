@@ -758,7 +758,7 @@ mod tests {
                 code: DefinitionRegistrationCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
-                definition_id: u32::MAX
+                definition_id: 7
             }
         );
 

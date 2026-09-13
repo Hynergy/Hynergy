@@ -332,7 +332,11 @@ impl World {
         value: f64,
     ) -> Result<(), NetworkModelError> {
         self.network
-            .set_device_parameter(definitions, device, parameter, value)
+            .set_device_parameter(definitions, device, parameter, value)?;
+
+        self.derived_topology.mark_device_numerical_dirty(device);
+
+        Ok(())
     }
 
     #[inline]
@@ -405,12 +409,17 @@ mod tests {
     }
 
     #[test]
-    fn parameter_changes_do_not_change_topology() {
+    fn parameter_changes_invalidate_numerics_without_changing_topology() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::default();
         let d = device(1);
 
         world.add_device(&definitions, d, admittance()).unwrap();
+
+        let island = world.derived_topology.device_island(d);
+        let revision = world.derived_topology.island(island).unwrap().revision();
+
+        world.derived_topology.clear_invalidation();
 
         let before = world.derived_topology.clone();
 
@@ -421,6 +430,29 @@ mod tests {
         assert_eq!(world.derived_topology, before);
 
         assert_eq!(
+            world.derived_topology.island(island).unwrap().revision(),
+            revision
+        );
+
+        assert!(
+            world
+                .derived_topology
+                .invalidation()
+                .topology_dirty_islands()
+                .is_empty()
+        );
+
+        assert_eq!(
+            world
+                .derived_topology
+                .invalidation()
+                .numerical_dirty_islands(),
+            &[island]
+        );
+
+        let invalidation_before_failure = world.derived_topology.invalidation().clone();
+
+        assert_eq!(
             world.set_device_parameter(&definitions, d, ParameterId::new(0), 0.0,),
             Err(NetworkModelError::ParameterConstraint {
                 parameter: ParameterId::new(0),
@@ -428,7 +460,10 @@ mod tests {
             })
         );
 
-        assert_eq!(world.derived_topology, before);
+        assert_eq!(
+            world.derived_topology.invalidation(),
+            &invalidation_before_failure
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ impl IslandVertex {
     }
 
     #[inline]
+    #[allow(dead_code)]
     unsafe fn net_unchecked(self) -> NetId {
         debug_assert_eq!(self.0.get() & Self::TYPE_BIT, 0);
 
@@ -59,6 +60,7 @@ impl IslandVertex {
     }
 
     #[inline]
+    #[allow(dead_code)]
     unsafe fn device_unchecked(self) -> DeviceId {
         debug_assert_ne!(self.0.get() & Self::TYPE_BIT, 0);
 
@@ -102,13 +104,12 @@ impl From<DeviceId> for IslandVertex {
     }
 }
 
-
 pub(super) fn wire_components(
     topology: &DerivedTopology,
     network: &Network,
     net_id: NetId,
     scratch: &mut TraversalScratch,
-) -> Vec<Vec<WireId>> {
+) -> Vec<WireComponent> {
     scratch.begin_wire_traversal(network.wires().len());
 
     let candidates = &topology
@@ -132,29 +133,33 @@ pub(super) fn wire_components(
 
         scratch.wire_stack.push(start);
 
-        let mut component = Vec::new();
+        let mut component = WireComponent::default();
 
         while let Some(wire) = scratch.wire_stack.pop() {
-            component.push(wire);
+            component.wires.push(wire);
 
             for connection in network
                 .wire_connections(wire)
                 .expect("visited repair wire must still be live")
             {
-                let Some(neighbor) = connection.as_wire() else {
+                if let Some(neighbor) = connection.as_wire() {
+                    let index = neighbor.index();
+
+                    debug_assert_eq!(
+                        topology.wire_net_map[index],
+                        Some(net_id),
+                        "destructive mutation cannot create a cross-net wire edge"
+                    );
+
+                    if scratch.visit_wire(index) {
+                        scratch.wire_stack.push(neighbor);
+                    }
+
                     continue;
-                };
+                }
 
-                let index = neighbor.index();
-
-                debug_assert_eq!(
-                    topology.wire_net_map[index],
-                    Some(net_id),
-                    "destructive mutation cannot create a cross-net wire edge"
-                );
-
-                if scratch.visit_wire(index) {
-                    scratch.wire_stack.push(neighbor);
+                if let Some((device, _)) = connection.as_terminal() {
+                    component.terminal_devices.push(device);
                 }
             }
         }
@@ -238,25 +243,16 @@ fn walk_island_component(
                     .get(net_id)
                     .expect("visited island net must be live");
 
-                for &wire in &net.wires {
-                    for connection in network
-                        .wire_connections(wire)
-                        .expect("wire in live net must exist")
-                    {
-                        let Some((device_id, _)) = connection.as_terminal() else {
-                            continue;
-                        };
+                for &device_id in &net.terminal_devices {
+                    let index = device_id.index();
 
-                        let index = device_id.index();
-
-                        if !scratch.visit_device(index) {
-                            continue;
-                        }
-
-                        debug_assert_eq!(topology.device_island_map[index], Some(island_id));
-
-                        scratch.island_stack.push(device_id.into());
+                    if !scratch.visit_device(index) {
+                        continue;
                     }
+
+                    debug_assert_eq!(topology.device_island_map[index], Some(island_id));
+
+                    scratch.island_stack.push(device_id.into());
                 }
             }
 
@@ -383,4 +379,10 @@ impl TraversalScratch {
         self.touched_devices.push(index);
         true
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct WireComponent {
+    pub(super) wires: Vec<WireId>,
+    pub(super) terminal_devices: Vec<DeviceId>,
 }

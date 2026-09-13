@@ -543,13 +543,12 @@ mod tests {
         bytes
     }
 
-    fn definition_buffer(reserved: u32, commands: &[Vec<u8>]) -> Vec<u8> {
+    fn definition_buffer(commands: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = Vec::new();
-
         bytes.extend_from_slice(&DEFINITION_BUFFER_MAGIC);
         bytes.extend_from_slice(&DEFINITION_BUFFER_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&reserved.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // reserved
         bytes.extend_from_slice(&(commands.len() as u32).to_le_bytes());
 
         for command in commands {
@@ -666,7 +665,7 @@ mod tests {
         let mut engine = Engine::new();
 
         let definition_id =
-            register_definition_buffer(&mut engine, &definition_buffer(0, &[])).unwrap();
+            register_definition_buffer(&mut engine, &definition_buffer(&[])).unwrap();
 
         assert_eq!(definition_id.get(), Engine::COMPOSITE_DEFINITION_ID_BASE);
 
@@ -695,11 +694,7 @@ mod tests {
             ),
         ];
 
-        register_definition_buffer(
-            &mut engine,
-            &definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &commands),
-        )
-        .unwrap();
+        register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
 
         let definition = registered_definition(&engine);
 
@@ -719,7 +714,7 @@ mod tests {
 
     #[test]
     fn truncated_header_reports_input_end() {
-        let bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+        let bytes = definition_buffer(&[]);
 
         for length in [0, 1, 3, 5, 7, 11, 15] {
             assert_error(
@@ -733,7 +728,7 @@ mod tests {
 
     #[test]
     fn invalid_header_fields_report_their_offsets() {
-        let valid = definition_buffer(0, &[]);
+        let valid = definition_buffer(&[]);
 
         let mut invalid_magic = valid.clone();
         invalid_magic[0] = b'X';
@@ -775,7 +770,7 @@ mod tests {
 
     #[test]
     fn truncated_command_frame_reports_command_index() {
-        let mut bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+        let mut bytes = definition_buffer(&[]);
         bytes[12..16].copy_from_slice(&1_u32.to_le_bytes());
 
         assert_error(
@@ -788,14 +783,11 @@ mod tests {
 
     #[test]
     fn truncated_command_payload_reports_input_end() {
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[framed_command(
-                DEFINITION_COMMAND_ADD_ELEMENT,
-                8,
-                &1_u32.to_le_bytes(),
-            )],
-        );
+        let bytes = definition_buffer(&[framed_command(
+            DEFINITION_COMMAND_ADD_ELEMENT,
+            8,
+            &1_u32.to_le_bytes(),
+        )]);
 
         assert_error(
             &bytes,
@@ -807,7 +799,7 @@ mod tests {
 
     #[test]
     fn unknown_command_reports_command_start() {
-        let bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[command(99, &[])]);
+        let bytes = definition_buffer(&[command(99, &[])]);
 
         assert_error(
             &bytes,
@@ -820,8 +812,7 @@ mod tests {
     #[test]
     fn fixed_empty_payload_commands_reject_nonempty_payloads() {
         for tag in [DEFINITION_COMMAND_ADD_TERMINAL, DEFINITION_COMMAND_ADD_NODE] {
-            let bytes =
-                definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[command(tag, &[0])]);
+            let bytes = definition_buffer(&[command(tag, &[0])]);
 
             assert_error(
                 &bytes,
@@ -837,10 +828,7 @@ mod tests {
         let mut payload = constraints_payload(None, None, false, None);
         payload.push(0);
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)],
-        );
+        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)]);
 
         assert_error(
             &bytes,
@@ -855,10 +843,7 @@ mod tests {
         let mut payload = element_payload(1, &[], &[]);
         payload.push(0);
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
-        );
+        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
 
         assert_error(
             &bytes,
@@ -906,11 +891,7 @@ mod tests {
 
         let mut engine = Engine::new();
 
-        register_definition_buffer(
-            &mut engine,
-            &definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &commands),
-        )
-        .unwrap();
+        register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
 
         assert_eq!(registered_definition(&engine).parameters(), &[expected]);
     }
@@ -924,13 +905,10 @@ mod tests {
             CONSTRAINT_RECIPROCAL_LOWER,
             CONSTRAINT_RECIPROCAL_UPPER,
         ] {
-            let bytes = definition_buffer(
-                Engine::COMPOSITE_DEFINITION_ID_BASE,
-                &[command(
-                    DEFINITION_COMMAND_ADD_PARAMETER,
-                    &flags.to_le_bytes(),
-                )],
-            );
+            let bytes = definition_buffer(&[command(
+                DEFINITION_COMMAND_ADD_PARAMETER,
+                &flags.to_le_bytes(),
+            )]);
 
             assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidFlags, 0, 22);
         }
@@ -942,10 +920,7 @@ mod tests {
         payload.extend_from_slice(&CONSTRAINT_LOWER.to_le_bytes());
         payload.extend_from_slice(&1_u32.to_le_bytes());
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)],
-        );
+        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)]);
 
         assert_error(
             &bytes,
@@ -957,13 +932,10 @@ mod tests {
 
     #[test]
     fn zero_element_definition_id_is_rejected() {
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(
-                DEFINITION_COMMAND_ADD_ELEMENT,
-                &element_payload(0, &[], &[]),
-            )],
-        );
+        let bytes = definition_buffer(&[command(
+            DEFINITION_COMMAND_ADD_ELEMENT,
+            &element_payload(0, &[], &[]),
+        )]);
 
         assert_error(
             &bytes,
@@ -979,10 +951,7 @@ mod tests {
         payload.extend_from_slice(&1_u32.to_le_bytes());
         payload.extend_from_slice(&u32::MAX.to_le_bytes());
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
-        );
+        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
 
         assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidCount, 0, 26);
     }
@@ -994,10 +963,7 @@ mod tests {
         payload.extend_from_slice(&0_u32.to_le_bytes());
         payload.extend_from_slice(&u32::MAX.to_le_bytes());
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
-        );
+        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
 
         assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidCount, 0, 30);
     }
@@ -1011,10 +977,7 @@ mod tests {
         payload.push(99);
         payload.extend_from_slice(&0_u32.to_le_bytes());
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
-        );
+        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
 
         assert_error(
             &bytes,
@@ -1098,11 +1061,9 @@ mod tests {
                     .map(Vec::len)
                     .sum::<usize>();
 
-            let error = register_definition_buffer(
-                &mut Engine::new(),
-                &definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &commands),
-            )
-            .unwrap_err();
+            let error =
+                register_definition_buffer(&mut Engine::new(), &definition_buffer(&commands))
+                    .unwrap_err();
 
             assert_eq!(error.kind(), expected_kind);
             assert_eq!(error.command_index(), command_index);
@@ -1114,13 +1075,10 @@ mod tests {
     fn failed_buffer_does_not_register_definition() {
         let mut engine = Engine::new();
 
-        let bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[
-                command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                command(99, &[]),
-            ],
-        );
+        let bytes = definition_buffer(&[
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(99, &[]),
+        ]);
 
         assert_eq!(
             register_definition_buffer(&mut engine, &bytes)
@@ -1139,10 +1097,7 @@ mod tests {
 
     #[test]
     fn command_count_larger_than_available_commands_is_rejected() {
-        let mut bytes = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_NODE, &[])],
-        );
+        let mut bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_NODE, &[])]);
         bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
 
         assert_error(
@@ -1155,7 +1110,7 @@ mod tests {
 
     #[test]
     fn bytes_after_declared_commands_are_rejected() {
-        let mut bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+        let mut bytes = definition_buffer(&[]);
         bytes.extend_from_slice(&command(DEFINITION_COMMAND_ADD_NODE, &[]));
 
         assert_error(
@@ -1170,9 +1125,9 @@ mod tests {
     fn registration_returns_engine_assigned_definition_ids() {
         let mut engine = Engine::new();
 
-        let first = register_definition_buffer(&mut engine, &definition_buffer(0, &[])).unwrap();
+        let first = register_definition_buffer(&mut engine, &definition_buffer(&[])).unwrap();
 
-        let second = register_definition_buffer(&mut engine, &definition_buffer(0, &[])).unwrap();
+        let second = register_definition_buffer(&mut engine, &definition_buffer(&[])).unwrap();
 
         assert_eq!(first.get(), Engine::COMPOSITE_DEFINITION_ID_BASE);
 
