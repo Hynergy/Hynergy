@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["hynergy-ffi", "hynergy-engine", "hynergy-model", "hynergy-protocol", "hynergy-ids", ]
+members = [
+    "hynergy-ffi",
+    "hynergy-engine",
+    "hynergy-model",
+    "hynergy-protocol",
+    "hynergy-ids",
+]
 
 [workspace.package]
 version = "0.0.1-dev"
@@ -12,3 +18,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[profile.bench]
+debug = 1
+strip = false

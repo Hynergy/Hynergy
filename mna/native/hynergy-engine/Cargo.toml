@@ -7,3 +7,10 @@ edition.workspace = true
 hynergy-model = { path = "../hynergy-model" }
 hynergy-ids = { path = "../hynergy-ids" }
 smallvec = "1.16.1"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "world"
+harness = false
