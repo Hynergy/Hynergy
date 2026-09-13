@@ -344,10 +344,10 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, World, WorldCommand, WorldCommandApplyError};
-    use hynergy_model::device::definition::{DeviceId, PrimitiveElementKind, TerminalId};
+    use super::*;
+    use hynergy_model::device::definition::PrimitiveElementKind;
     use hynergy_model::device::registry::DefinitionRegistry;
-    use hynergy_model::network::{NetworkModelError, WireId};
+    use hynergy_model::parameter::{ParameterConstraintError, ParameterId};
 
     fn wire(raw: u32) -> WireId {
         WireId::try_from(raw).unwrap()
@@ -357,8 +357,12 @@ mod tests {
         DeviceId::try_from(raw).unwrap()
     }
 
+    fn admittance() -> DefinitionId {
+        PrimitiveElementKind::Admittance.into()
+    }
+
     #[test]
-    fn world_updates_authoritative_network_before_derived_topology() {
+    fn world_updates_network_and_topology_consistently() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::default();
         let a = wire(1);
@@ -368,20 +372,19 @@ mod tests {
         world.add_wire(a).unwrap();
         world.add_wire(b).unwrap();
         world.connect_wires(a, b).unwrap();
-        world
-            .add_device(&definitions, d, PrimitiveElementKind::Admittance.into())
-            .unwrap();
+        world.add_device(&definitions, d, admittance()).unwrap();
         world.attach_terminal(a, d, TerminalId::new(0)).unwrap();
         world.detach_terminal(a, d, TerminalId::new(0)).unwrap();
         world.disconnect_wires(a, b).unwrap();
-        world.remove_wire(b).unwrap();
         world.remove_device(d).unwrap();
+        world.remove_wire(b).unwrap();
+        world.remove_wire(a).unwrap();
 
         world.derived_topology.assert_consistent(&world.network);
     }
 
     #[test]
-    fn failed_model_mutation_does_not_change_derived_topology() {
+    fn failed_network_mutation_does_not_change_topology() {
         let mut world = World::default();
         let a = wire(1);
         let b = wire(2);
@@ -389,6 +392,7 @@ mod tests {
         world.add_wire(a).unwrap();
         world.add_wire(b).unwrap();
         world.connect_wires(a, b).unwrap();
+
         let before = world.derived_topology.clone();
 
         assert_eq!(
@@ -396,7 +400,44 @@ mod tests {
             Err(NetworkModelError::AlreadyConnected)
         );
         assert_eq!(world.derived_topology, before);
+
         world.derived_topology.assert_consistent(&world.network);
+    }
+
+    #[test]
+    fn parameter_changes_do_not_change_topology() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::default();
+        let d = device(1);
+
+        world.add_device(&definitions, d, admittance()).unwrap();
+
+        let before = world.derived_topology.clone();
+
+        world
+            .set_device_parameter(&definitions, d, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        assert_eq!(world.derived_topology, before);
+
+        assert_eq!(
+            world.set_device_parameter(&definitions, d, ParameterId::new(0), 0.0,),
+            Err(NetworkModelError::ParameterConstraint {
+                parameter: ParameterId::new(0),
+                source: ParameterConstraintError::OutOfRange,
+            })
+        );
+
+        assert_eq!(world.derived_topology, before);
+    }
+
+    #[test]
+    fn world_ids_are_sequential() {
+        let mut engine = Engine::new();
+
+        assert_eq!(engine.new_world().unwrap(), 0);
+        assert_eq!(engine.new_world().unwrap(), 1);
+        assert_eq!(engine.new_world().unwrap(), 2);
     }
 
     #[test]
@@ -406,51 +447,235 @@ mod tests {
         let first = engine.new_world().unwrap();
         let second = engine.new_world().unwrap();
 
-        assert_eq!(first, 0);
-        assert_eq!(second, 1);
-
         engine.destroy_world(first).unwrap();
 
         let third = engine.new_world().unwrap();
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
         assert_eq!(third, 2);
 
-        assert!(engine.world(first).is_none());
-        assert!(engine.world(second).is_some());
-        assert!(engine.world(third).is_some());
+        assert!(!engine.contains_world(first));
+        assert!(engine.contains_world(second));
+        assert!(engine.contains_world(third));
     }
 
     #[test]
-    fn applying_command_to_unknown_world_fails() {
+    fn destroying_unknown_or_already_destroyed_world_fails() {
+        let mut engine = Engine::new();
+        let world = engine.new_world().unwrap();
+
+        engine.destroy_world(world).unwrap();
+
+        assert_eq!(
+            engine.destroy_world(world),
+            Err(WorldManagementError::UnknownWorld)
+        );
+        assert_eq!(
+            engine.destroy_world(999),
+            Err(WorldManagementError::UnknownWorld)
+        );
+    }
+
+    #[test]
+    fn world_lookup_tracks_liveness() {
+        let mut engine = Engine::new();
+        let world = engine.new_world().unwrap();
+
+        assert!(engine.world(world).is_some());
+        assert!(engine.contains_world(world));
+
+        engine.destroy_world(world).unwrap();
+
+        assert!(engine.world(world).is_none());
+        assert!(!engine.contains_world(world));
+    }
+
+    #[test]
+    fn command_to_unknown_world_fails() {
         let mut engine = Engine::new();
 
         assert_eq!(
-            engine.apply_world_command(
-                0,
-                WorldCommand::AddWire {
-                    wire: WireId::try_from(1).unwrap(),
-                },
-            ),
+            engine.apply_world_command(0, WorldCommand::AddWire { wire: wire(1) },),
             Err(WorldCommandApplyError::UnknownWorld)
         );
     }
 
     #[test]
-    fn world_commands_mutate_the_world() {
+    fn command_to_destroyed_world_fails() {
         let mut engine = Engine::new();
         let world = engine.new_world().unwrap();
-        let wire = WireId::try_from(1).unwrap();
+
+        engine.destroy_world(world).unwrap();
+
+        assert_eq!(
+            engine.apply_world_command(world, WorldCommand::AddWire { wire: wire(1) },),
+            Err(WorldCommandApplyError::UnknownWorld)
+        );
+    }
+
+    #[test]
+    fn every_world_command_variant_dispatches() {
+        let mut engine = Engine::new();
+        let world = engine.new_world().unwrap();
+        let a = wire(1);
+        let b = wire(2);
+        let d = device(1);
+
+        engine
+            .apply_world_command(world, WorldCommand::AddWire { wire: a })
+            .unwrap();
+
+        engine
+            .apply_world_command(world, WorldCommand::AddWire { wire: b })
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::ConnectWires {
+                    wire_a: a,
+                    wire_b: b,
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::DisconnectWires {
+                    wire_a: a,
+                    wire_b: b,
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AddDevice {
+                    device: d,
+                    definition: admittance(),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AttachTerminal {
+                    wire: a,
+                    device: d,
+                    terminal: TerminalId::new(0),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::DetachTerminal {
+                    wire: a,
+                    device: d,
+                    terminal: TerminalId::new(0),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::SetDeviceParameter {
+                    device: d,
+                    parameter: ParameterId::new(0),
+                    value: 1.0,
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(world, WorldCommand::RemoveDevice { device: d })
+            .unwrap();
+
+        engine
+            .apply_world_command(world, WorldCommand::RemoveWire { wire: b })
+            .unwrap();
+
+        engine
+            .apply_world_command(world, WorldCommand::RemoveWire { wire: a })
+            .unwrap();
+
+        let world = engine.world(world).unwrap();
+
+        assert!(world.network.wires().iter().all(Option::is_none));
+        assert!(world.network.devices().iter().all(Option::is_none));
+
+        world.derived_topology.assert_consistent(&world.network);
+    }
+
+    #[test]
+    fn command_dispatch_preserves_model_errors() {
+        let mut engine = Engine::new();
+        let world = engine.new_world().unwrap();
+        let wire = wire(1);
 
         engine
             .apply_world_command(world, WorldCommand::AddWire { wire })
             .unwrap();
 
+        assert_eq!(
+            engine.apply_world_command(world, WorldCommand::AddWire { wire },),
+            Err(WorldCommandApplyError::Model(
+                NetworkModelError::IdAlreadyAssigned { id: wire.id() }
+            ))
+        );
+    }
+
+    #[test]
+    fn connect_and_attach_commands_update_network_connections() {
+        let mut engine = Engine::new();
+        let world = engine.new_world().unwrap();
+        let a = wire(1);
+        let b = wire(2);
+        let d = device(1);
+        let terminal = TerminalId::new(0);
+
+        for command in [
+            WorldCommand::AddWire { wire: a },
+            WorldCommand::AddWire { wire: b },
+            WorldCommand::ConnectWires {
+                wire_a: a,
+                wire_b: b,
+            },
+            WorldCommand::AddDevice {
+                device: d,
+                definition: admittance(),
+            },
+            WorldCommand::AttachTerminal {
+                wire: a,
+                device: d,
+                terminal,
+            },
+        ] {
+            engine.apply_world_command(world, command).unwrap();
+        }
+
+        let connections = engine
+            .world(world)
+            .unwrap()
+            .network()
+            .wire_connections(a)
+            .unwrap();
+
         assert!(
-            engine
-                .world(world)
-                .unwrap()
-                .network()
-                .wire_connections(wire)
-                .is_ok()
+            connections
+                .iter()
+                .any(|connection| connection.as_wire() == Some(b))
+        );
+        assert!(
+            connections
+                .iter()
+                .any(|connection| { connection.as_terminal() == Some((d, terminal)) })
         );
     }
 }

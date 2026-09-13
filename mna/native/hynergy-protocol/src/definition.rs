@@ -518,7 +518,6 @@ fn truncated_header(error: Truncated) -> DefinitionRegistrationError {
 mod tests {
     use super::*;
     use hynergy_model::device::definition::DeviceBody;
-    use hynergy_model::parameter::Bound;
 
     #[derive(Clone, Copy)]
     enum TestValue {
@@ -534,26 +533,11 @@ mod tests {
         bytes
     }
 
-    fn element_payload(device: u32, terminals: &[u32], parameters: &[TestValue]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&device.to_le_bytes());
-        bytes.extend_from_slice(&(terminals.len() as u32).to_le_bytes());
-        for terminal in terminals {
-            bytes.extend_from_slice(&terminal.to_le_bytes());
-        }
-        bytes.extend_from_slice(&(parameters.len() as u32).to_le_bytes());
-        for parameter in parameters {
-            match parameter {
-                TestValue::Literal(value) => {
-                    bytes.push(DEFINITION_VALUE_LITERAL);
-                    bytes.extend_from_slice(&value.to_le_bytes());
-                }
-                TestValue::Parameter(index) => {
-                    bytes.push(DEFINITION_VALUE_PARAMETER);
-                    bytes.extend_from_slice(&index.to_le_bytes());
-                }
-            }
-        }
+    fn framed_command(tag: u16, payload_length: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(6 + payload.len());
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&payload_length.to_le_bytes());
+        bytes.extend_from_slice(payload);
         bytes
     }
 
@@ -564,9 +548,38 @@ mod tests {
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&id.to_le_bytes());
         bytes.extend_from_slice(&(commands.len() as u32).to_le_bytes());
+
         for command in commands {
             bytes.extend_from_slice(command);
         }
+
+        bytes
+    }
+
+    fn element_payload(device: u32, terminals: &[u32], parameters: &[TestValue]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&device.to_le_bytes());
+        bytes.extend_from_slice(&(terminals.len() as u32).to_le_bytes());
+
+        for terminal in terminals {
+            bytes.extend_from_slice(&terminal.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&(parameters.len() as u32).to_le_bytes());
+
+        for parameter in parameters {
+            match parameter {
+                TestValue::Literal(value) => {
+                    bytes.push(DEFINITION_VALUE_LITERAL);
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                TestValue::Parameter(parameter) => {
+                    bytes.push(DEFINITION_VALUE_PARAMETER);
+                    bytes.extend_from_slice(&parameter.to_le_bytes());
+                }
+            }
+        }
+
         bytes
     }
 
@@ -625,23 +638,47 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn empty_definition_registers_and_returns_its_engine_scoped_id() {
-        let mut engine = Engine::new();
-
-        register_definition_buffer(&mut engine, &definition_buffer(1, &[])).unwrap();
-
-        let definition = engine
+    fn registered_definition(engine: &Engine) -> &DeviceDefinition {
+        engine
             .definitions()
             .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
-            .unwrap();
-        assert_eq!(definition.terminals().len(), 0);
-        assert_eq!(definition.parameters().len(), 0);
+            .unwrap()
+    }
+
+    fn assert_error(
+        bytes: &[u8],
+        kind: DefinitionRegistrationErrorKind,
+        command_index: u32,
+        byte_offset: u32,
+    ) {
+        let error = register_definition_buffer(&mut Engine::new(), bytes).unwrap_err();
+
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.command_index(), command_index);
+        assert_eq!(error.byte_offset(), byte_offset);
     }
 
     #[test]
-    fn complete_builder_queue_registers_the_expected_definition() {
+    fn empty_definition_registers() {
         let mut engine = Engine::new();
+
+        register_definition_buffer(
+            &mut engine,
+            &definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]),
+        )
+        .unwrap();
+
+        let definition = registered_definition(&engine);
+
+        assert!(matches!(definition.body(), DeviceBody::Composite(_)));
+        assert!(definition.terminals().is_empty());
+        assert!(definition.parameters().is_empty());
+    }
+
+    #[test]
+    fn complete_definition_registers_expected_contents() {
+        let mut engine = Engine::new();
+
         let commands = [
             command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
             command(DEFINITION_COMMAND_ADD_NODE, &[]),
@@ -662,117 +699,331 @@ mod tests {
         )
         .unwrap();
 
-        let definition = engine
-            .definitions()
-            .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
-            .unwrap();
+        let definition = registered_definition(&engine);
+
         assert_eq!(definition.terminals().len(), 2);
         assert_eq!(definition.parameters().len(), 1);
+
         let DeviceBody::Composite(circuit) = definition.body() else {
-            panic!("registered definition was not composite");
+            panic!("expected composite definition");
         };
+
         assert_eq!(circuit.node_count(), 3);
         assert_eq!(circuit.elements().len(), 1);
-        assert_eq!(circuit.elements()[0].definition().index(), 0);
+        assert_eq!(circuit.elements()[0].definition().get(), 1);
+        assert_eq!(circuit.elements()[0].terminals()[0].id(), 0);
         assert_eq!(circuit.elements()[0].terminals()[1].id(), 2);
     }
 
     #[test]
-    fn malformed_headers_are_rejected_with_header_offsets() {
-        let valid = definition_buffer(6, &[]);
-        let mut wrong_magic = valid.clone();
-        wrong_magic[0] = b'X';
-        let mut wrong_version = valid.clone();
-        wrong_version[4..6].copy_from_slice(&(DEFINITION_BUFFER_VERSION + 1).to_le_bytes());
-        let mut nonzero_flags = valid.clone();
-        nonzero_flags[6..8].copy_from_slice(&1_u16.to_le_bytes());
-        let cases = [
-            (
-                &valid[..5],
+    fn truncated_header_reports_input_end() {
+        let bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+
+        for length in [0, 1, 3, 5, 7, 11, 15] {
+            assert_error(
+                &bytes[..length],
                 DefinitionRegistrationErrorKind::TruncatedInput,
-                5,
-            ),
+                u32::MAX,
+                length as u32,
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_header_fields_report_their_offsets() {
+        let valid = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+
+        let mut invalid_magic = valid.clone();
+        invalid_magic[0] = b'X';
+
+        let mut invalid_version = valid.clone();
+        invalid_version[4..6].copy_from_slice(&(DEFINITION_BUFFER_VERSION + 1).to_le_bytes());
+
+        let mut invalid_flags = valid.clone();
+        invalid_flags[6..8].copy_from_slice(&1_u16.to_le_bytes());
+
+        let mut invalid_id = valid;
+        invalid_id[8..12].copy_from_slice(&0_u32.to_le_bytes());
+
+        for (bytes, kind, offset) in [
             (
-                &wrong_magic[..],
+                invalid_magic,
                 DefinitionRegistrationErrorKind::InvalidMagic,
                 0,
             ),
             (
-                &wrong_version[..],
+                invalid_version,
                 DefinitionRegistrationErrorKind::UnsupportedVersion,
                 4,
             ),
             (
-                &nonzero_flags[..],
+                invalid_flags,
                 DefinitionRegistrationErrorKind::InvalidFlags,
                 6,
             ),
-        ];
-
-        for (bytes, expected_kind, expected_offset) in cases {
-            let error = register_definition_buffer(&mut Engine::new(), bytes).unwrap_err();
-            assert_eq!(error.kind(), expected_kind);
-            assert_eq!(error.command_index(), u32::MAX);
-            assert_eq!(error.byte_offset(), expected_offset);
+            (
+                invalid_id,
+                DefinitionRegistrationErrorKind::InvalidDeviceId,
+                8,
+            ),
+        ] {
+            assert_error(&bytes, kind, u32::MAX, offset);
         }
     }
 
     #[test]
-    fn truncated_unknown_and_mis_sized_commands_are_rejected_at_the_command() {
-        let truncated = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[vec![]]);
-        let unknown = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[command(99, &[])]);
-        let wrong_fixed_length = definition_buffer(
-            Engine::COMPOSITE_DEFINITION_ID_BASE,
-            &[command(DEFINITION_COMMAND_ADD_NODE, &[0])],
+    fn truncated_command_frame_reports_command_index() {
+        let mut bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+        bytes[12..16].copy_from_slice(&1_u32.to_le_bytes());
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::TruncatedInput,
+            0,
+            DEFINITION_HEADER_LENGTH as u32,
         );
-        let cases = [
-            (
-                truncated,
-                DefinitionRegistrationErrorKind::TruncatedInput,
-                0,
-                DEFINITION_HEADER_LENGTH,
-            ),
-            (
-                unknown,
-                DefinitionRegistrationErrorKind::UnknownCommand,
-                0,
-                DEFINITION_HEADER_LENGTH,
-            ),
-            (
-                wrong_fixed_length,
+    }
+
+    #[test]
+    fn truncated_command_payload_reports_input_end() {
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[framed_command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                8,
+                &1_u32.to_le_bytes(),
+            )],
+        );
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::TruncatedInput,
+            0,
+            26,
+        );
+    }
+
+    #[test]
+    fn unknown_command_reports_command_start() {
+        let bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[command(99, &[])]);
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::UnknownCommand,
+            0,
+            DEFINITION_HEADER_LENGTH as u32,
+        );
+    }
+
+    #[test]
+    fn fixed_empty_payload_commands_reject_nonempty_payloads() {
+        for tag in [DEFINITION_COMMAND_ADD_TERMINAL, DEFINITION_COMMAND_ADD_NODE] {
+            let bytes =
+                definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[command(tag, &[0])]);
+
+            assert_error(
+                &bytes,
                 DefinitionRegistrationErrorKind::InvalidCommandLength,
                 0,
-                DEFINITION_HEADER_LENGTH,
-            ),
-        ];
-
-        for (bytes, expected_kind, expected_index, expected_offset) in cases {
-            let error = register_definition_buffer(&mut Engine::new(), &bytes).unwrap_err();
-            assert_eq!(error.kind(), expected_kind);
-            assert_eq!(error.command_index(), expected_index);
-            assert_eq!(error.byte_offset(), expected_offset as u32);
+                DEFINITION_HEADER_LENGTH as u32,
+            );
         }
     }
 
     #[test]
-    fn element_vector_count_cannot_read_beyond_its_command() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u32.to_le_bytes());
-        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    fn parameter_command_rejects_trailing_payload_bytes() {
+        let mut payload = constraints_payload(None, None, false, None);
+        payload.push(0);
+
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)],
+        );
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::InvalidCommandLength,
+            0,
+            DEFINITION_HEADER_LENGTH as u32,
+        );
+    }
+
+    #[test]
+    fn element_command_rejects_trailing_payload_bytes() {
+        let mut payload = element_payload(1, &[], &[]);
+        payload.push(0);
+
         let bytes = definition_buffer(
             Engine::COMPOSITE_DEFINITION_ID_BASE,
             &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
         );
 
-        let error = register_definition_buffer(&mut Engine::new(), &bytes).unwrap_err();
-
-        assert_eq!(error.kind(), DefinitionRegistrationErrorKind::InvalidCount);
-        assert_eq!(error.command_index(), 0);
-        assert_eq!(error.byte_offset(), DEFINITION_HEADER_LENGTH as u32 + 10);
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::InvalidCommandLength,
+            0,
+            DEFINITION_HEADER_LENGTH as u32,
+        );
     }
 
     #[test]
-    fn builder_validation_errors_have_stable_kinds_and_command_locations() {
+    fn parameter_constraints_round_trip() {
+        let lower = Bound {
+            value: 1.0,
+            inclusive: false,
+        };
+        let upper = Bound {
+            value: 10.0,
+            inclusive: true,
+        };
+        let reciprocal_lower = Bound {
+            value: 0.1,
+            inclusive: true,
+        };
+        let reciprocal_upper = Bound {
+            value: 1.0,
+            inclusive: false,
+        };
+
+        let expected = ParameterConstraints::new(
+            Some(lower),
+            Some(upper),
+            true,
+            Some((Some(reciprocal_lower), Some(reciprocal_upper))),
+        );
+
+        let commands = [command(
+            DEFINITION_COMMAND_ADD_PARAMETER,
+            &constraints_payload(
+                Some(lower),
+                Some(upper),
+                true,
+                Some((Some(reciprocal_lower), Some(reciprocal_upper))),
+            ),
+        )];
+
+        let mut engine = Engine::new();
+
+        register_definition_buffer(
+            &mut engine,
+            &definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &commands),
+        )
+        .unwrap();
+
+        assert_eq!(registered_definition(&engine).parameters(), &[expected]);
+    }
+
+    #[test]
+    fn invalid_constraint_flags_are_rejected() {
+        for flags in [
+            1 << 15,
+            CONSTRAINT_LOWER_INCLUSIVE,
+            CONSTRAINT_UPPER_INCLUSIVE,
+            CONSTRAINT_RECIPROCAL_LOWER,
+            CONSTRAINT_RECIPROCAL_UPPER,
+        ] {
+            let bytes = definition_buffer(
+                Engine::COMPOSITE_DEFINITION_ID_BASE,
+                &[command(
+                    DEFINITION_COMMAND_ADD_PARAMETER,
+                    &flags.to_le_bytes(),
+                )],
+            );
+
+            assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidFlags, 0, 22);
+        }
+    }
+
+    #[test]
+    fn truncated_constraint_bound_reports_payload_end() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&CONSTRAINT_LOWER.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)],
+        );
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::TruncatedInput,
+            0,
+            28,
+        );
+    }
+
+    #[test]
+    fn zero_element_definition_id_is_rejected() {
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(0, &[], &[]),
+            )],
+        );
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::InvalidDeviceId,
+            0,
+            22,
+        );
+    }
+
+    #[test]
+    fn terminal_count_cannot_exceed_command_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
+        );
+
+        assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidCount, 0, 26);
+    }
+
+    #[test]
+    fn parameter_count_cannot_exceed_command_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
+        );
+
+        assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidCount, 0, 30);
+    }
+
+    #[test]
+    fn unknown_element_value_kind_is_rejected() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(99);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+
+        let bytes = definition_buffer(
+            Engine::COMPOSITE_DEFINITION_ID_BASE,
+            &[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)],
+        );
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::UnknownValueKind,
+            0,
+            34,
+        );
+    }
+
+    #[test]
+    fn builder_errors_report_stable_command_locations() {
         let cases = [
             (
                 vec![command(
@@ -838,12 +1089,12 @@ mod tests {
         ];
 
         for (commands, expected_kind) in cases {
-            let expected_index = (commands.len() - 1) as u32;
-            let expected_offset = DEFINITION_HEADER_LENGTH as u32
+            let command_index = (commands.len() - 1) as u32;
+            let byte_offset = DEFINITION_HEADER_LENGTH
                 + commands[..commands.len() - 1]
                     .iter()
                     .map(Vec::len)
-                    .sum::<usize>() as u32;
+                    .sum::<usize>();
 
             let error = register_definition_buffer(
                 &mut Engine::new(),
@@ -852,15 +1103,16 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(error.kind(), expected_kind);
-            assert_eq!(error.command_index(), expected_index);
-            assert_eq!(error.byte_offset(), expected_offset);
+            assert_eq!(error.command_index(), command_index);
+            assert_eq!(error.byte_offset(), byte_offset as u32);
         }
     }
 
     #[test]
-    fn failed_buffer_does_not_publish_or_consume_a_device_id() {
+    fn failed_buffer_does_not_register_definition() {
         let mut engine = Engine::new();
-        let invalid = definition_buffer(
+
+        let bytes = definition_buffer(
             Engine::COMPOSITE_DEFINITION_ID_BASE,
             &[
                 command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
@@ -868,56 +1120,47 @@ mod tests {
             ],
         );
 
-        let failure = register_definition_buffer(&mut engine, &invalid).unwrap_err();
         assert_eq!(
-            failure.kind(),
+            register_definition_buffer(&mut engine, &bytes)
+                .unwrap_err()
+                .kind(),
             DefinitionRegistrationErrorKind::UnknownCommand
         );
 
         assert!(
             engine
                 .definitions()
-                .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE,).unwrap())
+                .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
                 .is_none()
         );
     }
 
     #[test]
-    fn incorrect_command_count_and_trailing_bytes_are_rejected() {
-        let mut missing_command = definition_buffer(
+    fn command_count_larger_than_available_commands_is_rejected() {
+        let mut bytes = definition_buffer(
             Engine::COMPOSITE_DEFINITION_ID_BASE,
             &[command(DEFINITION_COMMAND_ADD_NODE, &[])],
         );
-        missing_command[12..16].copy_from_slice(&2_u32.to_le_bytes());
-        let mut trailing_command = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
-        trailing_command.extend_from_slice(&command(DEFINITION_COMMAND_ADD_NODE, &[]));
-        let cases = [
-            (
-                missing_command,
-                DefinitionRegistrationErrorKind::TruncatedInput,
-                1,
-                22,
-            ),
-            (
-                trailing_command,
-                DefinitionRegistrationErrorKind::TrailingBytes,
-                0,
-                16,
-            ),
-        ];
+        bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
 
-        for (bytes, expected_kind, expected_index, expected_offset) in cases {
-            let mut engine = Engine::new();
-            let error = register_definition_buffer(&mut engine, &bytes).unwrap_err();
-            assert_eq!(error.kind(), expected_kind);
-            assert_eq!(error.command_index(), expected_index);
-            assert_eq!(error.byte_offset(), expected_offset);
-            assert!(
-                engine
-                    .definitions()
-                    .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
-                    .is_none()
-            );
-        }
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::TruncatedInput,
+            1,
+            22,
+        );
+    }
+
+    #[test]
+    fn bytes_after_declared_commands_are_rejected() {
+        let mut bytes = definition_buffer(Engine::COMPOSITE_DEFINITION_ID_BASE, &[]);
+        bytes.extend_from_slice(&command(DEFINITION_COMMAND_ADD_NODE, &[]));
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::TrailingBytes,
+            0,
+            DEFINITION_HEADER_LENGTH as u32,
+        );
     }
 }

@@ -420,38 +420,6 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
     code
 }
 
-fn map_world_command_error(error: WorldCommandError) -> CommandResult {
-    let code = match error.kind() {
-        WorldCommandErrorKind::InvalidMagic => CommandCode::InvalidMagic,
-        WorldCommandErrorKind::UnsupportedVersion => CommandCode::UnsupportedVersion,
-        WorldCommandErrorKind::InvalidFlags => CommandCode::InvalidFlags,
-        WorldCommandErrorKind::InvalidReserved => CommandCode::InvalidReserved,
-        WorldCommandErrorKind::TruncatedInput => CommandCode::TruncatedInput,
-        WorldCommandErrorKind::UnknownCommand => CommandCode::UnknownCommand,
-        WorldCommandErrorKind::InvalidCommandLength => CommandCode::InvalidCommandLength,
-        WorldCommandErrorKind::InvalidId => CommandCode::InvalidId,
-        WorldCommandErrorKind::TrailingBytes => CommandCode::TrailingBytes,
-        WorldCommandErrorKind::UnknownWorld => CommandCode::UnknownWorld,
-
-        WorldCommandErrorKind::IdOutOfBound => CommandCode::IdOutOfBound,
-        WorldCommandErrorKind::IdExceeds31Bit => CommandCode::IdExceeds31Bit,
-        WorldCommandErrorKind::IdAlreadyAssigned => CommandCode::IdAlreadyAssigned,
-        WorldCommandErrorKind::IdNotAssigned => CommandCode::IdNotAssigned,
-        WorldCommandErrorKind::WireConnectToSelf => CommandCode::WireConnectToSelf,
-        WorldCommandErrorKind::AlreadyConnected => CommandCode::AlreadyConnected,
-        WorldCommandErrorKind::NotConnected => CommandCode::NotConnected,
-        WorldCommandErrorKind::TerminalAlreadyConnected => CommandCode::TerminalAlreadyConnected,
-        WorldCommandErrorKind::InvalidTerminal => CommandCode::InvalidTerminal,
-        WorldCommandErrorKind::InvalidParameter => CommandCode::InvalidParameter,
-        WorldCommandErrorKind::ParameterConstraintViolation => {
-            CommandCode::ParameterConstraintViolation
-        }
-        WorldCommandErrorKind::UnknownDefinition => CommandCode::UnknownDefinition,
-    };
-
-    CommandResult::failure(code, error.command_index(), error.byte_offset())
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Publication {
@@ -493,11 +461,11 @@ pub struct SolveResult {
 /// of the same engine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_world_solve(
-    engine: *mut Engine,
-    world_id: u32,
-    publications: *mut Publication,
-    publication_capacity: u32,
-    result: *mut SolveResult,
+    _engine: *mut Engine,
+    _world_id: u32,
+    _publications: *mut Publication,
+    _publication_capacity: u32,
+    _result: *mut SolveResult,
 ) -> u32 {
     todo!("world solving is not implemented")
 }
@@ -556,34 +524,107 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
     DefinitionRegistrationResult::failure(code, error.command_index(), error.byte_offset())
 }
 
+fn map_world_command_error(error: WorldCommandError) -> CommandResult {
+    let code = match error.kind() {
+        WorldCommandErrorKind::InvalidMagic => CommandCode::InvalidMagic,
+        WorldCommandErrorKind::UnsupportedVersion => CommandCode::UnsupportedVersion,
+        WorldCommandErrorKind::InvalidFlags => CommandCode::InvalidFlags,
+        WorldCommandErrorKind::InvalidReserved => CommandCode::InvalidReserved,
+        WorldCommandErrorKind::TruncatedInput => CommandCode::TruncatedInput,
+        WorldCommandErrorKind::UnknownCommand => CommandCode::UnknownCommand,
+        WorldCommandErrorKind::InvalidCommandLength => CommandCode::InvalidCommandLength,
+        WorldCommandErrorKind::InvalidId => CommandCode::InvalidId,
+        WorldCommandErrorKind::TrailingBytes => CommandCode::TrailingBytes,
+        WorldCommandErrorKind::UnknownWorld => CommandCode::UnknownWorld,
+
+        WorldCommandErrorKind::IdOutOfBound => CommandCode::IdOutOfBound,
+        WorldCommandErrorKind::IdExceeds31Bit => CommandCode::IdExceeds31Bit,
+        WorldCommandErrorKind::IdAlreadyAssigned => CommandCode::IdAlreadyAssigned,
+        WorldCommandErrorKind::IdNotAssigned => CommandCode::IdNotAssigned,
+        WorldCommandErrorKind::WireConnectToSelf => CommandCode::WireConnectToSelf,
+        WorldCommandErrorKind::AlreadyConnected => CommandCode::AlreadyConnected,
+        WorldCommandErrorKind::NotConnected => CommandCode::NotConnected,
+        WorldCommandErrorKind::TerminalAlreadyConnected => CommandCode::TerminalAlreadyConnected,
+        WorldCommandErrorKind::InvalidTerminal => CommandCode::InvalidTerminal,
+        WorldCommandErrorKind::InvalidParameter => CommandCode::InvalidParameter,
+        WorldCommandErrorKind::ParameterConstraintViolation => {
+            CommandCode::ParameterConstraintViolation
+        }
+        WorldCommandErrorKind::UnknownDefinition => CommandCode::UnknownDefinition,
+    };
+
+    CommandResult::failure(code, error.command_index(), error.byte_offset())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{align_of, size_of};
 
-    const EMPTY_DEFINITION_BUFFER: [u8; 16] = [
-        b'H',
-        b'Y',
-        b'D',
-        b'F',
-        1,
-        0,
-        0,
-        0,
-        Engine::COMPOSITE_DEFINITION_ID_BASE as u8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
+    fn definition_buffer() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HYDF");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&Engine::COMPOSITE_DEFINITION_ID_BASE.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes
+    }
 
-    fn sentinel_result() -> DefinitionRegistrationResult {
+    fn world_command(tag: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(6 + payload.len());
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn world_buffer(commands: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HYWC");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(commands.len() as u32).to_le_bytes());
+
+        for command in commands {
+            bytes.extend_from_slice(command);
+        }
+
+        bytes
+    }
+
+    fn u32_payload(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        bytes
+    }
+
+    fn definition_result_sentinel() -> DefinitionRegistrationResult {
         DefinitionRegistrationResult {
             code: 0xaaaa_aaaa,
             command_index: 0xbbbb_bbbb,
             byte_offset: 0xcccc_cccc,
+        }
+    }
+
+    fn world_result_sentinel() -> WorldCreationResult {
+        WorldCreationResult {
+            code: 0xaaaa_aaaa,
+            world_id: 0xbbbb_bbbb,
+        }
+    }
+
+    fn command_result_sentinel() -> CommandResult {
+        CommandResult {
+            code: 0xaaaa_aaaa,
+            command_index: 0xbbbb_bbbb,
+            byte_offset: 0xcccc_cccc,
+            reserved: 0xdddd_dddd,
         }
     }
 
@@ -595,18 +636,40 @@ mod tests {
         unsafe { hynergy_engine_register_definition(engine, bytes.as_ptr(), bytes.len(), result) }
     }
 
-    #[test]
-    fn abi_version_is_stable() {
-        assert_eq!(hynergy_abi_version(), 1);
+    fn create_world(engine: *mut Engine) -> WorldCreationResult {
+        let mut result = world_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_engine_create_world(engine, &mut result) },
+            WorldCode::Success as u32
+        );
+
+        result
+    }
+
+    fn apply(engine: *mut Engine, world: u32, bytes: &[u8], result: *mut CommandResult) -> u32 {
+        unsafe { hynergy_world_apply_commands(engine, world, bytes.as_ptr(), bytes.len(), result) }
     }
 
     #[test]
-    fn registration_result_has_stable_c_layout() {
+    fn abi_version_is_stable() {
+        assert_eq!(hynergy_abi_version(), ABI_VERSION);
+        assert_eq!(ABI_VERSION, 1);
+    }
+
+    #[test]
+    fn result_layouts_are_stable() {
         assert_eq!(size_of::<DefinitionRegistrationResult>(), 12);
         assert_eq!(
             align_of::<DefinitionRegistrationResult>(),
             align_of::<u32>()
         );
+
+        assert_eq!(size_of::<WorldCreationResult>(), 8);
+        assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>());
+
+        assert_eq!(size_of::<CommandResult>(), 16);
+        assert_eq!(align_of::<CommandResult>(), align_of::<u32>());
     }
 
     #[test]
@@ -622,11 +685,12 @@ mod tests {
     }
 
     #[test]
-    fn registration_reports_success_through_the_abi() {
+    fn definition_registration_reports_success() {
         let engine = hynergy_engine_create();
-        let mut result = sentinel_result();
+        let bytes = definition_buffer();
+        let mut result = definition_result_sentinel();
 
-        let code = register(engine, &EMPTY_DEFINITION_BUFFER, &mut result);
+        let code = register(engine, &bytes, &mut result);
 
         assert_eq!(code, DefinitionRegistrationCode::Success as u32);
         assert_eq!(
@@ -644,11 +708,12 @@ mod tests {
     }
 
     #[test]
-    fn registration_maps_protocol_errors_to_stable_abi_results() {
+    fn definition_registration_maps_protocol_errors() {
         let engine = hynergy_engine_create();
-        let mut bytes = EMPTY_DEFINITION_BUFFER;
+        let mut bytes = definition_buffer();
         bytes[0] = b'X';
-        let mut result = sentinel_result();
+
+        let mut result = definition_result_sentinel();
 
         let code = register(engine, &bytes, &mut result);
 
@@ -668,23 +733,35 @@ mod tests {
     }
 
     #[test]
-    fn abi_rejects_null_pointers_without_mutating_the_engine() {
+    fn definition_registration_rejects_null_result_without_processing() {
         let engine = hynergy_engine_create();
-        let mut result = sentinel_result();
+        let bytes = definition_buffer();
 
-        let null_result_code = register(engine, &EMPTY_DEFINITION_BUFFER, std::ptr::null_mut());
         assert_eq!(
-            null_result_code,
+            register(engine, &bytes, std::ptr::null_mut(),),
             DefinitionRegistrationCode::NullResult as u32
         );
-        assert_eq!(result, sentinel_result());
 
-        let null_engine_code =
-            register(std::ptr::null_mut(), &EMPTY_DEFINITION_BUFFER, &mut result);
+        let mut result = definition_result_sentinel();
+
         assert_eq!(
-            null_engine_code,
-            DefinitionRegistrationCode::NullEngine as u32
+            register(engine, &bytes, &mut result),
+            DefinitionRegistrationCode::Success as u32
         );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn definition_registration_reports_null_engine() {
+        let bytes = definition_buffer();
+        let mut result = definition_result_sentinel();
+
+        let code = register(std::ptr::null_mut(), &bytes, &mut result);
+
+        assert_eq!(code, DefinitionRegistrationCode::NullEngine as u32);
         assert_eq!(
             result,
             DefinitionRegistrationResult {
@@ -693,13 +770,17 @@ mod tests {
                 byte_offset: u32::MAX,
             }
         );
+    }
 
-        let null_input_code =
+    #[test]
+    fn definition_registration_reports_null_input() {
+        let engine = hynergy_engine_create();
+        let mut result = definition_result_sentinel();
+
+        let code =
             unsafe { hynergy_engine_register_definition(engine, std::ptr::null(), 0, &mut result) };
-        assert_eq!(
-            null_input_code,
-            DefinitionRegistrationCode::NullInput as u32
-        );
+
+        assert_eq!(code, DefinitionRegistrationCode::NullInput as u32);
         assert_eq!(
             result,
             DefinitionRegistrationResult {
@@ -709,8 +790,23 @@ mod tests {
             }
         );
 
-        let success_code = register(engine, &EMPTY_DEFINITION_BUFFER, &mut result);
-        assert_eq!(success_code, DefinitionRegistrationCode::Success as u32);
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn create_world_rejects_null_result_without_creating_world() {
+        let engine = hynergy_engine_create();
+
+        assert_eq!(
+            unsafe { hynergy_engine_create_world(engine, std::ptr::null_mut(),) },
+            WorldCode::NullResult as u32
+        );
+
+        let result = create_world(engine);
+
+        assert_eq!(result.world_id, 0);
 
         unsafe {
             hynergy_engine_destroy(engine);
@@ -718,65 +814,358 @@ mod tests {
     }
 
     #[test]
-    fn command_result_has_stable_c_layout() {
-        assert_eq!(size_of::<CommandResult>(), 16);
-        assert_eq!(align_of::<CommandResult>(), align_of::<u32>());
+    fn create_world_reports_null_engine() {
+        let mut result = world_result_sentinel();
+
+        let code = unsafe { hynergy_engine_create_world(std::ptr::null_mut(), &mut result) };
+
+        assert_eq!(code, WorldCode::NullEngine as u32);
+        assert_eq!(
+            result,
+            WorldCreationResult {
+                code: WorldCode::NullEngine as u32,
+                world_id: u32::MAX,
+            }
+        );
     }
 
     #[test]
-    fn world_creation_result_has_stable_c_layout() {
-        assert_eq!(size_of::<WorldCreationResult>(), 8);
-        assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>(),);
-    }
-
-    #[test]
-    fn ffi_can_create_apply_and_destroy_world() {
+    fn world_ids_are_not_reused_through_ffi() {
         let engine = hynergy_engine_create();
 
-        let mut creation = WorldCreationResult {
-            code: 0xaaaa_aaaa,
-            world_id: 0xbbbb_bbbb,
-        };
+        let first = create_world(engine);
+        let second = create_world(engine);
+
+        assert_eq!(first.world_id, 0);
+        assert_eq!(second.world_id, 1);
 
         assert_eq!(
-            unsafe { hynergy_engine_create_world(engine, &mut creation) },
-            WorldCode::Success as u32,
+            unsafe { hynergy_engine_destroy_world(engine, first.world_id,) },
+            WorldCode::Success as u32
         );
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"HYWC");
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        let third = create_world(engine);
 
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&4_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(third.world_id, 2);
 
-        let mut result = CommandResult {
-            code: 0,
-            command_index: 0,
-            byte_offset: 0,
-            reserved: 0,
-        };
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn destroy_world_reports_unknown_world() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
 
         assert_eq!(
-            unsafe {
-                hynergy_world_apply_commands(
-                    engine,
-                    creation.world_id,
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    &mut result,
-                )
-            },
-            CommandCode::Success as u32,
+            unsafe { hynergy_engine_destroy_world(engine, world.world_id,) },
+            WorldCode::Success as u32
         );
 
         assert_eq!(
-            unsafe { hynergy_engine_destroy_world(engine, creation.world_id,) },
-            WorldCode::Success as u32,
+            unsafe { hynergy_engine_destroy_world(engine, world.world_id,) },
+            WorldCode::UnknownWorld as u32
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn destroy_world_reports_null_engine() {
+        assert_eq!(
+            unsafe { hynergy_engine_destroy_world(std::ptr::null_mut(), 0,) },
+            WorldCode::NullEngine as u32
+        );
+    }
+
+    #[test]
+    fn apply_commands_rejects_null_result_without_applying() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        let bytes = world_buffer(&[world_command(1, &u32_payload(&[1]))]);
+
+        assert_eq!(
+            apply(engine, world.world_id, &bytes, std::ptr::null_mut(),),
+            CommandCode::NullResult as u32
+        );
+
+        let mut result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world.world_id, &bytes, &mut result,),
+            CommandCode::Success as u32
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn apply_commands_reports_null_engine() {
+        let bytes = world_buffer(&[]);
+        let mut result = command_result_sentinel();
+
+        let code = apply(std::ptr::null_mut(), 0, &bytes, &mut result);
+
+        assert_eq!(code, CommandCode::NullEngine as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::NullEngine as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_commands_reports_null_input_without_applying() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+        let mut result = command_result_sentinel();
+
+        let code = unsafe {
+            hynergy_world_apply_commands(engine, world.world_id, std::ptr::null(), 0, &mut result)
+        };
+
+        assert_eq!(code, CommandCode::NullInput as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::NullInput as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn empty_command_buffer_succeeds_through_ffi() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+        let bytes = world_buffer(&[]);
+        let mut result = command_result_sentinel();
+
+        let code = apply(engine, world.world_id, &bytes, &mut result);
+
+        assert_eq!(code, CommandCode::Success as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::Success as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn command_buffer_applies_mutation_through_ffi() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        let bytes = world_buffer(&[world_command(1, &u32_payload(&[1]))]);
+
+        let mut result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world.world_id, &bytes, &mut result,),
+            CommandCode::Success as u32
+        );
+
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::Success as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn protocol_error_is_mapped_through_ffi() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        let mut bytes = world_buffer(&[]);
+        bytes[0] = b'X';
+
+        let mut result = command_result_sentinel();
+
+        let code = apply(engine, world.world_id, &bytes, &mut result);
+
+        assert_eq!(code, CommandCode::InvalidMagic as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::InvalidMagic as u32,
+                command_index: u32::MAX,
+                byte_offset: 0,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn invalid_command_length_is_mapped_through_ffi() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        let bytes = world_buffer(&[world_command(1, &[1, 0])]);
+
+        let mut result = command_result_sentinel();
+
+        let code = apply(engine, world.world_id, &bytes, &mut result);
+
+        assert_eq!(code, CommandCode::InvalidCommandLength as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::InvalidCommandLength as u32,
+                command_index: 0,
+                byte_offset: 16,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn unknown_world_is_mapped_through_ffi() {
+        let engine = hynergy_engine_create();
+        let bytes = world_buffer(&[]);
+        let mut result = command_result_sentinel();
+
+        let code = apply(engine, 42, &bytes, &mut result);
+
+        assert_eq!(code, CommandCode::UnknownWorld as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::UnknownWorld as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn model_error_is_mapped_with_failing_command_location() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        let add = world_command(1, &u32_payload(&[1]));
+
+        let bytes = world_buffer(&[add.clone(), add]);
+
+        let mut result = command_result_sentinel();
+
+        let code = apply(engine, world.world_id, &bytes, &mut result);
+
+        assert_eq!(code, CommandCode::IdAlreadyAssigned as u32);
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::IdAlreadyAssigned as u32,
+                command_index: 1,
+                byte_offset: 26,
+                reserved: 0,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn earlier_commands_remain_applied_after_ffi_failure() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        let add = world_command(1, &u32_payload(&[1]));
+
+        let bytes = world_buffer(&[add.clone(), add]);
+
+        let mut result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world.world_id, &bytes, &mut result,),
+            CommandCode::IdAlreadyAssigned as u32
+        );
+
+        let remove = world_buffer(&[world_command(2, &u32_payload(&[1]))]);
+
+        assert_eq!(
+            apply(engine, world.world_id, &remove, &mut result,),
+            CommandCode::Success as u32
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn destroyed_world_rejects_command_buffers() {
+        let engine = hynergy_engine_create();
+        let world = create_world(engine);
+
+        assert_eq!(
+            unsafe { hynergy_engine_destroy_world(engine, world.world_id,) },
+            WorldCode::Success as u32
+        );
+
+        let bytes = world_buffer(&[]);
+        let mut result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world.world_id, &bytes, &mut result,),
+            CommandCode::UnknownWorld as u32
+        );
+
+        assert_eq!(
+            result,
+            CommandResult {
+                code: CommandCode::UnknownWorld as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            }
         );
 
         unsafe {
