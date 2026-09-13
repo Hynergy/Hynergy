@@ -12,16 +12,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "hynergy-ids"
-version = "0.0.1-dev"
-
-[[package]]
-name = "hynergy-mna-ffi"
+name = "hynergy-ffi"
 version = "0.0.1-dev"
 dependencies = [
  "hynergy-engine",
  "hynergy-protocol",
 ]
+
+[[package]]
+name = "hynergy-ids"
+version = "0.0.1-dev"
 
 [[package]]
 name = "hynergy-model"
@@ -37,6 +37,7 @@ name = "hynergy-protocol"
 version = "0.0.1-dev"
 dependencies = [
  "hynergy-engine",
+ "hynergy-ffi",
  "hynergy-model",
 ]
 

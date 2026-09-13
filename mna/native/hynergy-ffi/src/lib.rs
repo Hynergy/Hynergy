@@ -1,5 +1,8 @@
-use hynergy_engine::Engine;
-use hynergy_protocol::{DefinitionRegistrationError, DefinitionRegistrationErrorKind};
+use hynergy_engine::{Engine, WorldManagementError};
+use hynergy_protocol::{
+    DefinitionRegistrationError, DefinitionRegistrationErrorKind, WorldCommandError,
+    WorldCommandErrorKind,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub const ABI_VERSION: u32 = 1;
@@ -169,11 +172,39 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
     }
     code
 }
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldCode {
+    Success = 0,
+    NullEngine = 1,
+    NullResult = 2,
+    UnknownWorld = 3,
+    WorldIdExhausted = 4,
+    InternalPanic = u32::MAX,
+}
+
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldCreationResult {
     pub code: u32,
     pub world_id: u32,
+}
+
+impl WorldCreationResult {
+    const fn success(world_id: u32) -> Self {
+        Self {
+            code: WorldCode::Success as u32,
+            world_id,
+        }
+    }
+
+    const fn failure(code: WorldCode) -> Self {
+        Self {
+            code: code as u32,
+            world_id: u32::MAX,
+        }
+    }
 }
 
 /// Creates a world and returns its engine-assigned ID in `result`.
@@ -194,7 +225,41 @@ pub unsafe extern "C" fn hynergy_engine_create_world(
     engine: *mut Engine,
     result: *mut WorldCreationResult,
 ) -> u32 {
-    todo!("world creation is not implemented")
+    if result.is_null() {
+        return WorldCode::NullResult as u32;
+    }
+
+    let output = if engine.is_null() {
+        WorldCreationResult::failure(WorldCode::NullEngine)
+    } else {
+        let creation = catch_unwind(AssertUnwindSafe(|| {
+            let engine = unsafe { &mut *engine };
+            engine.new_world()
+        }));
+
+        match creation {
+            Ok(Ok(world_id)) => WorldCreationResult::success(world_id),
+
+            Ok(Err(WorldManagementError::WorldIdExhausted)) => {
+                WorldCreationResult::failure(WorldCode::WorldIdExhausted)
+            }
+
+            // Creation cannot produce UnknownWorld.
+            Ok(Err(WorldManagementError::UnknownWorld)) => {
+                WorldCreationResult::failure(WorldCode::InternalPanic)
+            }
+
+            Err(_) => WorldCreationResult::failure(WorldCode::InternalPanic),
+        }
+    };
+
+    let code = output.code;
+
+    unsafe {
+        result.write(output);
+    }
+
+    code
 }
 
 /// Destroys a world and all resources that the world owns.
@@ -210,16 +275,90 @@ pub unsafe extern "C" fn hynergy_engine_create_world(
 /// call. The caller must prevent concurrent use of the same engine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_destroy_world(engine: *mut Engine, world_id: u32) -> u32 {
-    todo!("world destruction is not implemented")
+    if engine.is_null() {
+        return WorldCode::NullEngine as u32;
+    }
+
+    let destruction = catch_unwind(AssertUnwindSafe(|| {
+        let engine = unsafe { &mut *engine };
+        engine.destroy_world(world_id)
+    }));
+
+    match destruction {
+        Ok(Ok(())) => WorldCode::Success as u32,
+
+        Ok(Err(WorldManagementError::UnknownWorld)) => WorldCode::UnknownWorld as u32,
+
+        Ok(Err(WorldManagementError::WorldIdExhausted)) => WorldCode::InternalPanic as u32,
+
+        Err(_) => WorldCode::InternalPanic as u32,
+    }
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCode {
+    Success = 0,
+
+    NullEngine = 1,
+    NullInput = 2,
+    NullResult = 3,
+    InputTooLarge = 4,
+
+    InvalidMagic = 5,
+    UnsupportedVersion = 6,
+    InvalidFlags = 7,
+    InvalidReserved = 8,
+    TruncatedInput = 9,
+    UnknownCommand = 10,
+    InvalidCommandLength = 11,
+    InvalidId = 12,
+    TrailingBytes = 13,
+    UnknownWorld = 14,
+
+    IdOutOfBound = 20,
+    IdExceeds31Bit = 21,
+    IdAlreadyAssigned = 22,
+    IdNotAssigned = 23,
+    WireConnectToSelf = 24,
+    AlreadyConnected = 25,
+    NotConnected = 26,
+    TerminalAlreadyConnected = 27,
+    InvalidTerminal = 28,
+    InvalidParameter = 29,
+    ParameterConstraintViolation = 30,
+    UnknownDefinition = 31,
+
+    InternalPanic = u32::MAX,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandResult {
     pub code: u32,
     pub command_index: u32,
     pub byte_offset: u32,
-    pub applied_command_count: u32,
+    pub reserved: u32,
+}
+
+impl CommandResult {
+    const fn success() -> Self {
+        Self {
+            code: CommandCode::Success as u32,
+            command_index: u32::MAX,
+            byte_offset: u32::MAX,
+            reserved: 0,
+        }
+    }
+
+    const fn failure(code: CommandCode, command_index: u32, byte_offset: u32) -> Self {
+        Self {
+            code: code as u32,
+            command_index,
+            byte_offset,
+            reserved: 0,
+        }
+    }
 }
 
 /// Applies a world command buffer in command order.
@@ -245,7 +384,72 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
     input_len: usize,
     result: *mut CommandResult,
 ) -> u32 {
-    todo!("world command buffers are not implemented")
+    if result.is_null() {
+        return CommandCode::NullResult as u32;
+    }
+
+    let output = if engine.is_null() {
+        CommandResult::failure(CommandCode::NullEngine, u32::MAX, u32::MAX)
+    } else if input.is_null() {
+        CommandResult::failure(CommandCode::NullInput, u32::MAX, u32::MAX)
+    } else if input_len > u32::MAX as usize {
+        CommandResult::failure(CommandCode::InputTooLarge, u32::MAX, u32::MAX)
+    } else {
+        let application = catch_unwind(AssertUnwindSafe(|| {
+            let engine = unsafe { &mut *engine };
+            let input = unsafe { std::slice::from_raw_parts(input, input_len) };
+
+            hynergy_protocol::apply_world_command_buffer(engine, world_id, input)
+        }));
+
+        match application {
+            Ok(Ok(())) => CommandResult::success(),
+
+            Ok(Err(error)) => map_world_command_error(error),
+
+            Err(_) => CommandResult::failure(CommandCode::InternalPanic, u32::MAX, u32::MAX),
+        }
+    };
+
+    let code = output.code;
+
+    unsafe {
+        result.write(output);
+    }
+
+    code
+}
+
+fn map_world_command_error(error: WorldCommandError) -> CommandResult {
+    let code = match error.kind() {
+        WorldCommandErrorKind::InvalidMagic => CommandCode::InvalidMagic,
+        WorldCommandErrorKind::UnsupportedVersion => CommandCode::UnsupportedVersion,
+        WorldCommandErrorKind::InvalidFlags => CommandCode::InvalidFlags,
+        WorldCommandErrorKind::InvalidReserved => CommandCode::InvalidReserved,
+        WorldCommandErrorKind::TruncatedInput => CommandCode::TruncatedInput,
+        WorldCommandErrorKind::UnknownCommand => CommandCode::UnknownCommand,
+        WorldCommandErrorKind::InvalidCommandLength => CommandCode::InvalidCommandLength,
+        WorldCommandErrorKind::InvalidId => CommandCode::InvalidId,
+        WorldCommandErrorKind::TrailingBytes => CommandCode::TrailingBytes,
+        WorldCommandErrorKind::UnknownWorld => CommandCode::UnknownWorld,
+
+        WorldCommandErrorKind::IdOutOfBound => CommandCode::IdOutOfBound,
+        WorldCommandErrorKind::IdExceeds31Bit => CommandCode::IdExceeds31Bit,
+        WorldCommandErrorKind::IdAlreadyAssigned => CommandCode::IdAlreadyAssigned,
+        WorldCommandErrorKind::IdNotAssigned => CommandCode::IdNotAssigned,
+        WorldCommandErrorKind::WireConnectToSelf => CommandCode::WireConnectToSelf,
+        WorldCommandErrorKind::AlreadyConnected => CommandCode::AlreadyConnected,
+        WorldCommandErrorKind::NotConnected => CommandCode::NotConnected,
+        WorldCommandErrorKind::TerminalAlreadyConnected => CommandCode::TerminalAlreadyConnected,
+        WorldCommandErrorKind::InvalidTerminal => CommandCode::InvalidTerminal,
+        WorldCommandErrorKind::InvalidParameter => CommandCode::InvalidParameter,
+        WorldCommandErrorKind::ParameterConstraintViolation => {
+            CommandCode::ParameterConstraintViolation
+        }
+        WorldCommandErrorKind::UnknownDefinition => CommandCode::UnknownDefinition,
+    };
+
+    CommandResult::failure(code, error.command_index(), error.byte_offset())
 }
 
 #[repr(C)]
@@ -507,6 +711,73 @@ mod tests {
 
         let success_code = register(engine, &EMPTY_DEFINITION_BUFFER, &mut result);
         assert_eq!(success_code, DefinitionRegistrationCode::Success as u32);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn command_result_has_stable_c_layout() {
+        assert_eq!(size_of::<CommandResult>(), 16);
+        assert_eq!(align_of::<CommandResult>(), align_of::<u32>());
+    }
+
+    #[test]
+    fn world_creation_result_has_stable_c_layout() {
+        assert_eq!(size_of::<WorldCreationResult>(), 8);
+        assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>(),);
+    }
+
+    #[test]
+    fn ffi_can_create_apply_and_destroy_world() {
+        let engine = hynergy_engine_create();
+
+        let mut creation = WorldCreationResult {
+            code: 0xaaaa_aaaa,
+            world_id: 0xbbbb_bbbb,
+        };
+
+        assert_eq!(
+            unsafe { hynergy_engine_create_world(engine, &mut creation) },
+            WorldCode::Success as u32,
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HYWC");
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+
+        let mut result = CommandResult {
+            code: 0,
+            command_index: 0,
+            byte_offset: 0,
+            reserved: 0,
+        };
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_apply_commands(
+                    engine,
+                    creation.world_id,
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    &mut result,
+                )
+            },
+            CommandCode::Success as u32,
+        );
+
+        assert_eq!(
+            unsafe { hynergy_engine_destroy_world(engine, creation.world_id,) },
+            WorldCode::Success as u32,
+        );
 
         unsafe {
             hynergy_engine_destroy(engine);

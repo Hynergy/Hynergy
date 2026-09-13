@@ -1,5 +1,5 @@
 [package]
-name = "hynergy-mna-ffi"
+name = "hynergy-ffi"
 version.workspace = true
 edition.workspace = true
 
