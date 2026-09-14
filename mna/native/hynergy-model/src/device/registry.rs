@@ -105,6 +105,7 @@ mod tests {
             vec![0.into(), 1.into()],
             Vec::new(),
             TerminalPartitionLayout::try_new(vec![0.into(), 0.into()]).unwrap(),
+            0,
         )
     }
 

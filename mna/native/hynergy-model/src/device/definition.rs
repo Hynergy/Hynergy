@@ -267,6 +267,13 @@ impl PrimitiveElementKind {
 
         Ok(())
     }
+
+    pub const fn state_count(self) -> usize {
+        match self {
+            Self::Capacitor | Self::Inductor | Self::TickDelay => 1,
+            _ => 0,
+        }
+    }
 }
 
 impl From<PrimitiveElementKind> for DefinitionId {
@@ -289,6 +296,7 @@ pub struct DeviceDefinition {
     terminals: SmallVec<[NodeId; 4]>,
     param_constraints: SmallVec<[ParameterConstraints; 1]>,
     terminal_partition_layout: TerminalPartitionLayout,
+    state_count: usize,
 }
 
 impl DeviceDefinition {
@@ -303,6 +311,7 @@ impl DeviceDefinition {
             terminals: terminals.into(),
             param_constraints: param_constraints.into(),
             terminal_partition_layout,
+            state_count: kind.state_count(),
         }
     }
 
@@ -311,12 +320,14 @@ impl DeviceDefinition {
         terminals: impl Into<SmallVec<[NodeId; 4]>>,
         param_constraints: impl Into<SmallVec<[ParameterConstraints; 1]>>,
         terminal_partition_layout: TerminalPartitionLayout,
+        state_count: usize,
     ) -> Self {
         Self {
             body: DeviceBody::Composite(circuit),
             terminals: terminals.into(),
             param_constraints: param_constraints.into(),
             terminal_partition_layout,
+            state_count,
         }
     }
 
@@ -343,6 +354,11 @@ impl DeviceDefinition {
     #[inline]
     pub fn terminal_partition_count(&self) -> usize {
         self.terminal_partition_layout.partition_count()
+    }
+
+    #[inline]
+    pub const fn state_count(&self) -> usize {
+        self.state_count
     }
 }
 
@@ -599,5 +615,21 @@ mod tests {
                 TerminalPartitionId::new(2),
             ]
         );
+    }
+
+    #[test]
+    fn primitive_state_counts_match_contract() {
+        for kind in PrimitiveElementKind::ALL {
+            let expected = match kind {
+                PrimitiveElementKind::Capacitor
+                | PrimitiveElementKind::Inductor
+                | PrimitiveElementKind::TickDelay => 1,
+
+                _ => 0,
+            };
+
+            assert_eq!(kind.state_count(), expected, "{kind:?}");
+            assert_eq!(kind.definition().state_count(), expected, "{kind:?}");
+        }
     }
 }

@@ -102,6 +102,9 @@ pub enum DeviceDefinitionBuilderError {
 
     #[error("exhausted TerminalPartitionId range")]
     TerminalPartitionIdExhausted,
+
+    #[error("definition state count exceeds the addressable state range")]
+    StateCountExhausted,
 }
 
 pub struct DeviceDefinitionBuilder<'a> {
@@ -287,9 +290,11 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         Ok(())
     }
 
+    #[inline]
     pub fn build_definition(self) -> Result<DeviceDefinition, DeviceDefinitionBuilderError> {
         self.validate_parameter_usage()?;
 
+        let state_count = self.derive_state_count()?;
         let terminal_partition_layout = self.derive_terminal_partition_layout()?;
 
         Ok(DeviceDefinition::new_composite(
@@ -297,6 +302,7 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             self.terminals,
             self.param_constraints,
             terminal_partition_layout,
+            state_count,
         ))
     }
 
@@ -435,6 +441,20 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn derive_state_count(&self) -> Result<usize, DeviceDefinitionBuilderError> {
+        self.elements.iter().try_fold(0usize, |total, element| {
+            let definition = self
+                .registry
+                .get(element.definition())
+                .expect("elements are validated before insertion");
+
+            total
+                .checked_add(definition.state_count())
+                .ok_or(DeviceDefinitionBuilderError::StateCountExhausted)
+        })
     }
 }
 
@@ -949,5 +969,109 @@ mod tests {
                 TerminalPartitionId::new(0),
             ]
         );
+    }
+
+    #[test]
+    fn composite_state_count_accumulates_nested_element_state() {
+        let mut registry = DefinitionRegistry::new();
+
+        let child = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            builder
+                .add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::Capacitor),
+                    vec![a, b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::Inductor),
+                    vec![a, b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(child.state_count(), 2);
+
+        let child_id = registry.register(child).unwrap();
+
+        let parent = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            builder
+                .add_element(Element::new(child_id, vec![a, b], Vec::<ValueRef>::new()))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(child_id, vec![a, b], Vec::<ValueRef>::new()))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(parent.state_count(), 4);
+    }
+
+    #[test]
+    fn composite_state_count_overflow_is_rejected() {
+        let mut registry = DefinitionRegistry::new();
+
+        let current_definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            builder
+                .add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::Capacitor),
+                    vec![a, b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(current_definition.state_count(), 1);
+
+        let mut current = registry.register(current_definition).unwrap();
+
+        for _ in 0..usize::BITS {
+            let result = {
+                let mut builder = DeviceDefinitionBuilder::new(&registry);
+                let [a, b] = terminals(&mut builder);
+
+                for _ in 0..2 {
+                    builder
+                        .add_element(Element::new(current, vec![a, b], Vec::<ValueRef>::new()))
+                        .unwrap();
+                }
+
+                builder.build_definition()
+            };
+
+            match result {
+                Ok(definition) => {
+                    current = registry.register(definition).unwrap();
+                }
+
+                Err(DeviceDefinitionBuilderError::StateCountExhausted) => {
+                    return;
+                }
+
+                Err(error) => {
+                    panic!("unexpected builder error: {error:?}");
+                }
+            }
+        }
+
+        panic!("state count should overflow");
     }
 }

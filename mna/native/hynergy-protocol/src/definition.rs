@@ -73,6 +73,7 @@ pub enum DefinitionRegistrationErrorKind {
     IncompatibleParameterConstraints,
     UnusedParameter,
     TerminalPartitionIdExhausted,
+    StateCountExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +519,9 @@ fn map_builder_error(
 
         DeviceDefinitionBuilderError::TerminalPartitionIdExhausted => {
             DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted
+        }
+        DeviceDefinitionBuilderError::StateCountExhausted => {
+            DefinitionRegistrationErrorKind::StateCountExhausted
         }
     };
 

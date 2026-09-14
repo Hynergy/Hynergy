@@ -44,6 +44,7 @@ pub enum DefinitionRegistrationCode {
     IncompatibleParameterConstraints = 33,
     UnusedParameter = 34,
     TerminalPartitionIdExhausted = 35,
+    StateCountExhausted = 36,
 
     InternalPanic = u32::MAX,
 }
@@ -260,6 +261,9 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
         }
         DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted => {
             DefinitionRegistrationCode::TerminalPartitionIdExhausted
+        }
+        DefinitionRegistrationErrorKind::StateCountExhausted => {
+            DefinitionRegistrationCode::StateCountExhausted
         }
     };
 
