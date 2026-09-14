@@ -453,7 +453,7 @@ mod tests {
         let invalidation_before_failure = world.derived_topology.invalidation().clone();
 
         assert_eq!(
-            world.set_device_parameter(&definitions, d, ParameterId::new(0), 0.0,),
+            world.set_device_parameter(&definitions, d, ParameterId::new(0), -1.0,),
             Err(NetworkModelError::ParameterConstraint {
                 parameter: ParameterId::new(0),
                 source: ParameterConstraintError::OutOfRange,

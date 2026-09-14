@@ -38,6 +38,12 @@ pub enum DefinitionRegistrationCode {
     ParameterIdExhausted = 27,
     DefinitionIdExhausted = 28,
     InvalidDefinition = 29,
+    InvalidPrimitiveParameters = 30,
+    UnusedInternalNode = 31,
+    DisconnectedInternalComponent = 32,
+    IncompatibleParameterConstraints = 33,
+    UnusedParameter = 34,
+    TerminalPartitionIdExhausted = 35,
 
     InternalPanic = u32::MAX,
 }
@@ -178,6 +184,86 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
         result.write(output);
     }
     code
+}
+
+fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegistrationResult {
+    let code = match error.kind() {
+        DefinitionRegistrationErrorKind::InvalidMagic => DefinitionRegistrationCode::InvalidMagic,
+        DefinitionRegistrationErrorKind::UnsupportedVersion => {
+            DefinitionRegistrationCode::UnsupportedVersion
+        }
+        DefinitionRegistrationErrorKind::InvalidFlags => DefinitionRegistrationCode::InvalidFlags,
+        DefinitionRegistrationErrorKind::InvalidReserved => {
+            DefinitionRegistrationCode::InvalidReserved
+        }
+        DefinitionRegistrationErrorKind::TruncatedInput => {
+            DefinitionRegistrationCode::TruncatedInput
+        }
+        DefinitionRegistrationErrorKind::UnknownCommand => {
+            DefinitionRegistrationCode::UnknownCommand
+        }
+        DefinitionRegistrationErrorKind::InvalidCommandLength => {
+            DefinitionRegistrationCode::InvalidCommandLength
+        }
+        DefinitionRegistrationErrorKind::InvalidCount => DefinitionRegistrationCode::InvalidCount,
+        DefinitionRegistrationErrorKind::InvalidDefinitionId => {
+            DefinitionRegistrationCode::InvalidDefinitionId
+        }
+        DefinitionRegistrationErrorKind::UnknownValueKind => {
+            DefinitionRegistrationCode::UnknownValueKind
+        }
+        DefinitionRegistrationErrorKind::TrailingBytes => DefinitionRegistrationCode::TrailingBytes,
+        DefinitionRegistrationErrorKind::UnknownDefinition => {
+            DefinitionRegistrationCode::UnknownDefinition
+        }
+        DefinitionRegistrationErrorKind::TerminalCountMismatch => {
+            DefinitionRegistrationCode::TerminalCountMismatch
+        }
+        DefinitionRegistrationErrorKind::ParameterCountMismatch => {
+            DefinitionRegistrationCode::ParameterCountMismatch
+        }
+        DefinitionRegistrationErrorKind::NodeOutOfRange => {
+            DefinitionRegistrationCode::NodeOutOfRange
+        }
+        DefinitionRegistrationErrorKind::ParameterOutOfRange => {
+            DefinitionRegistrationCode::ParameterOutOfRange
+        }
+        DefinitionRegistrationErrorKind::ParameterConstraintViolation => {
+            DefinitionRegistrationCode::ParameterConstraintViolation
+        }
+        DefinitionRegistrationErrorKind::NodeIdExhausted => {
+            DefinitionRegistrationCode::NodeIdExhausted
+        }
+        DefinitionRegistrationErrorKind::ParameterIdExhausted => {
+            DefinitionRegistrationCode::ParameterIdExhausted
+        }
+        DefinitionRegistrationErrorKind::DefinitionIdExhausted => {
+            DefinitionRegistrationCode::DefinitionIdExhausted
+        }
+        DefinitionRegistrationErrorKind::InvalidDefinition => {
+            DefinitionRegistrationCode::InvalidDefinition
+        }
+        DefinitionRegistrationErrorKind::InvalidPrimitiveParameters => {
+            DefinitionRegistrationCode::InvalidPrimitiveParameters
+        }
+        DefinitionRegistrationErrorKind::UnusedInternalNode => {
+            DefinitionRegistrationCode::UnusedInternalNode
+        }
+        DefinitionRegistrationErrorKind::DisconnectedInternalComponent => {
+            DefinitionRegistrationCode::DisconnectedInternalComponent
+        }
+        DefinitionRegistrationErrorKind::IncompatibleParameterConstraints => {
+            DefinitionRegistrationCode::IncompatibleParameterConstraints
+        }
+        DefinitionRegistrationErrorKind::UnusedParameter => {
+            DefinitionRegistrationCode::UnusedParameter
+        }
+        DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted => {
+            DefinitionRegistrationCode::TerminalPartitionIdExhausted
+        }
+    };
+
+    DefinitionRegistrationResult::failure(code, error.command_index(), error.byte_offset())
 }
 
 #[repr(u32)]
@@ -477,69 +563,6 @@ pub unsafe extern "C" fn hynergy_world_solve(
     todo!("world solving is not implemented")
 }
 
-fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegistrationResult {
-    let code = match error.kind() {
-        DefinitionRegistrationErrorKind::InvalidMagic => DefinitionRegistrationCode::InvalidMagic,
-        DefinitionRegistrationErrorKind::UnsupportedVersion => {
-            DefinitionRegistrationCode::UnsupportedVersion
-        }
-        DefinitionRegistrationErrorKind::InvalidFlags => DefinitionRegistrationCode::InvalidFlags,
-        DefinitionRegistrationErrorKind::InvalidReserved => {
-            DefinitionRegistrationCode::InvalidReserved
-        }
-        DefinitionRegistrationErrorKind::TruncatedInput => {
-            DefinitionRegistrationCode::TruncatedInput
-        }
-        DefinitionRegistrationErrorKind::UnknownCommand => {
-            DefinitionRegistrationCode::UnknownCommand
-        }
-        DefinitionRegistrationErrorKind::InvalidCommandLength => {
-            DefinitionRegistrationCode::InvalidCommandLength
-        }
-        DefinitionRegistrationErrorKind::InvalidCount => DefinitionRegistrationCode::InvalidCount,
-        DefinitionRegistrationErrorKind::UnknownValueKind => {
-            DefinitionRegistrationCode::UnknownValueKind
-        }
-        DefinitionRegistrationErrorKind::TrailingBytes => DefinitionRegistrationCode::TrailingBytes,
-        DefinitionRegistrationErrorKind::UnknownDefinition => {
-            DefinitionRegistrationCode::UnknownDefinition
-        }
-        DefinitionRegistrationErrorKind::TerminalCountMismatch => {
-            DefinitionRegistrationCode::TerminalCountMismatch
-        }
-        DefinitionRegistrationErrorKind::ParameterCountMismatch => {
-            DefinitionRegistrationCode::ParameterCountMismatch
-        }
-        DefinitionRegistrationErrorKind::NodeOutOfRange => {
-            DefinitionRegistrationCode::NodeOutOfRange
-        }
-        DefinitionRegistrationErrorKind::ParameterOutOfRange => {
-            DefinitionRegistrationCode::ParameterOutOfRange
-        }
-        DefinitionRegistrationErrorKind::ParameterConstraintViolation => {
-            DefinitionRegistrationCode::ParameterConstraintViolation
-        }
-        DefinitionRegistrationErrorKind::NodeIdExhausted => {
-            DefinitionRegistrationCode::NodeIdExhausted
-        }
-        DefinitionRegistrationErrorKind::ParameterIdExhausted => {
-            DefinitionRegistrationCode::ParameterIdExhausted
-        }
-        DefinitionRegistrationErrorKind::DefinitionIdExhausted => {
-            DefinitionRegistrationCode::DefinitionIdExhausted
-        }
-        DefinitionRegistrationErrorKind::InvalidDefinition => {
-            DefinitionRegistrationCode::InvalidDefinition
-        }
-        DefinitionRegistrationErrorKind::InvalidDefinitionId => {
-            DefinitionRegistrationCode::InvalidDefinitionId
-        }
-        _ => todo!("{:?}", error),
-    };
-
-    DefinitionRegistrationResult::failure(code, error.command_index(), error.byte_offset())
-}
-
 fn map_world_command_error(error: WorldCommandError) -> CommandResult {
     let code = match error.kind() {
         WorldCommandErrorKind::InvalidMagic => CommandCode::InvalidMagic,
@@ -578,13 +601,193 @@ mod tests {
     use std::mem::{align_of, size_of};
 
     fn definition_buffer() -> Vec<u8> {
+        definition_buffer_with_commands(&[])
+    }
+
+    fn definition_command(tag: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(6 + payload.len());
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn definition_buffer_with_commands(commands: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"HYDF");
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(commands.len() as u32).to_le_bytes());
+
+        for command in commands {
+            bytes.extend_from_slice(command);
+        }
+
         bytes
+    }
+
+    fn literal_element_payload(
+        definition_id: u32,
+        terminals: &[u32],
+        parameters: &[f64],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&definition_id.to_le_bytes());
+
+        bytes.extend_from_slice(&(terminals.len() as u32).to_le_bytes());
+        for terminal in terminals {
+            bytes.extend_from_slice(&terminal.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&(parameters.len() as u32).to_le_bytes());
+        for parameter in parameters {
+            bytes.push(0); // DEFINITION_VALUE_LITERAL
+            bytes.extend_from_slice(&parameter.to_le_bytes());
+        }
+
+        bytes
+    }
+
+    #[test]
+    fn definition_registration_maps_invalid_primitive_parameters() {
+        const ADD_TERMINAL: u16 = 1;
+        const ADD_ELEMENT: u16 = 4;
+
+        // Primitive IDs are one-based, so VoltageControlledSwitch is 9.
+        const VOLTAGE_CONTROLLED_SWITCH: u32 = 9;
+
+        let engine = hynergy_engine_create();
+
+        let mut commands = vec![
+            definition_command(ADD_TERMINAL, &[]),
+            definition_command(ADD_TERMINAL, &[]),
+            definition_command(ADD_TERMINAL, &[]),
+            definition_command(ADD_TERMINAL, &[]),
+        ];
+
+        let element_offset = 16 + commands.iter().map(Vec::len).sum::<usize>();
+
+        commands.push(definition_command(
+            ADD_ELEMENT,
+            &literal_element_payload(
+                VOLTAGE_CONTROLLED_SWITCH,
+                &[0, 1, 2, 3],
+                &[
+                    0.0, // threshold
+                    0.0, // hysteresis
+                    1.0, // G_max
+                    1.0, // G_min -- invalid because G_max must be > G_min
+                ],
+            ),
+        ));
+
+        let bytes = definition_buffer_with_commands(&commands);
+        let mut result = definition_result_sentinel();
+
+        let code = register(engine, &bytes, &mut result);
+
+        assert_eq!(
+            code,
+            DefinitionRegistrationCode::InvalidPrimitiveParameters as u32
+        );
+
+        assert_eq!(
+            result,
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::InvalidPrimitiveParameters as u32,
+                command_index: 4,
+                byte_offset: element_offset as u32,
+                definition_id: u32::MAX,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn definition_registration_maps_unused_internal_node() {
+        const ADD_TERMINAL: u16 = 1;
+        const ADD_NODE: u16 = 2;
+
+        let engine = hynergy_engine_create();
+
+        let commands = vec![
+            definition_command(ADD_TERMINAL, &[]),
+            definition_command(ADD_NODE, &[]),
+        ];
+
+        let bytes = definition_buffer_with_commands(&commands);
+        let mut result = definition_result_sentinel();
+
+        let code = register(engine, &bytes, &mut result);
+
+        assert_eq!(code, DefinitionRegistrationCode::UnusedInternalNode as u32);
+
+        assert_eq!(
+            result,
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::UnusedInternalNode as u32,
+                command_index: commands.len() as u32,
+                byte_offset: bytes.len() as u32,
+                definition_id: u32::MAX,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn definition_registration_maps_disconnected_internal_component() {
+        const ADD_TERMINAL: u16 = 1;
+        const ADD_NODE: u16 = 2;
+        const ADD_ELEMENT: u16 = 4;
+
+        const RESISTANCE: u32 = 1;
+
+        let engine = hynergy_engine_create();
+
+        let commands = vec![
+            // Exposed node 0.
+            definition_command(ADD_TERMINAL, &[]),
+            // Internal nodes 1 and 2.
+            definition_command(ADD_NODE, &[]),
+            definition_command(ADD_NODE, &[]),
+            // A real internal circuit which has no instantaneous path to node 0.
+            definition_command(
+                ADD_ELEMENT,
+                &literal_element_payload(RESISTANCE, &[1, 2], &[1.0]),
+            ),
+        ];
+
+        let bytes = definition_buffer_with_commands(&commands);
+        let mut result = definition_result_sentinel();
+
+        let code = register(engine, &bytes, &mut result);
+
+        assert_eq!(
+            code,
+            DefinitionRegistrationCode::DisconnectedInternalComponent as u32
+        );
+
+        assert_eq!(
+            result,
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::DisconnectedInternalComponent as u32,
+                command_index: commands.len() as u32,
+                byte_offset: bytes.len() as u32,
+                definition_id: u32::MAX,
+            }
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
     }
 
     fn world_command(tag: u16, payload: &[u8]) -> Vec<u8> {
@@ -753,13 +956,14 @@ mod tests {
         let code = register(engine, &bytes, &mut result);
 
         assert_eq!(code, DefinitionRegistrationCode::Success as u32);
+
         assert_eq!(
             result,
             DefinitionRegistrationResult {
                 code: DefinitionRegistrationCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
-                definition_id: 7
+                definition_id: Engine::COMPOSITE_DEFINITION_ID_BASE,
             }
         );
 

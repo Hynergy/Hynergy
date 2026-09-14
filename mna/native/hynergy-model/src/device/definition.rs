@@ -210,6 +210,31 @@ impl PrimitiveElementKind {
                 .map_err(|source| PrimitiveParameterError::InvalidParameter { index, source })?;
         }
 
+        self.validate_parameter_relations_unchecked(parameters)
+    }
+
+    pub(crate) fn validate_parameter_relations(
+        self,
+        parameters: &[f64],
+    ) -> Result<(), PrimitiveParameterError> {
+        let expected = self.parameter_count();
+
+        if parameters.len() != expected {
+            return Err(PrimitiveParameterError::WrongParameterCount {
+                expected,
+                actual: parameters.len(),
+            });
+        }
+
+        self.validate_parameter_relations_unchecked(parameters)
+    }
+
+    fn validate_parameter_relations_unchecked(
+        self,
+        parameters: &[f64],
+    ) -> Result<(), PrimitiveParameterError> {
+        debug_assert_eq!(parameters.len(), self.parameter_count());
+
         match self {
             Self::VoltageControlledSwitch => {
                 if parameters[2] <= parameters[3] {
@@ -220,13 +245,11 @@ impl PrimitiveElementKind {
                 }
             }
 
-            Self::VoltageControlledConductance => {
-                if parameters[3] <= parameters[2] {
-                    return Err(PrimitiveParameterError::ParameterMustBeGreater {
-                        greater: 3,
-                        lesser: 2,
-                    });
-                }
+            Self::VoltageControlledConductance if parameters[3] <= parameters[2] => {
+                return Err(PrimitiveParameterError::ParameterMustBeGreater {
+                    greater: 3,
+                    lesser: 2,
+                });
             }
 
             _ => {}

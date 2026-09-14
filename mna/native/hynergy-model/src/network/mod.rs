@@ -217,25 +217,30 @@ mod tests {
         assert_eq!(model.devices[0].as_ref().unwrap().parameters(), &[None]);
 
         model
-            .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 0.0)
             .unwrap();
+
         assert_eq!(
             model.devices[0].as_ref().unwrap().parameters(),
-            &[Some(1.0)]
+            &[Some(0.0)]
         );
 
+        model
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
+            .unwrap();
+
         for (value, error) in [
-            (0.0, ParameterConstraintError::OutOfRange),
             (-1.0, ParameterConstraintError::OutOfRange),
             (f64::NAN, ParameterConstraintError::NonFinite),
         ] {
             assert_eq!(
-                model.set_device_parameter(&definitions, device, ParameterId::new(0), value),
+                model.set_device_parameter(&definitions, device, ParameterId::new(0), value,),
                 Err(NetworkModelError::ParameterConstraint {
                     parameter: ParameterId::new(0),
                     source: error,
                 })
             );
+
             assert_eq!(
                 model.devices[0].as_ref().unwrap().parameters(),
                 &[Some(1.0)]

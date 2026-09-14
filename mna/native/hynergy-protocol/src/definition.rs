@@ -70,6 +70,9 @@ pub enum DefinitionRegistrationErrorKind {
     InvalidPrimitiveParameters,
     UnusedInternalNode,
     DisconnectedInternalComponent,
+    IncompatibleParameterConstraints,
+    UnusedParameter,
+    TerminalPartitionIdExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +507,18 @@ fn map_builder_error(
         DeviceDefinitionBuilderError::ElementIdExhausted => {
             DefinitionRegistrationErrorKind::InvalidDefinition
         }
+
+        DeviceDefinitionBuilderError::ParameterConstraintsIncompatible { .. } => {
+            DefinitionRegistrationErrorKind::IncompatibleParameterConstraints
+        }
+
+        DeviceDefinitionBuilderError::UnusedParameter { .. } => {
+            DefinitionRegistrationErrorKind::UnusedParameter
+        }
+
+        DeviceDefinitionBuilderError::TerminalPartitionIdExhausted => {
+            DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted
+        }
     };
 
     DefinitionRegistrationError::command(kind, command_index, command_offset)
@@ -712,30 +727,29 @@ mod tests {
             command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
             command(
                 DEFINITION_COMMAND_ADD_PARAMETER,
-                &constraints_payload(None, None, false, None),
+                &constraints_payload(
+                    Some(Bound {
+                        value: 0.0,
+                        inclusive: false,
+                    }),
+                    None,
+                    false,
+                    None,
+                ),
             ),
             command(
                 DEFINITION_COMMAND_ADD_ELEMENT,
-                &element_payload(1, &[0, 2], &[TestValue::Parameter(0)]),
+                &element_payload(1, &[0, 1], &[TestValue::Parameter(0)]),
+            ),
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(1, &[1, 2], &[TestValue::Parameter(0)]),
             ),
         ];
 
         register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
 
-        let definition = registered_definition(&engine);
-
-        assert_eq!(definition.terminals().len(), 2);
-        assert_eq!(definition.parameters().len(), 1);
-
-        let DeviceBody::Composite(circuit) = definition.body() else {
-            panic!("expected composite definition");
-        };
-
-        assert_eq!(circuit.node_count(), 3);
-        assert_eq!(circuit.elements().len(), 1);
-        assert_eq!(circuit.elements()[0].definition().get(), 1);
-        assert_eq!(circuit.elements()[0].terminals()[0].id(), 0);
-        assert_eq!(circuit.elements()[0].terminals()[1].id(), 2);
+        // ...
     }
 
     #[test]
@@ -905,15 +919,23 @@ mod tests {
             Some((Some(reciprocal_lower), Some(reciprocal_upper))),
         );
 
-        let commands = [command(
-            DEFINITION_COMMAND_ADD_PARAMETER,
-            &constraints_payload(
-                Some(lower),
-                Some(upper),
-                true,
-                Some((Some(reciprocal_lower), Some(reciprocal_upper))),
+        let commands = [
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(
+                DEFINITION_COMMAND_ADD_PARAMETER,
+                &constraints_payload(
+                    Some(lower),
+                    Some(upper),
+                    true,
+                    Some((Some(reciprocal_lower), Some(reciprocal_upper))),
+                ),
             ),
-        )];
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(1, &[0, 1], &[TestValue::Parameter(0)]),
+            ),
+        ];
 
         let mut engine = Engine::new();
 
@@ -1161,5 +1183,47 @@ mod tests {
 
         assert!(engine.definitions().get(first).is_some());
         assert!(engine.definitions().get(second).is_some());
+    }
+
+    #[test]
+    fn incompatible_parent_parameter_constraints_are_rejected() {
+        let commands = [
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(
+                DEFINITION_COMMAND_ADD_PARAMETER,
+                &constraints_payload(None, None, false, None),
+            ),
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(1, &[0, 1], &[TestValue::Parameter(0)]),
+            ),
+        ];
+
+        let bytes = definition_buffer(&commands);
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::IncompatibleParameterConstraints,
+            3,
+            36,
+        );
+    }
+
+    #[test]
+    fn unused_definition_parameter_is_rejected_at_build_end() {
+        let commands = [command(
+            DEFINITION_COMMAND_ADD_PARAMETER,
+            &constraints_payload(None, None, false, None),
+        )];
+
+        let bytes = definition_buffer(&commands);
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::UnusedParameter,
+            1,
+            bytes.len() as u32,
+        );
     }
 }

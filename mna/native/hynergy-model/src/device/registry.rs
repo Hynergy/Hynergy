@@ -142,8 +142,14 @@ mod tests {
         let first = registry.register(composite_definition()).unwrap();
         let second = registry.register(composite_definition()).unwrap();
 
-        assert_eq!(first.id().get(), 7);
-        assert_eq!(second.id().get(), 8);
+        assert_eq!(
+            first.id().get(),
+            DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE
+        );
+        assert_eq!(
+            second.id().get(),
+            DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE + 1
+        );
         assert!(registry.get(first).is_some());
         assert!(registry.get(second).is_some());
     }

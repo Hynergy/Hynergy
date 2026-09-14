@@ -85,6 +85,22 @@ pub enum DeviceDefinitionBuilderError {
 
     #[error("exhausted ElementId range")]
     ElementIdExhausted,
+
+    #[error(
+        "definition parameter {parameter:?} does not satisfy the constraints \
+     of parameter {parameter_index} of device {definition_id:?}"
+    )]
+    ParameterConstraintsIncompatible {
+        definition_id: DefinitionId,
+        parameter_index: usize,
+        parameter: ParameterId,
+    },
+
+    #[error("definition parameter {parameter:?} is unused")]
+    UnusedParameter { parameter: ParameterId },
+
+    #[error("exhausted TerminalPartitionId range")]
+    TerminalPartitionIdExhausted,
 }
 
 pub struct DeviceDefinitionBuilder<'a> {
@@ -219,17 +235,27 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                     })?;
                 }
 
-                ValueRef::Parameter(parameter_id)
-                    if parameter_id.index() >= self.param_constraints.len() =>
-                {
-                    return Err(DeviceDefinitionBuilderError::ParameterOutOfRange {
-                        parameter_index,
-                        parameter: *parameter_id,
-                        parameter_count: self.param_constraints.len(),
-                    });
-                }
+                ValueRef::Parameter(parameter_id) => {
+                    let Some(parameter_constraints) =
+                        self.param_constraints.get(parameter_id.index())
+                    else {
+                        return Err(DeviceDefinitionBuilderError::ParameterOutOfRange {
+                            parameter_index,
+                            parameter: *parameter_id,
+                            parameter_count: self.param_constraints.len(),
+                        });
+                    };
 
-                ValueRef::Parameter(_) => {}
+                    if !parameter_constraints.is_subset_of(constraint) {
+                        return Err(
+                            DeviceDefinitionBuilderError::ParameterConstraintsIncompatible {
+                                definition_id,
+                                parameter_index,
+                                parameter: *parameter_id,
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -249,12 +275,11 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             }
 
             if all_literal {
-                kind.validate_parameters(&parameters).map_err(|source| {
-                    DeviceDefinitionBuilderError::PrimitiveParameters {
+                kind.validate_parameter_relations(&parameters)
+                    .map_err(|source| DeviceDefinitionBuilderError::PrimitiveParameters {
                         definition_id,
                         source,
-                    }
-                })?;
+                    })?;
             }
         }
 
@@ -262,6 +287,8 @@ impl<'a> DeviceDefinitionBuilder<'a> {
     }
 
     pub fn build_definition(self) -> Result<DeviceDefinition, DeviceDefinitionBuilderError> {
+        self.validate_parameter_usage()?;
+
         let terminal_partitions = self.derive_terminal_partitions()?;
 
         Ok(DeviceDefinition::new_composite(
@@ -361,7 +388,10 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                 Some(partition) => partition,
 
                 None => {
-                    let partition = TerminalPartitionId::new(next_partition as u16);
+                    let raw = u16::try_from(next_partition)
+                        .map_err(|_| DeviceDefinitionBuilderError::TerminalPartitionIdExhausted)?;
+
+                    let partition = TerminalPartitionId::new(raw);
                     next_partition += 1;
 
                     root_partitions[root] = Some(partition);
@@ -374,6 +404,33 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         }
 
         Ok(terminal_partitions)
+    }
+
+    fn validate_parameter_usage(&self) -> Result<(), DeviceDefinitionBuilderError> {
+        if self.param_constraints.is_empty() {
+            return Ok(());
+        }
+
+        let mut used = vec![false; self.param_constraints.len()];
+
+        for element in &self.elements {
+            for value in element.parameters() {
+                if let ValueRef::Parameter(parameter) = value {
+                    used[parameter.index()] = true;
+                }
+            }
+        }
+
+        if let Some(index) = used.iter().position(|&used| !used) {
+            let parameter = ParameterId::new(
+                u32::try_from(index)
+                    .expect("parameter count is constrained to the ParameterId range"),
+            );
+
+            return Err(DeviceDefinitionBuilderError::UnusedParameter { parameter });
+        }
+
+        Ok(())
     }
 }
 
