@@ -1,6 +1,4 @@
-use crate::circuit::NodeId;
 use crate::device::definition::{DefinitionId, DeviceBody, DeviceDefinition, PrimitiveElementKind};
-use crate::parameter::{Bound, ParameterConstraints};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,63 +33,14 @@ impl Default for DefinitionRegistry {
 }
 
 impl DefinitionRegistry {
-    pub const COMPOSITE_DEFINITION_ID_BASE: u32 = 7;
+    pub const COMPOSITE_DEFINITION_ID_BASE: u32 = PrimitiveElementKind::COUNT + 1;
 
     pub fn new() -> Self {
-        let positive = ParameterConstraints::new(
-            Some(Bound {
-                value: 0.0,
-                inclusive: false,
-            }),
-            None,
-            false,
-            None,
-        );
-        let unrestricted = ParameterConstraints::default();
-
         Self {
-            definitions: vec![
-                DeviceDefinition::new_primitive(
-                    PrimitiveElementKind::Admittance,
-                    vec![NodeId::new(0), NodeId::new(1)],
-                    vec![positive],
-                ),
-                DeviceDefinition::new_primitive(
-                    PrimitiveElementKind::Impedance,
-                    vec![NodeId::new(0), NodeId::new(1)],
-                    vec![positive],
-                ),
-                DeviceDefinition::new_primitive(
-                    PrimitiveElementKind::AcrossSource,
-                    vec![NodeId::new(0), NodeId::new(1)],
-                    vec![unrestricted],
-                ),
-                DeviceDefinition::new_primitive(
-                    PrimitiveElementKind::ThroughSource,
-                    vec![NodeId::new(0), NodeId::new(1)],
-                    vec![unrestricted],
-                ),
-                DeviceDefinition::new_primitive(
-                    PrimitiveElementKind::ControlledThroughSource,
-                    vec![
-                        NodeId::new(0),
-                        NodeId::new(1),
-                        NodeId::new(2),
-                        NodeId::new(3),
-                    ],
-                    vec![unrestricted],
-                ),
-                DeviceDefinition::new_primitive(
-                    PrimitiveElementKind::ControlledAcrossSource,
-                    vec![
-                        NodeId::new(0),
-                        NodeId::new(1),
-                        NodeId::new(2),
-                        NodeId::new(3),
-                    ],
-                    vec![unrestricted],
-                ),
-            ],
+            definitions: PrimitiveElementKind::ALL
+                .into_iter()
+                .map(PrimitiveElementKind::definition)
+                .collect(),
         }
     }
 
@@ -146,31 +95,44 @@ impl DefinitionRegistry {
 mod tests {
     use super::{DefinitionRegistry, PrimitiveElementKind, RegisterDeviceError};
     use crate::circuit::Circuit;
-    use crate::circuit::NodeId;
     use crate::device::definition::{DefinitionId, DeviceBody, DeviceDefinition};
 
     fn composite_definition() -> DeviceDefinition {
         DeviceDefinition::new_composite(
             Circuit::new(2, Vec::new()),
-            vec![NodeId::new(0), NodeId::new(1)],
+            vec![0.into(), 1.into()],
             Vec::new(),
+            vec![0.into(), 0.into()],
         )
     }
 
     #[test]
-    fn primitive_definition_ids_are_one_based() {
-        let expected = [
-            (PrimitiveElementKind::Admittance, 1),
-            (PrimitiveElementKind::Impedance, 2),
-            (PrimitiveElementKind::AcrossSource, 3),
-            (PrimitiveElementKind::ThroughSource, 4),
-            (PrimitiveElementKind::ControlledThroughSource, 5),
-            (PrimitiveElementKind::ControlledAcrossSource, 6),
-        ];
+    fn primitive_definition_ids_match_registry_order() {
+        let registry = DefinitionRegistry::new();
 
-        for (kind, raw) in expected {
-            assert_eq!(DefinitionId::from(kind).get(), raw);
+        for (index, kind) in PrimitiveElementKind::ALL.into_iter().enumerate() {
+            let expected = (index + 1) as u32;
+
+            assert_eq!(kind as u32 + 1, expected);
+            assert_eq!(DefinitionId::from(kind).get(), expected);
+
+            assert!(matches!(
+                registry
+                    .get(DefinitionId::from(kind))
+                    .map(DeviceDefinition::body),
+                Some(DeviceBody::Primitive(actual)) if *actual == kind
+            ));
         }
+    }
+
+    #[test]
+    fn composite_ids_begin_after_all_primitives() {
+        assert_eq!(
+            DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE,
+            PrimitiveElementKind::COUNT + 1,
+        );
+
+        assert_eq!(DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE, 12,);
     }
 
     #[test]
@@ -190,14 +152,14 @@ mod tests {
     fn rejected_registration_does_not_consume_an_id() {
         let mut registry = DefinitionRegistry::new();
         let primitive = registry
-            .get(DefinitionId::from(PrimitiveElementKind::Admittance))
+            .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap()
             .clone();
 
         assert_eq!(
             registry.register(primitive),
             Err(RegisterDeviceError::PrimitiveRegistrationForbidden {
-                kind: PrimitiveElementKind::Admittance,
+                kind: PrimitiveElementKind::Conductance,
             })
         );
 

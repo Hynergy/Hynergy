@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn device_parameters_start_unassigned_and_store_values_explicitly() {
         let registry = DefinitionRegistry::new();
-        let definition_id = DefinitionId::from(PrimitiveElementKind::Admittance);
+        let definition_id = DefinitionId::from(PrimitiveElementKind::Conductance);
         let definition = registry.get(definition_id).unwrap();
         let mut slot = DeviceSlot::new(definition_id, definition);
 

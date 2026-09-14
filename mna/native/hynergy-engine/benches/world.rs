@@ -29,7 +29,7 @@ fn device(raw: usize) -> DeviceId {
 
 #[inline]
 fn admittance() -> DefinitionId {
-    PrimitiveElementKind::Admittance.into()
+    PrimitiveElementKind::Conductance.into()
 }
 
 fn line_world(wire_count: usize) -> World {

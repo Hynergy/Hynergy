@@ -1078,7 +1078,7 @@ mod tests {
             &mut topology,
             &definitions,
             d,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, w, d, 0);
@@ -1108,7 +1108,7 @@ mod tests {
             &mut topology,
             &definitions,
             da,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         add_device(
@@ -1116,7 +1116,7 @@ mod tests {
             &mut topology,
             &definitions,
             db,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, a, da, 0);
@@ -1242,7 +1242,7 @@ mod tests {
             &mut topology,
             &definitions,
             bridge,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, a, bridge, 0);
@@ -1281,7 +1281,7 @@ mod tests {
             &mut topology,
             &definitions,
             da,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         add_device(
@@ -1289,7 +1289,7 @@ mod tests {
             &mut topology,
             &definitions,
             db,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, a, da, 0);
@@ -1337,7 +1337,7 @@ mod tests {
                 &mut topology,
                 &definitions,
                 id,
-                PrimitiveElementKind::Admittance,
+                PrimitiveElementKind::Conductance,
             );
         }
 
@@ -1378,7 +1378,7 @@ mod tests {
                 &mut topology,
                 &definitions,
                 id,
-                PrimitiveElementKind::Admittance,
+                PrimitiveElementKind::Conductance,
             );
         }
 
@@ -1387,7 +1387,7 @@ mod tests {
             &mut topology,
             &definitions,
             bridge,
-            PrimitiveElementKind::ControlledThroughSource,
+            PrimitiveElementKind::VoltageControlledCurrentSource,
         );
 
         for (index, (&wire_id, &leaf)) in wires.iter().zip(leaves.iter()).enumerate() {
@@ -1459,7 +1459,7 @@ mod tests {
             &mut topology,
             &definitions,
             bridge,
-            PrimitiveElementKind::ControlledThroughSource,
+            PrimitiveElementKind::VoltageControlledCurrentSource,
         );
 
         for (terminal, wire) in wires.into_iter().enumerate() {
@@ -1506,7 +1506,7 @@ mod tests {
             &mut topology,
             &definitions,
             d,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, w, d, 0);
@@ -1543,7 +1543,7 @@ mod tests {
             &mut topology,
             &definitions,
             d,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, w, d, 0);
@@ -1580,7 +1580,7 @@ mod tests {
             &mut topology,
             &definitions,
             d,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, a, d, 0);
@@ -1630,7 +1630,7 @@ mod tests {
                 &mut topology,
                 &definitions,
                 device,
-                PrimitiveElementKind::Admittance,
+                PrimitiveElementKind::Conductance,
             );
         }
 
@@ -1671,7 +1671,7 @@ mod tests {
                 .add_device(
                     &definitions,
                     device,
-                    PrimitiveElementKind::Admittance.into(),
+                    PrimitiveElementKind::Conductance.into(),
                 )
                 .unwrap();
         }
@@ -1680,7 +1680,7 @@ mod tests {
             .add_device(
                 &definitions,
                 bridge,
-                PrimitiveElementKind::ControlledThroughSource.into(),
+                PrimitiveElementKind::VoltageControlledCurrentSource.into(),
             )
             .unwrap();
 
@@ -1740,7 +1740,7 @@ mod tests {
             &mut topology,
             &definitions,
             d,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, w, d, 0);
@@ -1794,14 +1794,14 @@ mod tests {
             &mut topology,
             &definitions,
             da,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
         add_device(
             &mut network,
             &mut topology,
             &definitions,
             db,
-            PrimitiveElementKind::Admittance,
+            PrimitiveElementKind::Conductance,
         );
 
         attach(&mut network, &mut topology, a, da, 0);

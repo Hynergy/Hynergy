@@ -534,6 +534,7 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
         DefinitionRegistrationErrorKind::InvalidDefinitionId => {
             DefinitionRegistrationCode::InvalidDefinitionId
         }
+        _ => todo!("{:?}", error),
     };
 
     DefinitionRegistrationResult::failure(code, error.command_index(), error.byte_offset())

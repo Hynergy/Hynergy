@@ -362,7 +362,7 @@ mod tests {
     }
 
     fn admittance() -> DefinitionId {
-        PrimitiveElementKind::Admittance.into()
+        PrimitiveElementKind::Conductance.into()
     }
 
     #[test]

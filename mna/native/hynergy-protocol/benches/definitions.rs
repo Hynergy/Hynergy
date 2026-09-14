@@ -67,7 +67,7 @@ impl DefinitionBufferBuilder {
     }
 
     fn add_admittance_element(&mut self) {
-        let definition: DefinitionId = PrimitiveElementKind::Admittance.into();
+        let definition: DefinitionId = PrimitiveElementKind::Conductance.into();
 
         let mut payload = Vec::with_capacity(29);
 

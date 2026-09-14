@@ -96,7 +96,7 @@ fn raw(index: usize) -> u32 {
 }
 
 fn admittance() -> u32 {
-    let definition: DefinitionId = PrimitiveElementKind::Admittance.into();
+    let definition: DefinitionId = PrimitiveElementKind::Conductance.into();
 
     definition.get()
 }

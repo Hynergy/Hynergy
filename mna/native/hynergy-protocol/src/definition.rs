@@ -67,6 +67,9 @@ pub enum DefinitionRegistrationErrorKind {
     ParameterIdExhausted,
     DefinitionIdExhausted,
     InvalidDefinition,
+    InvalidPrimitiveParameters,
+    UnusedInternalNode,
+    DisconnectedInternalComponent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,7 +254,9 @@ fn decode_definition(
         ));
     }
 
-    Ok(builder.build_definition())
+    builder
+        .build_definition()
+        .map_err(|error| map_builder_error(error, command_count, decoder.offset()))
 }
 
 fn decode_element(
@@ -455,31 +460,52 @@ fn map_builder_error(
         DeviceDefinitionBuilderError::UnknownDefinition { .. } => {
             DefinitionRegistrationErrorKind::UnknownDefinition
         }
+
         DeviceDefinitionBuilderError::TerminalCountMismatch { .. } => {
             DefinitionRegistrationErrorKind::TerminalCountMismatch
         }
+
         DeviceDefinitionBuilderError::ParameterCountMismatch { .. } => {
             DefinitionRegistrationErrorKind::ParameterCountMismatch
         }
+
         DeviceDefinitionBuilderError::NodeOutOfRange { .. } => {
             DefinitionRegistrationErrorKind::NodeOutOfRange
         }
+
         DeviceDefinitionBuilderError::ParameterOutOfRange { .. } => {
             DefinitionRegistrationErrorKind::ParameterOutOfRange
         }
+
         DeviceDefinitionBuilderError::ParameterConstraint { .. } => {
             DefinitionRegistrationErrorKind::ParameterConstraintViolation
         }
+
+        DeviceDefinitionBuilderError::PrimitiveParameters { .. } => {
+            DefinitionRegistrationErrorKind::InvalidPrimitiveParameters
+        }
+
+        DeviceDefinitionBuilderError::UnusedInternalNode { .. } => {
+            DefinitionRegistrationErrorKind::UnusedInternalNode
+        }
+
+        DeviceDefinitionBuilderError::InternalComponentWithoutTerminal { .. } => {
+            DefinitionRegistrationErrorKind::DisconnectedInternalComponent
+        }
+
         DeviceDefinitionBuilderError::NodeIdExhausted => {
             DefinitionRegistrationErrorKind::NodeIdExhausted
         }
+
         DeviceDefinitionBuilderError::ParameterIdExhausted => {
             DefinitionRegistrationErrorKind::ParameterIdExhausted
         }
+
         DeviceDefinitionBuilderError::ElementIdExhausted => {
             DefinitionRegistrationErrorKind::InvalidDefinition
         }
     };
+
     DefinitionRegistrationError::command(kind, command_index, command_offset)
 }
 

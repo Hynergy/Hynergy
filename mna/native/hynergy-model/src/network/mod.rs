@@ -211,7 +211,7 @@ mod tests {
         let definitions = DefinitionRegistry::new();
         let mut model = Network::new();
         let device = device_id(1);
-        let definition = DefinitionId::from(PrimitiveElementKind::Admittance);
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance);
 
         model.add_device(&definitions, device, definition).unwrap();
         assert_eq!(model.devices[0].as_ref().unwrap().parameters(), &[None]);
@@ -259,7 +259,7 @@ mod tests {
             .add_device(
                 &definitions,
                 device,
-                DefinitionId::from(PrimitiveElementKind::Admittance),
+                DefinitionId::from(PrimitiveElementKind::Conductance),
             )
             .unwrap();
         network.attach_terminal(wire_a, device, terminal).unwrap();

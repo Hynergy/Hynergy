@@ -474,7 +474,7 @@ mod tests {
     fn every_world_command_is_decoded_and_applied() {
         let mut engine = Engine::new();
         let world = engine.new_world().unwrap();
-        let definition = DefinitionId::from(PrimitiveElementKind::Admittance).get();
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance).get();
 
         let commands = [
             command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1])),
@@ -505,7 +505,7 @@ mod tests {
     fn wire_and_terminal_commands_create_expected_connections() {
         let mut engine = Engine::new();
         let world = engine.new_world().unwrap();
-        let definition = DefinitionId::from(PrimitiveElementKind::Admittance).get();
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance).get();
 
         let commands = [
             command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1])),
