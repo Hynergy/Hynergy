@@ -1,6 +1,7 @@
 use crate::circuit::{Circuit, Element, ElementId, NodeId, ValueRef};
 use crate::device::definition::{
     DefinitionId, DeviceBody, DeviceDefinition, PrimitiveParameterError, TerminalPartitionId,
+    TerminalPartitionLayout,
 };
 use crate::device::registry::DefinitionRegistry;
 use crate::parameter::{ParameterConstraintError, ParameterConstraints, ParameterId};
@@ -289,23 +290,25 @@ impl<'a> DeviceDefinitionBuilder<'a> {
     pub fn build_definition(self) -> Result<DeviceDefinition, DeviceDefinitionBuilderError> {
         self.validate_parameter_usage()?;
 
-        let terminal_partitions = self.derive_terminal_partitions()?;
+        let terminal_partition_layout = self.derive_terminal_partition_layout()?;
 
         Ok(DeviceDefinition::new_composite(
             Circuit::new(self.node_count, self.elements),
             self.terminals,
             self.param_constraints,
-            terminal_partitions,
+            terminal_partition_layout,
         ))
     }
 
-    fn derive_terminal_partitions(
+    fn derive_terminal_partition_layout(
         &self,
-    ) -> Result<SmallVec<[TerminalPartitionId; 4]>, DeviceDefinitionBuilderError> {
+    ) -> Result<TerminalPartitionLayout, DeviceDefinitionBuilderError> {
         let node_count = self.node_count as usize;
 
         let mut union_find = UnionFind::new(node_count);
         let mut referenced = vec![false; node_count];
+
+        let mut partition_anchors = SmallVec::<[Option<usize>; 4]>::new();
 
         for element in &self.elements {
             let definition = self
@@ -313,27 +316,25 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                 .get(element.definition())
                 .expect("elements are validated before insertion");
 
-            let element_terminals = element.terminals();
-            let partitions = definition.terminal_partitions();
+            partition_anchors.clear();
+            partition_anchors.resize(definition.terminal_partition_count(), None);
 
-            debug_assert_eq!(
-                element_terminals.len(),
-                partitions.len(),
-                "registered definition must have one partition per terminal"
-            );
+            for (&node, &partition) in element
+                .terminals()
+                .iter()
+                .zip(definition.terminal_partitions())
+            {
+                let node_index = node.index();
+                referenced[node_index] = true;
 
-            for &node in element_terminals {
-                referenced[node.id() as usize] = true;
-            }
+                match &mut partition_anchors[partition.index()] {
+                    Some(anchor) => {
+                        union_find.union(node_index, *anchor);
+                    }
 
-            for current in 1..element_terminals.len() {
-                if let Some(previous) =
-                    (0..current).find(|&previous| partitions[previous] == partitions[current])
-                {
-                    union_find.union(
-                        element_terminals[current].id() as usize,
-                        element_terminals[previous].id() as usize,
-                    );
+                    anchor => {
+                        *anchor = Some(node_index);
+                    }
                 }
             }
         }
@@ -403,7 +404,10 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             terminal_partitions.push(partition);
         }
 
-        Ok(terminal_partitions)
+        Ok(TerminalPartitionLayout::from_canonical_parts(
+            terminal_partitions,
+            next_partition as usize,
+        ))
     }
 
     fn validate_parameter_usage(&self) -> Result<(), DeviceDefinitionBuilderError> {
@@ -891,27 +895,44 @@ mod tests {
     }
 
     #[test]
-    fn nested_definition_uses_child_partition_summary() {
+    fn primitive_terminal_layouts_have_valid_partition_counts() {
+        for kind in PrimitiveElementKind::ALL {
+            let definition = kind.definition();
+
+            assert_eq!(
+                definition.terminals().len(),
+                definition.terminal_partitions().len(),
+            );
+
+            let expected_count = match kind {
+                PrimitiveElementKind::TickDelay => 2,
+                _ => 1,
+            };
+
+            assert_eq!(
+                definition.terminal_partition_count(),
+                expected_count,
+                "{kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn nested_definition_groups_non_adjacent_terminals_in_same_partition() {
         let mut registry = DefinitionRegistry::new();
 
         let child = {
             let mut builder = DeviceDefinitionBuilder::new(&registry);
 
-            let input_positive = builder.add_terminal().unwrap();
-            let input_negative = builder.add_terminal().unwrap();
-            let output_positive = builder.add_terminal().unwrap();
-            let output_negative = builder.add_terminal().unwrap();
+            let a = builder.add_terminal().unwrap();
+            let _b = builder.add_terminal().unwrap();
+            let c = builder.add_terminal().unwrap();
 
             builder
                 .add_element(Element::new(
-                    DefinitionId::from(PrimitiveElementKind::TickDelay),
-                    vec![
-                        input_positive,
-                        input_negative,
-                        output_positive,
-                        output_negative,
-                    ],
-                    vec![ValueRef::Literal(0.0)],
+                    DefinitionId::from(PrimitiveElementKind::Resistance),
+                    vec![a, c],
+                    vec![ValueRef::Literal(1.0)],
                 ))
                 .unwrap();
 
@@ -920,35 +941,12 @@ mod tests {
 
         let child_id = registry.register(child).unwrap();
 
-        let mut builder = DeviceDefinitionBuilder::new(&registry);
-
-        let input_positive = builder.add_terminal().unwrap();
-        let input_negative = builder.add_terminal().unwrap();
-        let output_positive = builder.add_terminal().unwrap();
-        let output_negative = builder.add_terminal().unwrap();
-
-        builder
-            .add_element(Element::new(
-                child_id,
-                vec![
-                    input_positive,
-                    input_negative,
-                    output_positive,
-                    output_negative,
-                ],
-                Vec::<ValueRef>::new(),
-            ))
-            .unwrap();
-
-        let parent = builder.build_definition().unwrap();
-
         assert_eq!(
-            parent.terminal_partitions(),
+            registry.get(child_id).unwrap().terminal_partitions(),
             &[
                 TerminalPartitionId::new(0),
+                TerminalPartitionId::new(1),
                 TerminalPartitionId::new(0),
-                TerminalPartitionId::new(1),
-                TerminalPartitionId::new(1),
             ]
         );
     }

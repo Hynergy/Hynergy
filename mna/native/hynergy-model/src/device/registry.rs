@@ -95,14 +95,16 @@ impl DefinitionRegistry {
 mod tests {
     use super::{DefinitionRegistry, PrimitiveElementKind, RegisterDeviceError};
     use crate::circuit::Circuit;
-    use crate::device::definition::{DefinitionId, DeviceBody, DeviceDefinition};
+    use crate::device::definition::{
+        DefinitionId, DeviceBody, DeviceDefinition, TerminalPartitionLayout,
+    };
 
     fn composite_definition() -> DeviceDefinition {
         DeviceDefinition::new_composite(
             Circuit::new(2, Vec::new()),
             vec![0.into(), 1.into()],
             Vec::new(),
-            vec![0.into(), 0.into()],
+            TerminalPartitionLayout::try_new(vec![0.into(), 0.into()]).unwrap(),
         )
     }
 

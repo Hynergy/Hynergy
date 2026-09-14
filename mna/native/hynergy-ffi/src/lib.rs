@@ -305,8 +305,6 @@ impl WorldCreationResult {
 /// The engine owns the new world. The caller must use the returned world ID
 /// for later world operations.
 ///
-/// This function is not implemented. The caller must not call it.
-///
 /// # Safety
 ///
 /// `engine` must point to a live [`Engine`] with exclusive access for this
@@ -359,8 +357,6 @@ pub unsafe extern "C" fn hynergy_engine_create_world(
 ///
 /// `world_id` must identify a live world that belongs to `engine`. The ID is
 /// invalid after this call succeeds.
-///
-/// This function is not implemented. The caller must not call it.
 ///
 /// # Safety
 ///
@@ -457,10 +453,9 @@ impl CommandResult {
 /// Applies a world command buffer in command order.
 ///
 /// The operation is not atomic. If a command fails, all earlier successful
-/// commands remain applied. The function stops at the first failure. It writes
-/// the failure location and the applied command count to `result`.
-///
-/// This function is not implemented. The caller must not call it.
+/// commands remain applied. The function stops at the first failure. On
+/// failure, `command_index` identifies the failing command and `byte_offset`
+/// identifies its location in the input buffer.
 ///
 /// # Safety
 ///
@@ -598,7 +593,7 @@ fn map_world_command_error(error: WorldCommandError) -> CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{align_of, size_of};
+    use std::mem::{align_of, offset_of, size_of};
 
     fn definition_buffer() -> Vec<u8> {
         definition_buffer_with_commands(&[])
@@ -829,18 +824,126 @@ mod tests {
     }
 
     #[test]
+    fn abi_code_values_are_stable() {
+        macro_rules! assert_codes {
+        ($enum:ident { $($variant:ident = $value:expr),* $(,)? }) => {
+            $(
+                assert_eq!(
+                    $enum::$variant as u32,
+                    $value,
+                    concat!(stringify!($enum), "::", stringify!($variant)),
+                );
+            )*
+        };
+    }
+
+        assert_codes!(DefinitionRegistrationCode {
+            Success = 0,
+            NullEngine = 1,
+            NullInput = 2,
+            NullResult = 3,
+            InputTooLarge = 4,
+
+            InvalidMagic = 5,
+            UnsupportedVersion = 6,
+            InvalidFlags = 7,
+            TruncatedInput = 8,
+            UnknownCommand = 9,
+            InvalidCommandLength = 10,
+            InvalidCount = 11,
+            UnknownValueKind = 12,
+            TrailingBytes = 13,
+            InvalidReserved = 14,
+            InvalidDefinitionId = 15,
+
+            UnknownDefinition = 20,
+            TerminalCountMismatch = 21,
+            ParameterCountMismatch = 22,
+            NodeOutOfRange = 23,
+            ParameterOutOfRange = 24,
+            ParameterConstraintViolation = 25,
+            NodeIdExhausted = 26,
+            ParameterIdExhausted = 27,
+            DefinitionIdExhausted = 28,
+            InvalidDefinition = 29,
+            InvalidPrimitiveParameters = 30,
+            UnusedInternalNode = 31,
+            DisconnectedInternalComponent = 32,
+            IncompatibleParameterConstraints = 33,
+            UnusedParameter = 34,
+            TerminalPartitionIdExhausted = 35,
+
+            InternalPanic = u32::MAX,
+        });
+
+        assert_codes!(WorldCode {
+            Success = 0,
+            NullEngine = 1,
+            NullResult = 2,
+            UnknownWorld = 3,
+            WorldIdExhausted = 4,
+            InternalPanic = u32::MAX,
+        });
+
+        assert_codes!(CommandCode {
+            Success = 0,
+
+            NullEngine = 1,
+            NullInput = 2,
+            NullResult = 3,
+            InputTooLarge = 4,
+
+            InvalidMagic = 5,
+            UnsupportedVersion = 6,
+            InvalidFlags = 7,
+            InvalidReserved = 8,
+            TruncatedInput = 9,
+            UnknownCommand = 10,
+            InvalidCommandLength = 11,
+            InvalidId = 12,
+            TrailingBytes = 13,
+            UnknownWorld = 14,
+
+            IdOutOfBound = 20,
+            IdExceeds31Bit = 21,
+            IdAlreadyAssigned = 22,
+            IdNotAssigned = 23,
+            WireConnectToSelf = 24,
+            AlreadyConnected = 25,
+            NotConnected = 26,
+            TerminalAlreadyConnected = 27,
+            InvalidTerminal = 28,
+            InvalidParameter = 29,
+            ParameterConstraintViolation = 30,
+            UnknownDefinition = 31,
+
+            InternalPanic = u32::MAX,
+        });
+    }
+
+    #[test]
     fn result_layouts_are_stable() {
         assert_eq!(size_of::<DefinitionRegistrationResult>(), 16);
         assert_eq!(
             align_of::<DefinitionRegistrationResult>(),
             align_of::<u32>()
         );
+        assert_eq!(offset_of!(DefinitionRegistrationResult, code), 0);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, command_index), 4);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, byte_offset), 8);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, definition_id), 12);
 
         assert_eq!(size_of::<WorldCreationResult>(), 8);
         assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>());
+        assert_eq!(offset_of!(WorldCreationResult, code), 0);
+        assert_eq!(offset_of!(WorldCreationResult, world_id), 4);
 
         assert_eq!(size_of::<CommandResult>(), 16);
         assert_eq!(align_of::<CommandResult>(), align_of::<u32>());
+        assert_eq!(offset_of!(CommandResult, code), 0);
+        assert_eq!(offset_of!(CommandResult, command_index), 4);
+        assert_eq!(offset_of!(CommandResult, byte_offset), 8);
+        assert_eq!(offset_of!(CommandResult, reserved), 12);
     }
 
     #[test]
