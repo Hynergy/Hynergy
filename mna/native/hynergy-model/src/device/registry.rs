@@ -107,49 +107,41 @@ mod tests {
     }
 
     #[test]
-    fn primitive_definition_ids_match_registry_order() {
+    fn primitive_definitions_are_registered_under_their_kind_ids() {
         let registry = DefinitionRegistry::new();
 
         for (index, kind) in PrimitiveElementKind::ALL.into_iter().enumerate() {
             let expected = (index + 1) as u32;
+            let id = DefinitionId::from(kind);
 
-            assert_eq!(kind as u32 + 1, expected);
-            assert_eq!(DefinitionId::from(kind).get(), expected);
+            assert_eq!(id.get(), expected);
 
             assert!(matches!(
-                registry
-                    .get(DefinitionId::from(kind))
-                    .map(DeviceDefinition::body),
-                Some(DeviceBody::Primitive(actual)) if *actual == kind
+                registry.get(id).map(DeviceDefinition::body),
+                Some(DeviceBody::Primitive(actual))
+                    if *actual == kind
             ));
         }
     }
 
     #[test]
-    fn composite_ids_begin_after_all_primitives() {
+    fn composite_ids_start_after_primitives_and_are_sequential() {
+        let mut registry = DefinitionRegistry::new();
+
         assert_eq!(
             DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE,
             PrimitiveElementKind::COUNT + 1,
         );
 
-        assert_eq!(DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE, 12,);
-    }
-
-    #[test]
-    fn registered_composites_receive_sequential_ids() {
-        let mut registry = DefinitionRegistry::new();
-
         let first = registry.register(composite_definition()).unwrap();
         let second = registry.register(composite_definition()).unwrap();
 
         assert_eq!(
-            first.id().get(),
+            first.get(),
             DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE
         );
-        assert_eq!(
-            second.id().get(),
-            DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE + 1
-        );
+        assert_eq!(second.get(), first.get() + 1);
+
         assert!(registry.get(first).is_some());
         assert!(registry.get(second).is_some());
     }
@@ -157,6 +149,7 @@ mod tests {
     #[test]
     fn rejected_registration_does_not_consume_an_id() {
         let mut registry = DefinitionRegistry::new();
+
         let primitive = registry
             .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap()
@@ -172,11 +165,12 @@ mod tests {
         let first = registry.register(composite_definition()).unwrap();
 
         assert_eq!(
-            first.id().get(),
+            first.get(),
             DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE
         );
+
         assert!(matches!(
-            registry.get(first).map(|definition| definition.body()),
+            registry.get(first).map(DeviceDefinition::body),
             Some(DeviceBody::Composite(_))
         ));
     }

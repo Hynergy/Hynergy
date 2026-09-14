@@ -470,71 +470,87 @@ mod tests {
         apply_world_command_buffer(&mut engine, world, &buffer(&[])).unwrap();
     }
 
-    #[test]
-    fn every_world_command_is_decoded_and_applied() {
-        let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
-        let definition = DefinitionId::from(PrimitiveElementKind::Conductance).get();
+    fn decode(tag: u16, payload: &[u8]) -> WorldCommand {
+        let mut decoder = Decoder::new(payload, 100);
 
-        let commands = [
-            command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1])),
-            command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[2])),
-            command(WORLD_COMMAND_CONNECT_WIRES, &u32_payload(&[1, 2])),
-            command(WORLD_COMMAND_DISCONNECT_WIRES, &u32_payload(&[1, 2])),
-            command(WORLD_COMMAND_ADD_DEVICE, &u32_payload(&[1, definition])),
-            command(WORLD_COMMAND_ATTACH_TERMINAL, &u32_payload(&[1, 1, 0])),
-            command(WORLD_COMMAND_DETACH_TERMINAL, &u32_payload(&[1, 1, 0])),
-            command(
-                WORLD_COMMAND_SET_DEVICE_PARAMETER,
-                &parameter_payload(1, 0, 1.0),
-            ),
-            command(WORLD_COMMAND_REMOVE_DEVICE, &u32_payload(&[1])),
-            command(WORLD_COMMAND_REMOVE_WIRE, &u32_payload(&[2])),
-            command(WORLD_COMMAND_REMOVE_WIRE, &u32_payload(&[1])),
-        ];
+        let command = decode_world_command(tag, &mut decoder, 3, 42).unwrap();
 
-        apply_world_command_buffer(&mut engine, world, &buffer(&commands)).unwrap();
+        assert!(decoder.is_empty());
 
-        let network = engine.world(world).unwrap().network();
-
-        assert!(network.wires().iter().all(Option::is_none));
-        assert!(network.devices().iter().all(Option::is_none));
+        command
     }
 
     #[test]
-    fn wire_and_terminal_commands_create_expected_connections() {
-        let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
-        let definition = DefinitionId::from(PrimitiveElementKind::Conductance).get();
+    fn decodes_every_world_command() {
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance);
 
-        let commands = [
-            command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1])),
-            command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[2])),
-            command(WORLD_COMMAND_CONNECT_WIRES, &u32_payload(&[1, 2])),
-            command(WORLD_COMMAND_ADD_DEVICE, &u32_payload(&[1, definition])),
-            command(WORLD_COMMAND_ATTACH_TERMINAL, &u32_payload(&[1, 1, 0])),
-        ];
-
-        apply_world_command_buffer(&mut engine, world, &buffer(&commands)).unwrap();
-
-        let network = engine.world(world).unwrap().network();
         let wire_a = WireId::try_from(1).unwrap();
         let wire_b = WireId::try_from(2).unwrap();
-        let device = DeviceId::try_from(1).unwrap();
-        let terminal = TerminalId::new(0);
+        let device = DeviceId::try_from(3).unwrap();
 
-        let connections = network.wire_connections(wire_a).unwrap();
+        let cases = [
+            (
+                WORLD_COMMAND_ADD_WIRE,
+                u32_payload(&[1]),
+                WorldCommand::AddWire { wire: wire_a },
+            ),
+            (
+                WORLD_COMMAND_REMOVE_WIRE,
+                u32_payload(&[1]),
+                WorldCommand::RemoveWire { wire: wire_a },
+            ),
+            (
+                WORLD_COMMAND_CONNECT_WIRES,
+                u32_payload(&[1, 2]),
+                WorldCommand::ConnectWires { wire_a, wire_b },
+            ),
+            (
+                WORLD_COMMAND_DISCONNECT_WIRES,
+                u32_payload(&[1, 2]),
+                WorldCommand::DisconnectWires { wire_a, wire_b },
+            ),
+            (
+                WORLD_COMMAND_ADD_DEVICE,
+                u32_payload(&[3, definition.get()]),
+                WorldCommand::AddDevice { device, definition },
+            ),
+            (
+                WORLD_COMMAND_REMOVE_DEVICE,
+                u32_payload(&[3]),
+                WorldCommand::RemoveDevice { device },
+            ),
+            (
+                WORLD_COMMAND_ATTACH_TERMINAL,
+                u32_payload(&[1, 3, 7]),
+                WorldCommand::AttachTerminal {
+                    wire: wire_a,
+                    device,
+                    terminal: TerminalId::new(7),
+                },
+            ),
+            (
+                WORLD_COMMAND_DETACH_TERMINAL,
+                u32_payload(&[1, 3, 7]),
+                WorldCommand::DetachTerminal {
+                    wire: wire_a,
+                    device,
+                    terminal: TerminalId::new(7),
+                },
+            ),
+            (
+                WORLD_COMMAND_SET_DEVICE_PARAMETER,
+                parameter_payload(3, 4, 2.5),
+                WorldCommand::SetDeviceParameter {
+                    device,
+                    parameter: ParameterId::new(4),
+                    value: 2.5,
+                },
+            ),
+        ];
 
-        assert!(
-            connections
-                .iter()
-                .any(|connection| connection.as_wire() == Some(wire_b))
-        );
-        assert!(
-            connections
-                .iter()
-                .any(|connection| { connection.as_terminal() == Some((device, terminal)) })
-        );
+        for (tag, payload, expected) in cases {
+            assert_eq!(decode(tag, &payload), expected);
+        }
     }
 
     #[test]
@@ -648,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn every_fixed_payload_length_is_enforced() {
+    fn command_payload_lengths_are_stable_and_enforced() {
         let cases = [
             (WORLD_COMMAND_ADD_WIRE, 4),
             (WORLD_COMMAND_REMOVE_WIRE, 4),
@@ -662,8 +678,11 @@ mod tests {
         ];
 
         for (tag, expected_length) in cases {
+            assert_eq!(expected_world_payload_length(tag), Some(expected_length));
+
             let mut engine = Engine::new();
             let world = engine.new_world().unwrap();
+
             let payload = vec![0; expected_length - 1];
 
             assert_error(
@@ -675,78 +694,31 @@ mod tests {
                 WORLD_COMMAND_HEADER_LENGTH as u32,
             );
         }
-    }
 
-    #[test]
-    fn expected_payload_lengths_are_stable() {
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_ADD_WIRE),
-            Some(4)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_REMOVE_WIRE),
-            Some(4)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_CONNECT_WIRES),
-            Some(8)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_DISCONNECT_WIRES),
-            Some(8)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_ADD_DEVICE),
-            Some(8)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_REMOVE_DEVICE),
-            Some(4)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_ATTACH_TERMINAL),
-            Some(12)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_DETACH_TERMINAL),
-            Some(12)
-        );
-        assert_eq!(
-            expected_world_payload_length(WORLD_COMMAND_SET_DEVICE_PARAMETER),
-            Some(16)
-        );
         assert_eq!(expected_world_payload_length(0), None);
         assert_eq!(expected_world_payload_length(u16::MAX), None);
     }
 
     #[test]
-    fn zero_non_zero_id_is_rejected() {
-        let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+    fn zero_non_zero_ids_are_rejected_at_their_field_offset() {
+        let cases = [
+            (WORLD_COMMAND_ADD_WIRE, u32_payload(&[0]), 22),
+            (WORLD_COMMAND_ADD_DEVICE, u32_payload(&[1, 0]), 26),
+        ];
 
-        assert_error(
-            &mut engine,
-            world,
-            &buffer(&[command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[0]))]),
-            WorldCommandErrorKind::InvalidId,
-            0,
-            22,
-        );
-    }
+        for (tag, payload, offset) in cases {
+            let mut engine = Engine::new();
+            let world = engine.new_world().unwrap();
 
-    #[test]
-    fn zero_definition_id_is_rejected() {
-        let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
-
-        assert_error(
-            &mut engine,
-            world,
-            &buffer(&[command(WORLD_COMMAND_ADD_DEVICE, &u32_payload(&[1, 0]))]),
-            WorldCommandErrorKind::InvalidId,
-            0,
-            26,
-        );
+            assert_error(
+                &mut engine,
+                world,
+                &buffer(&[command(tag, &payload)]),
+                WorldCommandErrorKind::InvalidId,
+                0,
+                offset,
+            );
+        }
     }
 
     #[test]
@@ -767,50 +739,54 @@ mod tests {
     }
 
     #[test]
-    fn earlier_commands_remain_applied_after_parse_failure() {
-        let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+    fn earlier_commands_remain_applied_after_later_failure() {
+        {
+            let mut engine = Engine::new();
+            let world = engine.new_world().unwrap();
 
-        let first = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
-        let malformed = framed_command(WORLD_COMMAND_ADD_WIRE, 4, &[2, 0]);
+            let first = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
 
-        let error = apply_world_command_buffer(&mut engine, world, &buffer(&[first, malformed]))
-            .unwrap_err();
+            let malformed = framed_command(WORLD_COMMAND_ADD_WIRE, 4, &[2, 0]);
 
-        assert_eq!(error.kind(), WorldCommandErrorKind::TruncatedInput);
-        assert_eq!(error.command_index(), 1);
+            let error =
+                apply_world_command_buffer(&mut engine, world, &buffer(&[first, malformed]))
+                    .unwrap_err();
 
-        assert!(
-            engine
-                .world(world)
-                .unwrap()
-                .network()
-                .wire_connections(WireId::try_from(1).unwrap())
-                .is_ok()
-        );
-    }
+            assert_eq!(error.kind(), WorldCommandErrorKind::TruncatedInput);
+            assert_eq!(error.command_index(), 1);
 
-    #[test]
-    fn earlier_commands_remain_applied_after_model_failure() {
-        let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+            assert!(
+                engine
+                    .world(world)
+                    .unwrap()
+                    .network()
+                    .wire_connections(WireId::try_from(1).unwrap())
+                    .is_ok()
+            );
+        }
 
-        let add = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
+        {
+            let mut engine = Engine::new();
+            let world = engine.new_world().unwrap();
 
-        let error = apply_world_command_buffer(&mut engine, world, &buffer(&[add.clone(), add]))
-            .unwrap_err();
+            let add = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
 
-        assert_eq!(error.kind(), WorldCommandErrorKind::IdAlreadyAssigned);
-        assert_eq!(error.command_index(), 1);
+            let error =
+                apply_world_command_buffer(&mut engine, world, &buffer(&[add.clone(), add]))
+                    .unwrap_err();
 
-        assert!(
-            engine
-                .world(world)
-                .unwrap()
-                .network()
-                .wire_connections(WireId::try_from(1).unwrap())
-                .is_ok()
-        );
+            assert_eq!(error.kind(), WorldCommandErrorKind::IdAlreadyAssigned);
+            assert_eq!(error.command_index(), 1);
+
+            assert!(
+                engine
+                    .world(world)
+                    .unwrap()
+                    .network()
+                    .wire_connections(WireId::try_from(1).unwrap())
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

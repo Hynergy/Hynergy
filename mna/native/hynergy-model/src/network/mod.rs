@@ -189,9 +189,10 @@ impl Network {
 
 #[cfg(test)]
 mod tests {
-    use super::{Network, NetworkModelError, connection::ConnectionRef};
+    use super::{Network, NetworkModelError};
     use crate::device::definition::{DefinitionId, DeviceId, PrimitiveElementKind, TerminalId};
     use crate::device::registry::DefinitionRegistry;
+    use crate::network::slot::{DeviceSlot, WireSlot};
     use crate::parameter::{ParameterConstraintError, ParameterId};
 
     fn device_id(raw: u32) -> DeviceId {
@@ -199,11 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_connection_rejects_ports_above_the_packed_mask() {
-        let device = device_id(1);
-        let terminal = TerminalId::new(ConnectionRef::TYPE_BIT);
-
-        assert!(ConnectionRef::terminal(device, terminal).is_none());
+    fn test() {
+        println!("{}", size_of::<Option<WireSlot>>());
+        println!("{}", size_of::<Option<DeviceSlot>>());
     }
 
     #[test]

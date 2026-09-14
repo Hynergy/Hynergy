@@ -175,235 +175,161 @@ fn within_bounds(value: f64, lower: Option<Bound>, upper: Option<Bound>) -> bool
 mod tests {
     use super::{Bound, ParameterConstraintError, ParameterConstraints};
 
+    fn bound(value: f64, inclusive: bool) -> Bound {
+        Bound { value, inclusive }
+    }
+
     #[test]
-    fn reciprocal_bounds_are_applied_to_reciprocal() {
-        let constraints = ParameterConstraints::new(
+    fn validate_enforces_finiteness_bounds_and_non_zero() {
+        let inclusive_range =
+            ParameterConstraints::new(Some(bound(1.0, true)), Some(bound(2.0, true)), false, None);
+
+        let exclusive_range = ParameterConstraints::new(
+            Some(bound(1.0, false)),
+            Some(bound(2.0, false)),
+            false,
+            None,
+        );
+
+        let non_zero = ParameterConstraints::new(None, None, true, None);
+
+        let cases = [
+            (
+                ParameterConstraints::default(),
+                f64::NAN,
+                Err(ParameterConstraintError::NonFinite),
+            ),
+            (
+                ParameterConstraints::default(),
+                f64::INFINITY,
+                Err(ParameterConstraintError::NonFinite),
+            ),
+            (inclusive_range, 1.0, Ok(())),
+            (inclusive_range, 2.0, Ok(())),
+            (
+                exclusive_range,
+                1.0,
+                Err(ParameterConstraintError::OutOfRange),
+            ),
+            (exclusive_range, 1.5, Ok(())),
+            (
+                exclusive_range,
+                2.0,
+                Err(ParameterConstraintError::OutOfRange),
+            ),
+            (non_zero, 0.0, Err(ParameterConstraintError::ZeroNotAllowed)),
+            (non_zero, -1.0, Ok(())),
+            (non_zero, 1.0, Ok(())),
+        ];
+
+        for (constraints, value, expected) in cases {
+            assert_eq!(constraints.validate(value), expected);
+        }
+    }
+
+    #[test]
+    fn validate_applies_reciprocal_constraints() {
+        let bounded = ParameterConstraints::new(
             None,
             None,
             false,
-            Some((
-                Some(Bound {
-                    value: 0.4,
-                    inclusive: true,
-                }),
-                Some(Bound {
-                    value: 0.6,
-                    inclusive: true,
-                }),
-            )),
+            Some((Some(bound(0.4, true)), Some(bound(0.6, true)))),
         );
 
-        assert_eq!(constraints.validate(2.0), Ok(()));
+        assert_eq!(bounded.validate(2.0), Ok(()));
         assert_eq!(
-            constraints.validate(0.5),
+            bounded.validate(0.5),
+            Err(ParameterConstraintError::ReciprocalOutOfRange)
+        );
+
+        let finite_reciprocal =
+            ParameterConstraints::new(None, None, true, Some((None, Some(bound(f64::MAX, true)))));
+
+        assert_eq!(
+            finite_reciprocal.validate(f64::from_bits(1)),
             Err(ParameterConstraintError::ReciprocalOutOfRange)
         );
     }
 
     #[test]
-    fn inclusive_bounds_accept_boundary_values() {
-        let constraints = ParameterConstraints::new(
-            Some(Bound {
-                value: 1.0,
-                inclusive: true,
-            }),
-            Some(Bound {
-                value: 2.0,
-                inclusive: true,
-            }),
-            false,
-            None,
-        );
+    fn constraint_subset_matches_supported_implications() {
+        let unrestricted = ParameterConstraints::default();
 
-        assert_eq!(constraints.validate(1.0), Ok(()));
-        assert_eq!(constraints.validate(2.0), Ok(()));
-    }
+        let positive = ParameterConstraints::new(Some(bound(0.0, false)), None, false, None);
 
-    #[test]
-    fn exclusive_bounds_reject_boundary_values() {
-        let constraints = ParameterConstraints::new(
-            Some(Bound {
-                value: 1.0,
-                inclusive: false,
-            }),
-            Some(Bound {
-                value: 2.0,
-                inclusive: false,
-            }),
-            false,
-            None,
-        );
+        let non_negative = ParameterConstraints::new(Some(bound(0.0, true)), None, false, None);
 
-        assert_eq!(
-            constraints.validate(1.0),
-            Err(ParameterConstraintError::OutOfRange)
-        );
-        assert_eq!(
-            constraints.validate(2.0),
-            Err(ParameterConstraintError::OutOfRange)
-        );
-        assert_eq!(constraints.validate(1.5), Ok(()));
-    }
+        let non_zero = ParameterConstraints::new(None, None, true, None);
 
-    #[test]
-    fn non_finite_input_is_rejected() {
-        let constraints = ParameterConstraints::default();
+        let reciprocal_non_zero = ParameterConstraints::new(None, None, false, Some((None, None)));
 
-        assert_eq!(
-            constraints.validate(f64::NAN),
-            Err(ParameterConstraintError::NonFinite)
-        );
-        assert_eq!(
-            constraints.validate(f64::INFINITY),
-            Err(ParameterConstraintError::NonFinite)
-        );
-    }
+        let reciprocal_required =
+            ParameterConstraints::new(None, None, false, Some((Some(bound(0.1, true)), None)));
 
-    #[test]
-    fn non_zero_constraint_rejects_zero() {
-        let constraints = ParameterConstraints::new(None, None, true, None);
+        let reciprocal_equal =
+            ParameterConstraints::new(None, None, false, Some((Some(bound(0.1, true)), None)));
 
-        assert_eq!(
-            constraints.validate(0.0),
-            Err(ParameterConstraintError::ZeroNotAllowed)
-        );
-    }
+        let reciprocal_stricter =
+            ParameterConstraints::new(None, None, false, Some((Some(bound(0.2, true)), None)));
 
-    #[test]
-    fn non_finite_reciprocal_is_rejected() {
-        let constraints = ParameterConstraints::new(
-            None,
-            None,
-            true,
-            Some((
-                None,
-                Some(Bound {
-                    value: f64::MAX,
-                    inclusive: true,
-                }),
-            )),
-        );
+        let cases = [
+            ("equal constraints", positive, positive, true),
+            (
+                "stricter lower bound",
+                ParameterConstraints::new(Some(bound(1.0, true)), None, false, None),
+                positive,
+                true,
+            ),
+            ("missing lower bound", unrestricted, positive, false),
+            (
+                "inclusive does not imply exclusive",
+                non_negative,
+                positive,
+                false,
+            ),
+            ("exclusive implies inclusive", positive, non_negative, true),
+            (
+                "stricter upper bound",
+                ParameterConstraints::new(None, Some(bound(9.0, true)), false, None),
+                ParameterConstraints::new(None, Some(bound(10.0, true)), false, None),
+                true,
+            ),
+            (
+                "missing upper bound",
+                unrestricted,
+                ParameterConstraints::new(None, Some(bound(10.0, true)), false, None),
+                false,
+            ),
+            ("explicit non-zero", non_zero, non_zero, true),
+            ("positive implies non-zero", positive, non_zero, true),
+            (
+                "reciprocal constraint implies non-zero",
+                reciprocal_non_zero,
+                non_zero,
+                true,
+            ),
+            (
+                "equal reciprocal range",
+                reciprocal_equal,
+                reciprocal_required,
+                true,
+            ),
+            (
+                "stricter reciprocal range",
+                reciprocal_stricter,
+                reciprocal_required,
+                true,
+            ),
+            (
+                "missing reciprocal constraint",
+                ParameterConstraints::new(Some(bound(1.0, true)), None, false, None),
+                reciprocal_required,
+                false,
+            ),
+        ];
 
-        assert_eq!(
-            constraints.validate(f64::from_bits(1)),
-            Err(ParameterConstraintError::ReciprocalOutOfRange)
-        );
-    }
-
-    #[test]
-    fn constraint_subset_accepts_equal_constraints() {
-        let constraints = ParameterConstraints::new(
-            Some(Bound {
-                value: 0.0,
-                inclusive: false,
-            }),
-            None,
-            false,
-            None,
-        );
-
-        assert!(constraints.is_subset_of(&constraints));
-    }
-
-    #[test]
-    fn constraint_subset_accepts_stricter_bounds() {
-        let provided = ParameterConstraints::new(
-            Some(Bound {
-                value: 1.0,
-                inclusive: true,
-            }),
-            Some(Bound {
-                value: 10.0,
-                inclusive: false,
-            }),
-            false,
-            None,
-        );
-
-        let required = ParameterConstraints::new(
-            Some(Bound {
-                value: 0.0,
-                inclusive: false,
-            }),
-            Some(Bound {
-                value: 10.0,
-                inclusive: true,
-            }),
-            false,
-            None,
-        );
-
-        assert!(provided.is_subset_of(&required));
-    }
-
-    #[test]
-    fn constraint_subset_rejects_weaker_lower_bound() {
-        let provided = ParameterConstraints::default();
-
-        let required = ParameterConstraints::new(
-            Some(Bound {
-                value: 0.0,
-                inclusive: false,
-            }),
-            None,
-            false,
-            None,
-        );
-
-        assert!(!provided.is_subset_of(&required));
-    }
-
-    #[test]
-    fn exclusive_zero_bound_implies_non_zero() {
-        let provided = ParameterConstraints::new(
-            Some(Bound {
-                value: 0.0,
-                inclusive: false,
-            }),
-            None,
-            false,
-            None,
-        );
-
-        let required = ParameterConstraints::new(None, None, true, None);
-
-        assert!(provided.is_subset_of(&required));
-    }
-
-    #[test]
-    fn reciprocal_constraint_implies_non_zero() {
-        let provided = ParameterConstraints::new(None, None, false, Some((None, None)));
-
-        let required = ParameterConstraints::new(None, None, true, None);
-
-        assert!(provided.is_subset_of(&required));
-    }
-
-    #[test]
-    fn constraint_subset_rejects_missing_required_reciprocal_bound() {
-        let provided = ParameterConstraints::new(
-            Some(Bound {
-                value: 1.0,
-                inclusive: true,
-            }),
-            None,
-            false,
-            None,
-        );
-
-        let required = ParameterConstraints::new(
-            None,
-            None,
-            false,
-            Some((
-                Some(Bound {
-                    value: 0.1,
-                    inclusive: true,
-                }),
-                None,
-            )),
-        );
-
-        assert!(!provided.is_subset_of(&required));
+        for (name, provided, required, expected) in cases {
+            assert_eq!(provided.is_subset_of(&required), expected, "{name}");
+        }
     }
 }

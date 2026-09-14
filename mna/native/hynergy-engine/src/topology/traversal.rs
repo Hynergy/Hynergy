@@ -386,3 +386,48 @@ pub(super) struct WireComponent {
     pub(super) wires: Vec<WireId>,
     pub(super) terminal_devices: Vec<DeviceId>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TraversalScratch;
+
+    #[test]
+    fn scratch_marks_are_reusable_between_traversals() {
+        let mut scratch = TraversalScratch::default();
+
+        scratch.begin_wire_traversal(4);
+
+        assert!(scratch.visit_wire(1));
+        assert!(scratch.visit_wire(3));
+
+        assert!(!scratch.visit_wire(1));
+        assert!(!scratch.visit_wire(3));
+
+        scratch.begin_wire_traversal(4);
+
+        assert!(scratch.visit_wire(1));
+        assert!(scratch.visit_wire(3));
+
+        // Growing the scratch storage must preserve the reset behavior.
+        scratch.begin_wire_traversal(8);
+
+        assert!(scratch.visit_wire(1));
+        assert!(scratch.visit_wire(7));
+
+        scratch.begin_island_traversal(4, 4);
+
+        assert!(scratch.visit_net(1));
+        assert!(scratch.visit_device(2));
+
+        assert!(!scratch.visit_net(1));
+        assert!(!scratch.visit_device(2));
+
+        scratch.begin_island_traversal(8, 8);
+
+        assert!(scratch.visit_net(1));
+        assert!(scratch.visit_device(2));
+
+        assert!(scratch.visit_net(7));
+        assert!(scratch.visit_device(7));
+    }
+}

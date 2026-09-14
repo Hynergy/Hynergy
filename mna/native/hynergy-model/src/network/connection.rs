@@ -107,4 +107,17 @@ mod tests {
         assert_eq!(connection.as_wire(), None);
         assert_eq!(connection.as_terminal(), Some((device, terminal)));
     }
+
+    #[test]
+    fn terminal_port_must_fit_packed_mask() {
+        let device = DeviceId::try_from(1).unwrap();
+
+        let largest_valid = TerminalId::new(ConnectionRef::TYPE_BIT - 1);
+
+        let first_invalid = TerminalId::new(ConnectionRef::TYPE_BIT);
+
+        assert!(ConnectionRef::terminal(device, largest_valid).is_some());
+
+        assert!(ConnectionRef::terminal(device, first_invalid).is_none());
+    }
 }

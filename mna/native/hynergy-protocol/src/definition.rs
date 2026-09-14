@@ -560,7 +560,8 @@ fn truncated_header(error: Truncated) -> DefinitionRegistrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hynergy_model::device::definition::DeviceBody;
+    use hynergy_model::device::definition::{DeviceBody, PrimitiveParameterError};
+    use hynergy_model::parameter::ParameterConstraintError;
 
     #[derive(Clone, Copy)]
     enum TestValue {
@@ -681,13 +682,6 @@ mod tests {
         bytes
     }
 
-    fn registered_definition(engine: &Engine) -> &DeviceDefinition {
-        engine
-            .definitions()
-            .get(DefinitionId::try_from(Engine::COMPOSITE_DEFINITION_ID_BASE).unwrap())
-            .unwrap()
-    }
-
     fn assert_error(
         bytes: &[u8],
         kind: DefinitionRegistrationErrorKind,
@@ -721,6 +715,30 @@ mod tests {
     fn complete_definition_registers_expected_contents() {
         let mut engine = Engine::new();
 
+        let lower = Bound {
+            value: 1.0,
+            inclusive: false,
+        };
+        let upper = Bound {
+            value: 10.0,
+            inclusive: true,
+        };
+        let reciprocal_lower = Bound {
+            value: 0.1,
+            inclusive: true,
+        };
+        let reciprocal_upper = Bound {
+            value: 1.0,
+            inclusive: false,
+        };
+
+        let expected_constraints = ParameterConstraints::new(
+            Some(lower),
+            Some(upper),
+            true,
+            Some((Some(reciprocal_lower), Some(reciprocal_upper))),
+        );
+
         let commands = [
             command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
             command(DEFINITION_COMMAND_ADD_NODE, &[]),
@@ -728,13 +746,10 @@ mod tests {
             command(
                 DEFINITION_COMMAND_ADD_PARAMETER,
                 &constraints_payload(
-                    Some(Bound {
-                        value: 0.0,
-                        inclusive: false,
-                    }),
-                    None,
-                    false,
-                    None,
+                    Some(lower),
+                    Some(upper),
+                    true,
+                    Some((Some(reciprocal_lower), Some(reciprocal_upper))),
                 ),
             ),
             command(
@@ -745,11 +760,55 @@ mod tests {
                 DEFINITION_COMMAND_ADD_ELEMENT,
                 &element_payload(1, &[1, 2], &[TestValue::Parameter(0)]),
             ),
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(1, &[0, 2], &[TestValue::Literal(2.0)]),
+            ),
         ];
 
-        register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
+        let definition_id =
+            register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
 
-        // ...
+        assert_eq!(definition_id.get(), Engine::COMPOSITE_DEFINITION_ID_BASE);
+
+        let definition = engine.definitions().get(definition_id).unwrap();
+
+        assert_eq!(definition.terminals().len(), 2);
+        assert_eq!(definition.terminals()[0].id(), 0);
+        assert_eq!(definition.terminals()[1].id(), 2);
+
+        assert_eq!(definition.parameters(), &[expected_constraints]);
+
+        let DeviceBody::Composite(circuit) = definition.body() else {
+            panic!("expected composite definition");
+        };
+
+        assert_eq!(circuit.node_count(), 3);
+        assert_eq!(circuit.elements().len(), 3);
+
+        let first = &circuit.elements()[0];
+        assert_eq!(first.definition().get(), 1);
+        assert_eq!(first.terminals()[0].id(), 0);
+        assert_eq!(first.terminals()[1].id(), 1);
+        assert_eq!(
+            first.parameters().as_slice(),
+            &[ValueRef::Parameter(ParameterId::new(0))]
+        );
+        let second = &circuit.elements()[1];
+        assert_eq!(second.definition().get(), 1);
+        assert_eq!(second.terminals()[0].id(), 1);
+        assert_eq!(second.terminals()[1].id(), 2);
+        assert_eq!(
+            second.parameters().as_slice(),
+            &[ValueRef::Parameter(ParameterId::new(0))]
+        );
+        let third = &circuit.elements()[2];
+
+        assert_eq!(third.definition().get(), 1);
+        assert_eq!(third.terminals()[0].id(), 0);
+        assert_eq!(third.terminals()[1].id(), 2);
+
+        assert_eq!(third.parameters().as_slice(), &[ValueRef::Literal(2.0)]);
     }
 
     #[test]
@@ -864,84 +923,62 @@ mod tests {
     }
 
     #[test]
-    fn parameter_command_rejects_trailing_payload_bytes() {
-        let mut payload = constraints_payload(None, None, false, None);
-        payload.push(0);
+    fn variable_length_commands_reject_trailing_payload_bytes() {
+        let mut parameter = constraints_payload(None, None, false, None);
+        parameter.push(0);
 
-        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_PARAMETER, &payload)]);
+        let mut element = element_payload(1, &[], &[]);
+        element.push(0);
 
-        assert_error(
-            &bytes,
-            DefinitionRegistrationErrorKind::InvalidCommandLength,
-            0,
-            DEFINITION_HEADER_LENGTH as u32,
-        );
+        for (tag, payload) in [
+            (DEFINITION_COMMAND_ADD_PARAMETER, parameter),
+            (DEFINITION_COMMAND_ADD_ELEMENT, element),
+        ] {
+            let bytes = definition_buffer(&[command(tag, &payload)]);
+
+            assert_error(
+                &bytes,
+                DefinitionRegistrationErrorKind::InvalidCommandLength,
+                0,
+                DEFINITION_HEADER_LENGTH as u32,
+            );
+        }
     }
 
     #[test]
-    fn element_command_rejects_trailing_payload_bytes() {
-        let mut payload = element_payload(1, &[], &[]);
-        payload.push(0);
-
-        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
-
-        assert_error(
-            &bytes,
-            DefinitionRegistrationErrorKind::InvalidCommandLength,
-            0,
-            DEFINITION_HEADER_LENGTH as u32,
-        );
-    }
-
-    #[test]
-    fn parameter_constraints_round_trip() {
-        let lower = Bound {
-            value: 1.0,
-            inclusive: false,
-        };
-        let upper = Bound {
-            value: 10.0,
-            inclusive: true,
-        };
-        let reciprocal_lower = Bound {
-            value: 0.1,
-            inclusive: true,
-        };
-        let reciprocal_upper = Bound {
-            value: 1.0,
-            inclusive: false,
-        };
-
-        let expected = ParameterConstraints::new(
-            Some(lower),
-            Some(upper),
-            true,
-            Some((Some(reciprocal_lower), Some(reciprocal_upper))),
-        );
-
-        let commands = [
-            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-            command(
-                DEFINITION_COMMAND_ADD_PARAMETER,
-                &constraints_payload(
-                    Some(lower),
-                    Some(upper),
-                    true,
-                    Some((Some(reciprocal_lower), Some(reciprocal_upper))),
-                ),
+    fn element_counts_cannot_exceed_remaining_payload() {
+        let cases = [
+            (
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&1_u32.to_le_bytes());
+                    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+                    payload
+                },
+                26,
             ),
-            command(
-                DEFINITION_COMMAND_ADD_ELEMENT,
-                &element_payload(1, &[0, 1], &[TestValue::Parameter(0)]),
+            (
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&1_u32.to_le_bytes());
+                    payload.extend_from_slice(&0_u32.to_le_bytes());
+                    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+                    payload
+                },
+                30,
             ),
         ];
 
-        let mut engine = Engine::new();
+        for (payload, offset) in cases {
+            let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
 
-        register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
-
-        assert_eq!(registered_definition(&engine).parameters(), &[expected]);
+            assert_error(
+                &bytes,
+                DefinitionRegistrationErrorKind::InvalidCount,
+                0,
+                offset,
+            );
+        }
     }
 
     #[test]
@@ -994,26 +1031,144 @@ mod tests {
     }
 
     #[test]
-    fn terminal_count_cannot_exceed_command_payload() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u32.to_le_bytes());
-        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    fn builder_errors_map_to_stable_protocol_kinds() {
+        let definition_id = DefinitionId::try_from(99).unwrap();
+        let node = NodeId::new(1);
+        let parameter = ParameterId::new(0);
 
-        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
+        let cases = [
+            (
+                DeviceDefinitionBuilderError::UnknownDefinition { definition_id },
+                DefinitionRegistrationErrorKind::UnknownDefinition,
+            ),
+            (
+                DeviceDefinitionBuilderError::TerminalCountMismatch {
+                    definition_id,
+                    expected: vec![],
+                    actual: vec![],
+                },
+                DefinitionRegistrationErrorKind::TerminalCountMismatch,
+            ),
+            (
+                DeviceDefinitionBuilderError::ParameterCountMismatch {
+                    definition_id,
+                    expected: 1,
+                    actual: 0,
+                },
+                DefinitionRegistrationErrorKind::ParameterCountMismatch,
+            ),
+            (
+                DeviceDefinitionBuilderError::NodeOutOfRange {
+                    terminal_index: 0,
+                    node,
+                    node_count: 1,
+                },
+                DefinitionRegistrationErrorKind::NodeOutOfRange,
+            ),
+            (
+                DeviceDefinitionBuilderError::ParameterOutOfRange {
+                    parameter_index: 0,
+                    parameter,
+                    parameter_count: 0,
+                },
+                DefinitionRegistrationErrorKind::ParameterOutOfRange,
+            ),
+            (
+                DeviceDefinitionBuilderError::ParameterConstraint {
+                    parameter_index: 0,
+                    source: ParameterConstraintError::OutOfRange,
+                },
+                DefinitionRegistrationErrorKind::ParameterConstraintViolation,
+            ),
+            (
+                DeviceDefinitionBuilderError::PrimitiveParameters {
+                    definition_id,
+                    source: PrimitiveParameterError::WrongParameterCount {
+                        expected: 1,
+                        actual: 0,
+                    },
+                },
+                DefinitionRegistrationErrorKind::InvalidPrimitiveParameters,
+            ),
+            (
+                DeviceDefinitionBuilderError::UnusedInternalNode { node },
+                DefinitionRegistrationErrorKind::UnusedInternalNode,
+            ),
+            (
+                DeviceDefinitionBuilderError::InternalComponentWithoutTerminal { node },
+                DefinitionRegistrationErrorKind::DisconnectedInternalComponent,
+            ),
+            (
+                DeviceDefinitionBuilderError::NodeIdExhausted,
+                DefinitionRegistrationErrorKind::NodeIdExhausted,
+            ),
+            (
+                DeviceDefinitionBuilderError::ParameterIdExhausted,
+                DefinitionRegistrationErrorKind::ParameterIdExhausted,
+            ),
+            (
+                DeviceDefinitionBuilderError::ElementIdExhausted,
+                DefinitionRegistrationErrorKind::InvalidDefinition,
+            ),
+            (
+                DeviceDefinitionBuilderError::ParameterConstraintsIncompatible {
+                    definition_id,
+                    parameter_index: 0,
+                    parameter,
+                },
+                DefinitionRegistrationErrorKind::IncompatibleParameterConstraints,
+            ),
+            (
+                DeviceDefinitionBuilderError::UnusedParameter { parameter },
+                DefinitionRegistrationErrorKind::UnusedParameter,
+            ),
+            (
+                DeviceDefinitionBuilderError::TerminalPartitionIdExhausted,
+                DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted,
+            ),
+        ];
 
-        assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidCount, 0, 26);
+        for (source, expected_kind) in cases {
+            let error = map_builder_error(source, 7, 123);
+
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.command_index(), 7);
+            assert_eq!(error.byte_offset(), 123);
+        }
     }
 
     #[test]
-    fn parameter_count_cannot_exceed_command_payload() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    fn build_error_reports_end_of_buffer() {
+        let commands = [command(
+            DEFINITION_COMMAND_ADD_PARAMETER,
+            &constraints_payload(None, None, false, None),
+        )];
 
-        let bytes = definition_buffer(&[command(DEFINITION_COMMAND_ADD_ELEMENT, &payload)]);
+        let bytes = definition_buffer(&commands);
 
-        assert_error(&bytes, DefinitionRegistrationErrorKind::InvalidCount, 0, 30);
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::UnusedParameter,
+            commands.len() as u32,
+            bytes.len() as u32,
+        );
+    }
+
+    #[test]
+    fn builder_command_error_reports_failing_command_start() {
+        let commands = [command(
+            DEFINITION_COMMAND_ADD_ELEMENT,
+            &element_payload(99, &[], &[]),
+        )];
+
+        let bytes = definition_buffer(&commands);
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::UnknownDefinition,
+            0,
+            DEFINITION_HEADER_LENGTH as u32,
+        );
     }
 
     #[test]
@@ -1033,90 +1188,6 @@ mod tests {
             0,
             34,
         );
-    }
-
-    #[test]
-    fn builder_errors_report_stable_command_locations() {
-        let cases = [
-            (
-                vec![command(
-                    DEFINITION_COMMAND_ADD_ELEMENT,
-                    &element_payload(99, &[], &[]),
-                )],
-                DefinitionRegistrationErrorKind::UnknownDefinition,
-            ),
-            (
-                vec![
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(
-                        DEFINITION_COMMAND_ADD_ELEMENT,
-                        &element_payload(1, &[0], &[TestValue::Literal(1.0)]),
-                    ),
-                ],
-                DefinitionRegistrationErrorKind::TerminalCountMismatch,
-            ),
-            (
-                vec![
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(
-                        DEFINITION_COMMAND_ADD_ELEMENT,
-                        &element_payload(1, &[0, 1], &[]),
-                    ),
-                ],
-                DefinitionRegistrationErrorKind::ParameterCountMismatch,
-            ),
-            (
-                vec![
-                    command(DEFINITION_COMMAND_ADD_NODE, &[]),
-                    command(
-                        DEFINITION_COMMAND_ADD_ELEMENT,
-                        &element_payload(1, &[0, 1], &[TestValue::Literal(1.0)]),
-                    ),
-                ],
-                DefinitionRegistrationErrorKind::NodeOutOfRange,
-            ),
-            (
-                vec![
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(
-                        DEFINITION_COMMAND_ADD_ELEMENT,
-                        &element_payload(1, &[0, 1], &[TestValue::Parameter(0)]),
-                    ),
-                ],
-                DefinitionRegistrationErrorKind::ParameterOutOfRange,
-            ),
-            (
-                vec![
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-                    command(
-                        DEFINITION_COMMAND_ADD_ELEMENT,
-                        &element_payload(1, &[0, 1], &[TestValue::Literal(f64::NAN)]),
-                    ),
-                ],
-                DefinitionRegistrationErrorKind::ParameterConstraintViolation,
-            ),
-        ];
-
-        for (commands, expected_kind) in cases {
-            let command_index = (commands.len() - 1) as u32;
-            let byte_offset = DEFINITION_HEADER_LENGTH
-                + commands[..commands.len() - 1]
-                    .iter()
-                    .map(Vec::len)
-                    .sum::<usize>();
-
-            let error =
-                register_definition_buffer(&mut Engine::new(), &definition_buffer(&commands))
-                    .unwrap_err();
-
-            assert_eq!(error.kind(), expected_kind);
-            assert_eq!(error.command_index(), command_index);
-            assert_eq!(error.byte_offset(), byte_offset as u32);
-        }
     }
 
     #[test]
@@ -1166,64 +1237,6 @@ mod tests {
             DefinitionRegistrationErrorKind::TrailingBytes,
             0,
             DEFINITION_HEADER_LENGTH as u32,
-        );
-    }
-
-    #[test]
-    fn registration_returns_engine_assigned_definition_ids() {
-        let mut engine = Engine::new();
-
-        let first = register_definition_buffer(&mut engine, &definition_buffer(&[])).unwrap();
-
-        let second = register_definition_buffer(&mut engine, &definition_buffer(&[])).unwrap();
-
-        assert_eq!(first.get(), Engine::COMPOSITE_DEFINITION_ID_BASE);
-
-        assert_eq!(second.get(), Engine::COMPOSITE_DEFINITION_ID_BASE + 1);
-
-        assert!(engine.definitions().get(first).is_some());
-        assert!(engine.definitions().get(second).is_some());
-    }
-
-    #[test]
-    fn incompatible_parent_parameter_constraints_are_rejected() {
-        let commands = [
-            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
-            command(
-                DEFINITION_COMMAND_ADD_PARAMETER,
-                &constraints_payload(None, None, false, None),
-            ),
-            command(
-                DEFINITION_COMMAND_ADD_ELEMENT,
-                &element_payload(1, &[0, 1], &[TestValue::Parameter(0)]),
-            ),
-        ];
-
-        let bytes = definition_buffer(&commands);
-
-        assert_error(
-            &bytes,
-            DefinitionRegistrationErrorKind::IncompatibleParameterConstraints,
-            3,
-            36,
-        );
-    }
-
-    #[test]
-    fn unused_definition_parameter_is_rejected_at_build_end() {
-        let commands = [command(
-            DEFINITION_COMMAND_ADD_PARAMETER,
-            &constraints_payload(None, None, false, None),
-        )];
-
-        let bytes = definition_buffer(&commands);
-
-        assert_error(
-            &bytes,
-            DefinitionRegistrationErrorKind::UnusedParameter,
-            1,
-            bytes.len() as u32,
         );
     }
 }

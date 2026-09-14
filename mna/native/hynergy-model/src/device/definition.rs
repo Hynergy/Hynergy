@@ -57,7 +57,7 @@ impl PrimitiveElementKind {
 
     pub const COUNT: u32 = Self::ALL.len() as u32;
 
-    pub const fn parameter_count(self) -> usize {
+    pub const fn parameter_count(&self) -> usize {
         match self {
             Self::Resistance => 1,
             Self::Conductance => 1,
@@ -73,7 +73,7 @@ impl PrimitiveElementKind {
         }
     }
 
-    fn parameter_constraint(self, index: usize) -> Option<ParameterConstraints> {
+    fn parameter_constraint(&self, index: usize) -> Option<ParameterConstraints> {
         let unrestricted = ParameterConstraints::default();
 
         let positive = ParameterConstraints::new(
@@ -152,7 +152,7 @@ impl PrimitiveElementKind {
         }
     }
 
-    fn terminal_layout(self) -> (SmallVec<[NodeId; 4]>, SmallVec<[TerminalPartitionId; 4]>) {
+    fn terminal_layout(&self) -> (SmallVec<[NodeId; 4]>, SmallVec<[TerminalPartitionId; 4]>) {
         match self {
             Self::Resistance
             | Self::Conductance
@@ -193,7 +193,7 @@ impl PrimitiveElementKind {
         DeviceDefinition::new_primitive(self, terminals, param_constraints, terminal_partitions)
     }
 
-    pub fn validate_parameters(self, parameters: &[f64]) -> Result<(), PrimitiveParameterError> {
+    pub fn validate_parameters(&self, parameters: &[f64]) -> Result<(), PrimitiveParameterError> {
         let expected = self.parameter_count();
 
         if parameters.len() != expected {
@@ -214,7 +214,7 @@ impl PrimitiveElementKind {
     }
 
     pub(crate) fn validate_parameter_relations(
-        self,
+        &self,
         parameters: &[f64],
     ) -> Result<(), PrimitiveParameterError> {
         let expected = self.parameter_count();
@@ -230,7 +230,7 @@ impl PrimitiveElementKind {
     }
 
     fn validate_parameter_relations_unchecked(
-        self,
+        &self,
         parameters: &[f64],
     ) -> Result<(), PrimitiveParameterError> {
         debug_assert_eq!(parameters.len(), self.parameter_count());
@@ -331,54 +331,121 @@ impl DeviceDefinition {
 mod tests {
     use super::*;
 
-    #[test]
-    fn voltage_controlled_switch_requires_gmax_above_gmin() {
-        let kind = PrimitiveElementKind::VoltageControlledSwitch;
-
-        assert_eq!(
-            kind.validate_parameters(&[
-                5.0,  // threshold
-                1.0,  // hysteresis
-                10.0, // G_max
-                0.01, // G_min
-            ]),
-            Ok(())
-        );
-
-        assert_eq!(
-            kind.validate_parameters(&[5.0, 1.0, 0.01, 0.01,]),
-            Err(PrimitiveParameterError::ParameterMustBeGreater {
-                greater: 2,
-                lesser: 3,
-            })
-        );
+    fn invalid(
+        index: usize,
+        source: ParameterConstraintError,
+    ) -> Result<(), PrimitiveParameterError> {
+        Err(PrimitiveParameterError::InvalidParameter { index, source })
     }
 
     #[test]
-    fn voltage_controlled_conductance_requires_gmax_above_gmin() {
-        let kind = PrimitiveElementKind::VoltageControlledConductance;
+    fn primitive_scalar_parameter_boundaries_match_contract() {
+        let cases: &[(
+            PrimitiveElementKind,
+            &[f64],
+            Result<(), PrimitiveParameterError>,
+        )] = &[
+            (PrimitiveElementKind::Resistance, &[1.0], Ok(())),
+            (
+                PrimitiveElementKind::Resistance,
+                &[0.0],
+                invalid(0, ParameterConstraintError::OutOfRange),
+            ),
+            (PrimitiveElementKind::Conductance, &[0.0], Ok(())),
+            (
+                PrimitiveElementKind::Conductance,
+                &[-1.0],
+                invalid(0, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::Capacitor,
+                &[0.0],
+                invalid(0, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::Inductor,
+                &[0.0],
+                invalid(0, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, 0.0, 1.0, 0.0],
+                Ok(()),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, -1.0, 1.0, 0.0],
+                invalid(1, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, 0.0, 0.0, 0.0],
+                invalid(2, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, 0.0, 1.0, -1.0],
+                invalid(3, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledConductance,
+                &[0.0, 1.0, 0.0, 1.0],
+                Ok(()),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledConductance,
+                &[0.0, 0.0, 0.0, 1.0],
+                invalid(1, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledConductance,
+                &[0.0, 1.0, -1.0, 1.0],
+                invalid(2, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledConductance,
+                &[0.0, 1.0, 0.0, 0.0],
+                invalid(3, ParameterConstraintError::OutOfRange),
+            ),
+        ];
 
-        assert_eq!(
-            kind.validate_parameters(&[
-                5.0,  // V_threshold
-                2.0,  // V_transition
-                0.01, // G_min
-                10.0, // G_max
-            ]),
-            Ok(())
-        );
-
-        assert_eq!(
-            kind.validate_parameters(&[5.0, 2.0, 10.0, 1.0,]),
-            Err(PrimitiveParameterError::ParameterMustBeGreater {
-                greater: 3,
-                lesser: 2,
-            })
-        );
+        for &(kind, parameters, ref expected) in cases {
+            assert_eq!(kind.validate_parameters(parameters), *expected, "{kind:?}");
+        }
     }
 
     #[test]
-    fn primitive_count_matches_last_discriminant() {
+    fn nonlinear_conductances_require_gmax_above_gmin() {
+        let cases = [
+            (
+                PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, 0.0, 1.0, 1.0][..],
+                2,
+                3,
+            ),
+            (
+                PrimitiveElementKind::VoltageControlledConductance,
+                &[0.0, 1.0, 1.0, 1.0][..],
+                3,
+                2,
+            ),
+        ];
+
+        for (kind, parameters, greater, lesser) in cases {
+            assert_eq!(
+                kind.validate_parameters(parameters),
+                Err(PrimitiveParameterError::ParameterMustBeGreater { greater, lesser }),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_discriminants_are_dense() {
+        for (index, kind) in PrimitiveElementKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind as usize, index);
+        }
+
         assert_eq!(
             PrimitiveElementKind::COUNT,
             PrimitiveElementKind::TickDelay as u32 + 1,

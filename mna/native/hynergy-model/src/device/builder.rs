@@ -486,9 +486,243 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::{DeviceDefinitionBuilder, DeviceDefinitionBuilderError};
-    use crate::circuit::{Element, ValueRef};
+    use crate::circuit::{Element, NodeId, ValueRef};
     use crate::device::definition::{DefinitionId, PrimitiveElementKind, TerminalPartitionId};
     use crate::device::registry::DefinitionRegistry;
+
+    use crate::parameter::{Bound, ParameterConstraintError, ParameterConstraints, ParameterId};
+
+    fn terminals<const N: usize>(builder: &mut DeviceDefinitionBuilder<'_>) -> [NodeId; N] {
+        std::array::from_fn(|_| builder.add_terminal().unwrap())
+    }
+
+    fn positive() -> ParameterConstraints {
+        ParameterConstraints::new(
+            Some(Bound {
+                value: 0.0,
+                inclusive: false,
+            }),
+            None,
+            false,
+            None,
+        )
+    }
+
+    fn non_negative() -> ParameterConstraints {
+        ParameterConstraints::new(
+            Some(Bound {
+                value: 0.0,
+                inclusive: true,
+            }),
+            None,
+            false,
+            None,
+        )
+    }
+
+    #[test]
+    fn add_element_rejects_invalid_shape_references_and_values() {
+        let registry = DefinitionRegistry::new();
+        let resistance = DefinitionId::from(PrimitiveElementKind::Resistance);
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let unknown = DefinitionId::try_from(999).unwrap();
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    unknown,
+                    Vec::<NodeId>::new(),
+                    Vec::<ValueRef>::new(),
+                )),
+                Err(DeviceDefinitionBuilderError::UnknownDefinition {
+                    definition_id
+                }) if definition_id == unknown
+            ));
+        }
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, _b] = terminals(&mut builder);
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    resistance,
+                    vec![a],
+                    vec![ValueRef::Literal(1.0)],
+                )),
+                Err(
+                    DeviceDefinitionBuilderError::TerminalCountMismatch {
+                        definition_id,
+                        ..
+                    }
+                ) if definition_id == resistance
+            ));
+        }
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    resistance,
+                    vec![a, b],
+                    Vec::<ValueRef>::new(),
+                )),
+                Err(
+                    DeviceDefinitionBuilderError::ParameterCountMismatch {
+                        definition_id,
+                        ..
+                    }
+                ) if definition_id == resistance
+            ));
+        }
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a] = terminals(&mut builder);
+            let missing = NodeId::new(1);
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    resistance,
+                    vec![a, missing],
+                    vec![ValueRef::Literal(1.0)],
+                )),
+                Err(DeviceDefinitionBuilderError::NodeOutOfRange {
+                    terminal_index: 1,
+                    node,
+                    ..
+                }) if node == missing
+            ));
+        }
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+            let missing = ParameterId::new(0);
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    resistance,
+                    vec![a, b],
+                    vec![ValueRef::Parameter(missing)],
+                )),
+                Err(
+                    DeviceDefinitionBuilderError::ParameterOutOfRange {
+                        parameter_index: 0,
+                        parameter,
+                        ..
+                    }
+                ) if parameter == missing
+            ));
+        }
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    resistance,
+                    vec![a, b],
+                    vec![ValueRef::Literal(0.0)],
+                )),
+                Err(DeviceDefinitionBuilderError::ParameterConstraint {
+                    parameter_index: 0,
+                    source: ParameterConstraintError::OutOfRange,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn parent_parameter_must_satisfy_every_child_use() {
+        let registry = DefinitionRegistry::new();
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            let parameter = builder.add_parameter(positive()).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::Resistance),
+                    vec![a, b],
+                    vec![ValueRef::Parameter(parameter)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap();
+        }
+
+        {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+            let [a, b] = terminals(&mut builder);
+
+            let parameter = builder.add_parameter(non_negative()).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::Conductance),
+                    vec![a, b],
+                    vec![ValueRef::Parameter(parameter)],
+                ))
+                .unwrap();
+
+            assert!(matches!(
+                builder.add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::Resistance),
+                    vec![a, b],
+                    vec![ValueRef::Parameter(parameter)],
+                )),
+                Err(
+                    DeviceDefinitionBuilderError::ParameterConstraintsIncompatible {
+                        definition_id,
+                        parameter_index: 0,
+                        parameter: actual,
+                    }
+                )
+                    if definition_id
+                        == DefinitionId::from(
+                            PrimitiveElementKind::Resistance
+                        )
+                        && actual == parameter
+            ));
+        }
+    }
+    #[test]
+    fn build_rejects_unused_parameter() {
+        let registry = DefinitionRegistry::new();
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        let parameter = builder
+            .add_parameter(ParameterConstraints::default())
+            .unwrap();
+
+        assert_eq!(
+            builder.build_definition(),
+            Err(DeviceDefinitionBuilderError::UnusedParameter { parameter })
+        );
+    }
+
+    #[test]
+    fn build_rejects_terminal_partition_id_overflow() {
+        let registry = DefinitionRegistry::new();
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        for _ in 0..(u16::MAX as usize + 2) {
+            builder.add_terminal().unwrap();
+        }
+
+        assert_eq!(
+            builder.build_definition(),
+            Err(DeviceDefinitionBuilderError::TerminalPartitionIdExhausted)
+        );
+    }
 
     #[test]
     fn derives_single_partition_through_series_elements() {
@@ -625,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_literal_primitive_parameter_relations() {
+    fn add_element_validates_literal_primitive_relations() {
         let registry = DefinitionRegistry::new();
         let mut builder = DeviceDefinitionBuilder::new(&registry);
 
