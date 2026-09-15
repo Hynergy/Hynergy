@@ -1,0 +1,11 @@
+[package]
+name = "hynergy-mna"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+faer = {
+    version = "0.24.4",
+    default-features = false,
+    features = ["std", "linalg", "sparse", "sparse-linalg"]
+}

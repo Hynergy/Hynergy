@@ -5,7 +5,7 @@ members = [
     "hynergy-engine",
     "hynergy-model",
     "hynergy-protocol",
-    "hynergy-ids",
+    "hynergy-ids", "hynergy-mna", "hynergy-ir",
 ]
 
 [workspace.package]
