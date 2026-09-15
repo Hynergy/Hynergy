@@ -6,7 +6,7 @@ mod validate;
 use hynergy_ids::define_non_zero_id;
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::{Network, WireId};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use store::{DenseId, DenseIdStore};
 use traversal::{island_components, wire_components};
 
@@ -172,7 +172,7 @@ impl DerivedTopology {
         debug_assert!(self.device_island_map[device.index()].is_none());
 
         let island_id = self.islands.insert(IslandTopology {
-            devices: vec![device],
+            devices: smallvec![device],
             revision: 0,
         });
 
@@ -791,7 +791,7 @@ impl DerivedTopology {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IslandTopology {
-    devices: Vec<DeviceId>,
+    devices: SmallVec<[DeviceId; 4]>,
     revision: u64,
 }
 

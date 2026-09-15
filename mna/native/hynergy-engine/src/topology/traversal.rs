@@ -1,12 +1,13 @@
 use super::{DerivedTopology, IslandId, NetId};
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::{Network, WireId};
+use smallvec::SmallVec;
 use std::num::NonZeroU32;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct IslandComponent {
-    pub(super) nets: Vec<NetId>,
-    pub(super) devices: Vec<DeviceId>,
+    pub(super) nets: SmallVec<[NetId; 4]>,
+    pub(super) devices: SmallVec<[DeviceId; 4]>,
 }
 
 impl IslandComponent {
