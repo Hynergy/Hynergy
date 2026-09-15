@@ -75,7 +75,7 @@ fn compile_primitive(
 
             let voltage = builder.parameter()?;
 
-            stamp_voltage_source(&mut builder, positive, negaitve, branch_current, voltage);
+            stamp_voltage_source(&mut builder, positive, negaitve, branch_current, voltage)?;
         }
 
         _ => {
