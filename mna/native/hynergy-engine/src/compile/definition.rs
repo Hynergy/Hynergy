@@ -69,13 +69,13 @@ fn compile_primitive(
 
         PrimitiveElementKind::VoltageSource => {
             let positive = builder.terminal_voltage()?;
-            let negaitve = builder.terminal_voltage()?;
+            let negative = builder.terminal_voltage()?;
 
             let branch_current = builder.branch_current_unknown()?;
 
             let voltage = builder.parameter()?;
 
-            stamp_voltage_source(&mut builder, positive, negaitve, branch_current, voltage)?;
+            stamp_voltage_source(&mut builder, positive, negative, branch_current, voltage)?;
         }
 
         _ => {
