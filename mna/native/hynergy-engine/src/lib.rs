@@ -196,6 +196,8 @@ impl Engine {
             }
         }
 
+        world.debug_validate_topology(definitions);
+
         Ok(())
     }
 }
