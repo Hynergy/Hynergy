@@ -29,12 +29,12 @@ impl DerivedTopology {
             "device component spans must mirror Network device slots"
         );
 
-        self.assert_membership_maps(network);
+        self.assert_membership_maps(definitions, network);
         self.assert_net_partition_matches_network(network);
         self.assert_island_partition_matches_network(definitions, network);
     }
 
-    fn assert_membership_maps(&self, network: &Network) {
+    fn assert_membership_maps(&self, definitions: &DefinitionRegistry, network: &Network) {
         let mut seen_wires = vec![false; network.wires().len()];
 
         for (net_id, net) in self.nets.iter() {
@@ -52,7 +52,7 @@ impl DerivedTopology {
                 );
             }
 
-            let mut expected_terminal_devices = Vec::new();
+            let mut expected_terminal_components = Vec::new();
 
             for &wire in &net.wires {
                 assert!(
@@ -78,29 +78,34 @@ impl DerivedTopology {
                     .wire_connections(wire)
                     .expect("wire in live net must exist")
                 {
-                    if let Some((device, _)) = connection.as_terminal() {
-                        expected_terminal_devices.push(device);
+                    if let Some((device, terminal)) = connection.as_terminal() {
+                        expected_terminal_components.push(terminal_component(
+                            definitions,
+                            network,
+                            device,
+                            terminal,
+                        ));
                     }
                 }
 
                 seen_wires[wire.index()] = true;
             }
 
-            let mut actual_terminal_devices = net.terminal_devices.clone();
+            let mut actual_terminal_components = net.terminal_components.clone();
 
-            expected_terminal_devices.sort_unstable_by_key(|device| device.index());
-            actual_terminal_devices.sort_unstable_by_key(|device| device.index());
+            expected_terminal_components.sort_unstable();
+            actual_terminal_components.sort_unstable();
 
             assert_eq!(
-                actual_terminal_devices.as_slice(),
-                expected_terminal_devices.as_slice(),
-                "Net terminal incidence disagrees with Network wire connections"
+                actual_terminal_components.as_slice(),
+                expected_terminal_components.as_slice(),
+                "Net terminal incidence disagrees with Network wire connections",
             );
 
-            if !net.terminal_devices.is_empty() {
+            if !net.terminal_components.is_empty() {
                 assert!(
                     island_id.is_some(),
-                    "a net with attached terminals must belong to an island"
+                    "a net with attached terminals must belong to an island",
                 );
             }
         }

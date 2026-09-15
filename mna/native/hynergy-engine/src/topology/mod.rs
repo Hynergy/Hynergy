@@ -243,7 +243,7 @@ impl DerivedTopology {
 
         let net_id = self.nets.insert(Net {
             wires: smallvec![wire],
-            terminal_devices: SmallVec::new(),
+            terminal_components: SmallVec::new(),
         });
 
         debug_assert_eq!(net_id.index(), self.net_island_map.len());
@@ -366,7 +366,9 @@ impl DerivedTopology {
             .expect("destination net must survive source removal");
 
         dst_net.wires.extend(src_net.wires);
-        dst_net.terminal_devices.extend(src_net.terminal_devices);
+        dst_net
+            .terminal_components
+            .extend(src_net.terminal_components);
 
         if bump_final_island {
             let island = final_island.expect("same-island net merge must have an island");
@@ -397,8 +399,8 @@ impl DerivedTopology {
         self.nets
             .get_mut(net_id)
             .expect("attached wire must reference a live net")
-            .terminal_devices
-            .push(device);
+            .terminal_components
+            .push(component);
 
         match self.net_island(net_id) {
             None => {
@@ -455,12 +457,12 @@ impl DerivedTopology {
                 .expect("detached wire must reference a live net");
 
             let position = net
-                .terminal_devices
+                .terminal_components
                 .iter()
-                .position(|&member| member == device)
-                .expect("net must contain an incidence for the detached terminal");
+                .position(|&member| member == device_component)
+                .expect("net must contain an incidence for the detached component");
 
-            net.terminal_devices.swap_remove(position);
+            net.terminal_components.swap_remove(position);
         }
 
         self.repair_island(
@@ -491,7 +493,7 @@ impl DerivedTopology {
         }
 
         let island_id = self.net_island(net_a);
-        let affected_nets = self.repair_net(network, scratch, net_a);
+        let affected_nets = self.repair_net(definitions, network, scratch, net_a);
 
         if affected_nets.len() > 1
             && let Some(island_id) = island_id
@@ -514,7 +516,7 @@ impl DerivedTopology {
             .and_then(Option::take)
             .expect("removed model wire must still have a derived net before repair");
         let island_id = self.net_island(net_id);
-        let affected_nets = self.repair_net(network, scratch, net_id);
+        let affected_nets = self.repair_net(definitions, network, scratch, net_id);
 
         if let Some(island_id) = island_id
             && self.islands.get(island_id).is_some()
@@ -538,12 +540,12 @@ impl DerivedTopology {
                 .expect("removed device's attached net must remain live");
 
             let position = net
-                .terminal_devices
+                .terminal_components
                 .iter()
-                .position(|&member| member == device)
-                .expect("attached net must contain removed device incidence");
+                .position(|member| member.device() == device)
+                .expect("attached net must contain removed device component incidence");
 
-            net.terminal_devices.swap_remove(position);
+            net.terminal_components.swap_remove(position);
         }
 
         let span = self
@@ -613,13 +615,14 @@ impl DerivedTopology {
 
     fn repair_net(
         &mut self,
+        definitions: &DefinitionRegistry,
         network: &Network,
         scratch: &mut TraversalScratch,
         net_id: NetId,
-    ) -> SmallVec<[NetId; 2]> {
+    ) -> SmallVec<[NetId; 4]> {
         let old_island = self.net_island(net_id);
 
-        let mut components = wire_components(self, network, net_id, scratch);
+        let mut components = wire_components(self, definitions, network, net_id, scratch);
 
         if components.is_empty() {
             self.nets
@@ -651,7 +654,7 @@ impl DerivedTopology {
                 .expect("old NetId must survive a non-empty repartition");
 
             net.wires = kept.wires;
-            net.terminal_devices = kept.terminal_devices;
+            net.terminal_components = kept.terminal_components;
         }
 
         let mut resulting_nets = SmallVec::with_capacity(components.len() + 1);
@@ -660,7 +663,7 @@ impl DerivedTopology {
         for component in components {
             let new_id = self.nets.insert(Net {
                 wires: component.wires,
-                terminal_devices: component.terminal_devices,
+                terminal_components: component.terminal_components,
             });
 
             debug_assert_eq!(new_id.index(), self.net_island_map.len());
@@ -1028,7 +1031,7 @@ impl IslandTopology {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Net {
     wires: SmallVec<[WireId; 4]>,
-    terminal_devices: SmallVec<[DeviceId; 2]>,
+    terminal_components: SmallVec<[DeviceComponent; 2]>,
 }
 
 impl Net {
@@ -1036,6 +1039,12 @@ impl Net {
     #[inline]
     pub(crate) fn wires(&self) -> &[WireId] {
         &self.wires
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn terminal_components(&self) -> &[DeviceComponent] {
+        &self.terminal_components
     }
 }
 
@@ -2094,9 +2103,9 @@ mod tests {
             topology
                 .net(net_id)
                 .unwrap()
-                .terminal_devices
+                .terminal_components
                 .iter()
-                .filter(|&&device| device == d)
+                .filter(|&&device_component| device_component.device == d)
                 .count(),
             2
         );
@@ -2115,9 +2124,9 @@ mod tests {
             topology
                 .net(net_id)
                 .unwrap()
-                .terminal_devices
+                .terminal_components
                 .iter()
-                .filter(|&&device| device == d)
+                .filter(|&&device_component| device_component.device == d)
                 .count(),
             1
         );
@@ -2352,5 +2361,57 @@ mod tests {
             topology.island(output_island).unwrap().components(),
             &[output],
         );
+    }
+
+    #[test]
+    fn net_terminal_incidence_preserves_device_partition() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut topology = DerivedTopology::default();
+
+        let input_wire = wire(1);
+        let output_wire = wire(2);
+        let delay = device(1);
+
+        add_wire(&mut network, &mut topology, input_wire);
+        add_wire(&mut network, &mut topology, output_wire);
+
+        add_device(
+            &mut network,
+            &mut topology,
+            &definitions,
+            delay,
+            PrimitiveElementKind::TickDelay,
+        );
+
+        attach(
+            &definitions,
+            &mut network,
+            &mut topology,
+            input_wire,
+            delay,
+            0,
+        );
+
+        attach(
+            &definitions,
+            &mut network,
+            &mut topology,
+            output_wire,
+            delay,
+            2,
+        );
+
+        let input_component = DeviceComponent::new(delay, DevicePartitionId::new(0));
+
+        let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
+
+        let input_net = topology.net(topology.wire_net(input_wire)).unwrap();
+
+        let output_net = topology.net(topology.wire_net(output_wire)).unwrap();
+
+        assert_eq!(input_net.terminal_components(), &[input_component],);
+
+        assert_eq!(output_net.terminal_components(), &[output_component],);
     }
 }

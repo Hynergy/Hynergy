@@ -1,5 +1,4 @@
 use super::{DerivedTopology, DeviceComponent, IslandId, NetId, terminal_component};
-use hynergy_model::device::definition::DeviceId;
 use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{Network, WireId};
 use smallvec::SmallVec;
@@ -25,6 +24,7 @@ enum IslandVertex {
 
 pub(super) fn wire_components(
     topology: &DerivedTopology,
+    definitions: &DefinitionRegistry,
     network: &Network,
     net_id: NetId,
     scratch: &mut TraversalScratch,
@@ -77,8 +77,13 @@ pub(super) fn wire_components(
                     continue;
                 }
 
-                if let Some((device, _)) = connection.as_terminal() {
-                    component.terminal_devices.push(device);
+                if let Some((device, terminal)) = connection.as_terminal() {
+                    component.terminal_components.push(terminal_component(
+                        definitions,
+                        network,
+                        device,
+                        terminal,
+                    ));
                 }
             }
         }
@@ -184,30 +189,19 @@ fn walk_island_component(
                     .get(net_id)
                     .expect("visited island net must be live");
 
-                for &wire_id in &net.wires {
-                    for connection in network
-                        .wire_connections(wire_id)
-                        .expect("visited island wire must be live")
-                    {
-                        let Some((device, terminal)) = connection.as_terminal() else {
-                            continue;
-                        };
+                for &neighbor in &net.terminal_components {
+                    let component_index = topology.component_index(neighbor);
 
-                        let neighbor = terminal_component(definitions, network, device, terminal);
-
-                        let component_index = topology.component_index(neighbor);
-
-                        if !scratch.visit_component(component_index) {
-                            continue;
-                        }
-
-                        debug_assert_eq!(
-                            topology.component_island_map[component_index],
-                            Some(island_id),
-                        );
-
-                        scratch.island_stack.push(IslandVertex::Component(neighbor));
+                    if !scratch.visit_component(component_index) {
+                        continue;
                     }
+
+                    debug_assert_eq!(
+                        topology.component_island_map[component_index],
+                        Some(island_id),
+                    );
+
+                    scratch.island_stack.push(IslandVertex::Component(neighbor));
                 }
             }
 
@@ -377,7 +371,7 @@ impl TraversalScratch {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct WireComponent {
     pub(super) wires: SmallVec<[WireId; 4]>,
-    pub(super) terminal_devices: SmallVec<[DeviceId; 2]>,
+    pub(super) terminal_components: SmallVec<[DeviceComponent; 2]>,
 }
 
 #[cfg(test)]
