@@ -1,4 +1,5 @@
-pub mod topology;
+mod compile;
+mod topology;
 
 use crate::topology::{DerivedTopology, TraversalScratch};
 use hynergy_model::device::definition::{DefinitionId, DeviceDefinition, DeviceId, TerminalId};

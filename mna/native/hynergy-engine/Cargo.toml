@@ -7,6 +7,8 @@ edition.workspace = true
 hynergy-model = { path = "../hynergy-model" }
 hynergy-ids = { path = "../hynergy-ids" }
 smallvec = "1.16.1"
+hynergy-ir = { path = "../hynergy-ir" }
+hynergy-mna = { path = "../hynergy-mna" }
 
 [dev-dependencies]
 criterion = "0.8.2"

@@ -513,6 +513,7 @@ version = "0.0.1-dev"
 dependencies = [
  "criterion",
  "hynergy-ids",
+ "hynergy-ir",
  "hynergy-mna",
  "hynergy-model",
  "smallvec",
