@@ -263,8 +263,6 @@ impl DerivedTopology {
         self.device_component_spans[device.index()] =
             Some(DeviceComponentSpan::new(start, partition_count));
 
-        let mut first_island = None;
-
         for partition_index in 0..partition_count {
             let partition = DevicePartitionId::new(
                 u16::try_from(partition_index)
@@ -279,10 +277,6 @@ impl DerivedTopology {
             });
 
             self.component_island_map.push(Some(island_id));
-
-            if first_island.is_none() {
-                first_island = Some(island_id);
-            }
 
             self.invalidation.mark_topology_dirty(island_id);
 
