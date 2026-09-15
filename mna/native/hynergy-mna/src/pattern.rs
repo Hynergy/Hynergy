@@ -1,4 +1,5 @@
 use faer::sparse::SymbolicSparseColMatRef;
+use thiserror::Error;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,22 +40,19 @@ impl MatrixSlot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum PatternError {
-    DimensionTooLarge {
-        dimension: usize,
-        max: usize,
-    },
+    #[error("MNA dimension {dimension} exceeds maximum supported dimension {max}")]
+    DimensionTooLarge { dimension: usize, max: usize },
 
+    #[error("unknown index {index:?} is outside matrix dimension {dimension}")]
     IndexOutOfBounds {
         index: UnknownIndex,
         dimension: usize,
     },
 
-    TooManyNonZeros {
-        nnz: usize,
-        max: usize,
-    },
+    #[error("MNA pattern contains {nnz} non zeros, exceeding maximum {max}")]
+    TooManyNonZeros { nnz: usize, max: usize },
 }
 
 #[derive(Debug)]

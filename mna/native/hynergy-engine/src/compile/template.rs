@@ -1,7 +1,39 @@
 use crate::compile::UnknownRange;
-use hynergy_ir::{InputSlot, MatrixAdd, RhsAdd, ValueBuildError, ValueProgramBuilder, ValueSlot};
-use hynergy_mna::pattern::{MnaPattern, PatternBuilder, PatternError, UnknownIndex};
+use crate::compile::island_ir::IslandIrBuilder;
+use crate::compile::state::StateRange;
+use hynergy_ir::{InputSlot, ValueBuildError, ValueSlot};
+use hynergy_mna::pattern::{PatternBuilder, PatternError, UnknownIndex};
 use smallvec::SmallVec;
+use thiserror::Error;
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct LocalStateId(u32);
+
+impl LocalStateId {
+    #[inline]
+    const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[inline]
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalState {
+    id: LocalStateId,
+    value: LocalValueId,
+}
+
+impl LocalState {
+    #[inline]
+    pub(crate) const fn value(self) -> LocalValueId {
+        self.value
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct BoundUnknowns {
@@ -10,7 +42,7 @@ pub(crate) struct BoundUnknowns {
 
 impl BoundUnknowns {
     #[inline]
-    fn get(&self, local: LocalUnknownId) -> Option<UnknownIndex> {
+    pub(crate) fn get(&self, local: LocalUnknownId) -> Option<UnknownIndex> {
         self.values[local.index()]
     }
 }
@@ -102,6 +134,10 @@ enum LocalValueNode {
     Parameter(LocalParameterId),
     Constant(f64),
 
+    Timestep,
+    State(LocalStateId),
+    Unknown(LocalUnknownId),
+
     Add(LocalValueId, LocalValueId),
     Sub(LocalValueId, LocalValueId),
     Mul(LocalValueId, LocalValueId),
@@ -154,50 +190,57 @@ struct LocalRhsTerm {
     scale: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionTemplateBuildError {
+    #[error("definition-template ID range is exhausted")]
     IdExhausted,
+
+    #[error("persistent state {state} has more than one next-state producer")]
+    DuplicateStateProducer { state: usize },
+
+    #[error("persistent state {state} has no next-state producer")]
+    MissingStateProducer { state: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionLinkError {
-    WrongTerminalBindingCount {
-        expected: usize,
-        actual: usize,
-    },
-    WrongAllocatedUnknownCount {
-        expected: usize,
-        actual: usize,
-    },
-    Pattern(PatternError),
-    Values(ValueBuildError),
+    #[error("expected {expected} terminal bindings, got {actual}")]
+    WrongTerminalBindingCount { expected: usize, actual: usize },
+
+    #[error("expected {expected} allocated unknowns, got {actual}")]
+    WrongAllocatedUnknownCount { expected: usize, actual: usize },
+
+    #[error("expected {expected} state bindings, got {actual}")]
+    WrongStateBindingCount { expected: usize, actual: usize },
+
+    #[error(transparent)]
+    Pattern(#[from] PatternError),
+
+    #[error(transparent)]
+    Values(#[from] ValueBuildError),
+
+    #[error("final MNA pattern is missing entry ({row:?}, {column:?})")]
     MissingPatternEntry {
         row: UnknownIndex,
         column: UnknownIndex,
     },
 }
 
-impl From<PatternError> for DefinitionLinkError {
-    #[inline]
-    fn from(error: PatternError) -> Self {
-        Self::Pattern(error)
-    }
-}
-
-impl From<ValueBuildError> for DefinitionLinkError {
-    #[inline]
-    fn from(error: ValueBuildError) -> Self {
-        Self::Values(error)
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct DefinitionTemplateBuilder {
     unknowns: Vec<LocalUnknownInfo>,
+    unknown_values: Vec<Option<LocalValueId>>,
+
     values: Vec<LocalValueInfo>,
     parameter_count: usize,
+
+    timestep_value: Option<LocalValueId>,
+
+    state_writes: Vec<Option<LocalValueId>>,
+
     matrix_terms: Vec<PendingMatrixTerm>,
     rhs_terms: Vec<LocalRhsTerm>,
+
     terminal_count: usize,
     allocated_unknown_count: usize,
 }
@@ -206,6 +249,77 @@ impl DefinitionTemplateBuilder {
     #[inline]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn timestep(&mut self) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+        if let Some(value) = self.timestep_value {
+            return Ok(value);
+        }
+
+        let value = self.allocate_value(LocalValueInfo {
+            node: LocalValueNode::Timestep,
+            constant: None,
+        })?;
+
+        self.timestep_value = Some(value);
+
+        Ok(value)
+    }
+
+    pub(crate) fn unknown_value(
+        &mut self,
+        unknown: LocalUnknownId,
+    ) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+        debug_assert!(unknown.index() < self.unknowns.len());
+
+        if let Some(value) = self.unknown_values[unknown.index()] {
+            return Ok(value);
+        }
+
+        let value = self.allocate_value(LocalValueInfo {
+            node: LocalValueNode::Unknown(unknown),
+            constant: None,
+        })?;
+
+        self.unknown_values[unknown.index()] = Some(value);
+
+        Ok(value)
+    }
+
+    pub(crate) fn state(&mut self) -> Result<LocalState, DefinitionTemplateBuildError> {
+        let raw = u32::try_from(self.state_writes.len())
+            .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+
+        let id = LocalStateId::new(raw);
+
+        let value = self.allocate_value(LocalValueInfo {
+            node: LocalValueNode::State(id),
+            constant: None,
+        })?;
+
+        self.state_writes.push(None);
+
+        Ok(LocalState { id, value })
+    }
+
+    pub(crate) fn write_state(
+        &mut self,
+        state: LocalState,
+        source: LocalValueId,
+    ) -> Result<(), DefinitionTemplateBuildError> {
+        debug_assert!(source.index() < self.values.len());
+
+        let destination = &mut self.state_writes[state.id.index()];
+
+        if destination.is_some() {
+            return Err(DefinitionTemplateBuildError::DuplicateStateProducer {
+                state: state.id.index(),
+            });
+        }
+
+        *destination = Some(source);
+
+        Ok(())
     }
 
     pub(crate) fn terminal_voltage(
@@ -357,6 +471,14 @@ impl DefinitionTemplateBuilder {
         canonicalize_pending_matrix_terms(&mut self.matrix_terms);
         canonicalize_rhs_terms(&mut self.rhs_terms);
 
+        let state_writes = std::mem::take(&mut self.state_writes)
+            .into_iter()
+            .enumerate()
+            .map(|(state, source)| {
+                source.ok_or(DefinitionTemplateBuildError::MissingStateProducer { state })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let mut coordinates = self
             .matrix_terms
             .iter()
@@ -399,6 +521,8 @@ impl DefinitionTemplateBuilder {
             matrix_terms: matrix_terms.into_boxed_slice(),
             rhs_terms: self.rhs_terms.into_boxed_slice(),
 
+            state_writes: state_writes.into_boxed_slice(),
+
             parameter_count: self.parameter_count,
             terminal_count: self.terminal_count,
             allocated_unknown_count: self.allocated_unknown_count,
@@ -413,6 +537,7 @@ impl DefinitionTemplateBuilder {
             .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
 
         self.unknowns.push(info);
+        self.unknown_values.push(None);
 
         Ok(LocalUnknownId::new(index))
     }
@@ -475,9 +600,13 @@ enum LocalBinaryOp {
 pub(crate) struct CompiledDefinitionTemplate {
     unknowns: Box<[LocalUnknownInfo]>,
     values: Box<[LocalValueInfo]>,
+
     matrix_entries: Box<[LocalMatrixEntry]>,
     matrix_terms: Box<[LocalMatrixTerm]>,
     rhs_terms: Box<[LocalRhsTerm]>,
+
+    state_writes: Box<[LocalValueId]>,
+
     parameter_count: usize,
     terminal_count: usize,
     allocated_unknown_count: usize,
@@ -507,12 +636,17 @@ impl CompiledDefinitionTemplate {
     pub(crate) fn bind(
         &self,
         unknowns: &BoundUnknowns,
-        pattern: &MnaPattern,
-        value_builder: &mut ValueProgramBuilder,
-        matrix_ops: &mut Vec<MatrixAdd>,
-        rhs_ops: &mut Vec<RhsAdd>,
+        states: StateRange,
+        ir: &mut IslandIrBuilder<'_>,
     ) -> Result<BoundDefinitionInputs, DefinitionLinkError> {
-        let (values, parameters) = self.bind_values(value_builder)?;
+        if states.len() != self.state_count() {
+            return Err(DefinitionLinkError::WrongStateBindingCount {
+                expected: self.state_count(),
+                actual: states.len(),
+            });
+        }
+
+        let (values, parameters) = self.bind_values(unknowns, states, ir)?;
 
         for term in &self.matrix_terms {
             let entry = self.matrix_entries[term.destination.index()];
@@ -525,15 +659,12 @@ impl CompiledDefinitionTemplate {
                 continue;
             };
 
-            let destination = pattern
+            let destination = ir
+                .pattern()
                 .slot(row, column)
                 .ok_or(DefinitionLinkError::MissingPatternEntry { row, column })?;
 
-            matrix_ops.push(MatrixAdd::new(
-                destination,
-                values[term.source.index()],
-                term.scale,
-            ));
+            ir.add_matrix(destination, values[term.source.index()], term.scale);
         }
 
         for term in &self.rhs_terms {
@@ -541,11 +672,13 @@ impl CompiledDefinitionTemplate {
                 continue;
             };
 
-            rhs_ops.push(RhsAdd::new(
-                destination,
-                values[term.source.index()],
-                term.scale,
-            ));
+            ir.add_rhs(destination, values[term.source.index()], term.scale);
+        }
+
+        for (index, &source) in self.state_writes.iter().enumerate() {
+            let destination = states.get(index).expect("state range length was validated");
+
+            ir.write_state(destination, values[source.index()]);
         }
 
         Ok(BoundDefinitionInputs { parameters })
@@ -553,7 +686,9 @@ impl CompiledDefinitionTemplate {
 
     fn bind_values(
         &self,
-        builder: &mut ValueProgramBuilder,
+        unknowns: &BoundUnknowns,
+        states: StateRange,
+        ir: &mut IslandIrBuilder<'_>,
     ) -> Result<(Vec<ValueSlot>, Box<[InputSlot]>), DefinitionLinkError> {
         let mut values = Vec::with_capacity(self.values.len());
 
@@ -562,32 +697,44 @@ impl CompiledDefinitionTemplate {
         for info in &self.values {
             let value = match info.node {
                 LocalValueNode::Parameter(parameter) => {
-                    let input = builder.static_input()?;
+                    let input = ir.parameter_input()?;
 
                     parameters[parameter.index()] = Some(input);
 
                     input.value()
                 }
 
-                LocalValueNode::Constant(value) => builder.constant(value)?,
+                LocalValueNode::Constant(value) => ir.constant_value(value)?,
+
+                LocalValueNode::Timestep => ir.timestep_value()?,
+
+                LocalValueNode::State(state) => {
+                    let state = states
+                        .get(state.index())
+                        .expect("state range length was validated");
+
+                    ir.state_value(state)?
+                }
+
+                LocalValueNode::Unknown(unknown) => ir.unknown_value(unknowns.get(unknown))?,
 
                 LocalValueNode::Add(lhs, rhs) => {
-                    builder.add(values[lhs.index()], values[rhs.index()])?
+                    ir.add_value(values[lhs.index()], values[rhs.index()])?
                 }
 
                 LocalValueNode::Sub(lhs, rhs) => {
-                    builder.sub(values[lhs.index()], values[rhs.index()])?
+                    ir.sub_value(values[lhs.index()], values[rhs.index()])?
                 }
 
                 LocalValueNode::Mul(lhs, rhs) => {
-                    builder.mul(values[lhs.index()], values[rhs.index()])?
+                    ir.mul_value(values[lhs.index()], values[rhs.index()])?
                 }
 
                 LocalValueNode::Div(lhs, rhs) => {
-                    builder.div(values[lhs.index()], values[rhs.index()])?
+                    ir.div_value(values[lhs.index()], values[rhs.index()])?
                 }
 
-                LocalValueNode::Neg(operand) => builder.neg(values[operand.index()])?,
+                LocalValueNode::Neg(operand) => ir.neg_value(values[operand.index()])?,
             };
 
             values.push(value);
@@ -663,6 +810,11 @@ impl CompiledDefinitionTemplate {
     #[inline]
     pub(crate) const fn allocated_unknown_count(&self) -> usize {
         self.allocated_unknown_count
+    }
+
+    #[inline]
+    pub(crate) fn state_count(&self) -> usize {
+        self.state_writes.len()
     }
 }
 
@@ -805,5 +957,113 @@ mod tests {
         assert_eq!(bound.get(branch), Some(UnknownIndex::new(1)),);
 
         assert_eq!(allocator.dimension(), 2);
+    }
+
+    #[test]
+    fn state_requires_exactly_one_next_state_producer() {
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let state = builder.state().unwrap();
+
+        assert!(matches!(
+            builder.finish(),
+            Err(DefinitionTemplateBuildError::MissingStateProducer { state: 0 })
+        ));
+
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let state = builder.state().unwrap();
+        let one = builder.constant(1.0).unwrap();
+        let two = builder.constant(2.0).unwrap();
+
+        builder.write_state(state, one).unwrap();
+
+        assert_eq!(
+            builder.write_state(state, two),
+            Err(DefinitionTemplateBuildError::DuplicateStateProducer { state: 0 }),
+        );
+    }
+
+    #[test]
+    fn state_timestep_and_solution_dependencies_bind_to_island_ir() {
+        use crate::compile::{island_ir::IslandIrBuilder, state::StateAllocator};
+
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let terminal = builder.terminal_voltage().unwrap();
+
+        let previous = builder.state().unwrap();
+
+        let timestep = builder.timestep().unwrap();
+
+        let voltage = builder.unknown_value(terminal).unwrap();
+
+        let history_plus_dt = builder.add(previous.value(), timestep).unwrap();
+
+        let next = builder.add(history_plus_dt, voltage).unwrap();
+
+        builder.write_state(previous, next).unwrap();
+
+        let template = builder.finish().unwrap();
+
+        assert_eq!(template.state_count(), 1);
+
+        let unknown = UnknownIndex::new(0);
+
+        let mut unknown_allocator = UnknownAllocator::new(1).unwrap();
+
+        let allocated_unknowns = unknown_allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let unknowns = template
+            .bind_unknowns(&[Some(unknown)], allocated_unknowns)
+            .unwrap();
+
+        let mut state_allocator = StateAllocator::new();
+
+        let states = state_allocator.allocate(template.state_count()).unwrap();
+
+        let pattern = PatternBuilder::new(1).unwrap().finish().unwrap();
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        template.bind(&unknowns, states, &mut ir_builder).unwrap();
+
+        let ir = ir_builder.finish().unwrap();
+
+        assert_eq!(ir.solution_inputs().len(), 1,);
+
+        assert_eq!(ir.state_inputs().len(), 1,);
+
+        let timestep_input = ir.timestep_input().unwrap();
+
+        let state_input = ir.state_inputs()[0].1;
+
+        let solution_input = ir.solution_inputs()[0].1;
+
+        let mut workspace = ir.value_program().new_workspace();
+
+        // dt = 0.5
+        workspace.set_input(timestep_input, 0.5);
+
+        // previous state = 2
+        workspace.set_input(state_input, 2.0);
+
+        // solved voltage = 3
+        workspace.set_input(solution_input, 3.0);
+
+        ir.value_program().execute_static(&mut workspace);
+
+        ir.value_program().execute_tick(&mut workspace);
+
+        ir.value_program().execute_iteration(&mut workspace);
+
+        let mut next_state = [0.0];
+
+        ir.state_transition()
+            .execute(&mut next_state, workspace.values());
+
+        assert_eq!(next_state, [5.5]);
     }
 }

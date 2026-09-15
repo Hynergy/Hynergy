@@ -10,21 +10,28 @@ use faer::{
         },
     },
 };
+use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum MnaError {
+    #[error("backend matrix index overflow")]
     IndexOverflow,
+
+    #[error("backend allocation failed")]
     OutOfMemory,
 
+    #[error("matrix is singular at index {index}")]
     Singular { index: usize },
 
+    #[error("MNA system has not been factorized")]
     NotFactorized,
 
+    #[error("RHS length mismatch: expected {expected}, got {actual}")]
     RhsLengthMismatch { expected: usize, actual: usize },
 
+    #[error("MNA backend failure")]
     BackendFailure,
 }
-
 impl MnaError {
     #[inline]
     fn from_faer(error: FaerError) -> Self {

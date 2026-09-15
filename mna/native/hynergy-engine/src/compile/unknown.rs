@@ -1,7 +1,9 @@
 use hynergy_mna::pattern::{PatternBuilder, UnknownIndex};
+use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnknownAllocationError {
+    #[error("requested MNA dimension {requested} exceeds maximum {max}")]
     DimensionTooLarge { requested: usize, max: usize },
 }
 

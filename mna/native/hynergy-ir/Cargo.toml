@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 hynergy-mna = { path = "../hynergy-mna" }
+thiserror = "2.0"

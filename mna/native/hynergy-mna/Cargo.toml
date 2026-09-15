@@ -9,3 +9,4 @@ faer = {
     default-features = false,
     features = ["std", "linalg", "sparse", "sparse-linalg"]
 }
+thiserror = "2.0"

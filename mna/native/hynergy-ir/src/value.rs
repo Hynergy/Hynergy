@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueSlot(u32);
@@ -44,10 +46,11 @@ pub enum EvaluationRate {
     Iteration = 3,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ValueBuildError {
+    #[error("the value-slot range is exhausted")]
     SlotExhausted,
-
+    #[error("unknown value slot {slot:?}")]
     UnknownValue { slot: ValueSlot },
 }
 

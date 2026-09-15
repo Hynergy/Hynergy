@@ -1,3 +1,5 @@
+mod island_ir;
+mod state;
 mod template;
 mod unknown;
 

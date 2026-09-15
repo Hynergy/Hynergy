@@ -517,6 +517,7 @@ dependencies = [
  "hynergy-mna",
  "hynergy-model",
  "smallvec",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -536,6 +537,7 @@ name = "hynergy-ir"
 version = "0.0.1-dev"
 dependencies = [
  "hynergy-mna",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -543,6 +545,7 @@ name = "hynergy-mna"
 version = "0.0.1-dev"
 dependencies = [
  "faer",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
