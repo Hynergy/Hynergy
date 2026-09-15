@@ -1,108 +1,26 @@
-use super::{DerivedTopology, IslandId, NetId};
+use super::{DerivedTopology, DeviceComponent, IslandId, NetId, terminal_component};
 use hynergy_model::device::definition::DeviceId;
+use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{Network, WireId};
 use smallvec::SmallVec;
-use std::num::NonZeroU32;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct IslandComponent {
     pub(super) nets: SmallVec<[NetId; 4]>,
-    pub(super) devices: SmallVec<[DeviceId; 4]>,
+    pub(super) components: SmallVec<[DeviceComponent; 2]>,
 }
 
 impl IslandComponent {
     #[inline]
     pub(super) fn rewrite_cost(&self) -> usize {
-        self.nets.len() + self.devices.len()
+        self.nets.len() + self.components.len()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IslandVertexType {
-    Device,
-    Net,
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-struct IslandVertex(NonZeroU32);
-
-impl IslandVertex {
-    const TYPE_BIT: u32 = 1 << 31;
-    const ID_MASK: u32 = Self::TYPE_BIT - 1;
-
-    #[inline]
-    fn as_net(self) -> Option<NetId> {
-        (self.vertex_type() == IslandVertexType::Net).then(|| {
-            let id = NonZeroU32::new(self.0.get() & Self::ID_MASK)
-                .expect("packed island vertex IDs are non-zero");
-
-            NetId::from(id)
-        })
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    unsafe fn net_unchecked(self) -> NetId {
-        debug_assert_eq!(self.0.get() & Self::TYPE_BIT, 0);
-
-        NetId::from(self.0)
-    }
-
-    #[inline]
-    fn as_device(self) -> Option<DeviceId> {
-        (self.vertex_type() == IslandVertexType::Device).then(|| {
-            let id = NonZeroU32::new(self.0.get() & Self::ID_MASK)
-                .expect("packed island vertex IDs are non-zero");
-
-            DeviceId::from(id)
-        })
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    unsafe fn device_unchecked(self) -> DeviceId {
-        debug_assert_ne!(self.0.get() & Self::TYPE_BIT, 0);
-
-        let raw = unsafe { NonZeroU32::new_unchecked(self.0.get() & Self::ID_MASK) };
-
-        DeviceId::from(raw)
-    }
-
-    #[inline]
-    fn vertex_type(self) -> IslandVertexType {
-        if self.0.get() & Self::TYPE_BIT != 0 {
-            IslandVertexType::Device
-        } else {
-            IslandVertexType::Net
-        }
-    }
-}
-
-impl From<NetId> for IslandVertex {
-    #[inline]
-    fn from(id: NetId) -> Self {
-        let raw: NonZeroU32 = id.into();
-
-        debug_assert!(raw.get() <= Self::ID_MASK);
-
-        Self(raw)
-    }
-}
-
-impl From<DeviceId> for IslandVertex {
-    #[inline]
-    fn from(id: DeviceId) -> Self {
-        let id: NonZeroU32 = id.into();
-
-        debug_assert!(id.get() <= Self::ID_MASK);
-
-        Self(
-            NonZeroU32::new(id.get() | Self::TYPE_BIT)
-                .expect("tagging non-zero DeviceId remains non-zero"),
-        )
-    }
+enum IslandVertex {
+    Net(NetId),
+    Component(DeviceComponent),
 }
 
 pub(super) fn wire_components(
@@ -173,33 +91,49 @@ pub(super) fn wire_components(
 
 pub(super) fn island_components(
     topology: &DerivedTopology,
+    definitions: &DefinitionRegistry,
     network: &Network,
     scratch: &mut TraversalScratch,
     island_id: IslandId,
     affected_nets: &[NetId],
 ) -> Vec<IslandComponent> {
-    scratch.begin_island_traversal(topology.nets.slot_count(), network.devices().len());
+    scratch.begin_island_traversal(
+        topology.nets.slot_count(),
+        topology.component_island_map.len(),
+    );
 
     let island = topology
         .islands
         .get(island_id)
         .expect("island repair requires a live island");
 
-    let mut components = Vec::new();
+    let mut pieces = Vec::new();
 
-    for &device_id in &island.devices {
-        let index = device_id.index();
+    for &device_component in &island.components {
+        let component_index = topology.component_index(device_component);
 
-        if !scratch.visit_device(index) {
+        if !scratch.visit_component(component_index) {
             continue;
         }
 
-        debug_assert_eq!(topology.device_island_map[index], Some(island_id));
-        debug_assert!(network.devices()[index].is_some());
+        debug_assert_eq!(
+            topology.component_island_map[component_index],
+            Some(island_id),
+        );
 
-        scratch.island_stack.push(device_id.into());
+        debug_assert!(network.devices()[device_component.device().index()].is_some());
 
-        components.push(walk_island_component(topology, network, island_id, scratch));
+        scratch
+            .island_stack
+            .push(IslandVertex::Component(device_component));
+
+        pieces.push(walk_island_component(
+            topology,
+            definitions,
+            network,
+            island_id,
+            scratch,
+        ));
 
         debug_assert!(scratch.island_stack.is_empty());
     }
@@ -211,62 +145,100 @@ pub(super) fn island_components(
             continue;
         }
 
-        debug_assert_eq!(topology.net_island_map[index], Some(island_id));
+        debug_assert_eq!(topology.net_island_map[index], Some(island_id),);
+
         debug_assert!(topology.nets.get(net_id).is_some());
 
-        scratch.island_stack.push(net_id.into());
+        scratch.island_stack.push(IslandVertex::Net(net_id));
 
-        components.push(walk_island_component(topology, network, island_id, scratch));
+        pieces.push(walk_island_component(
+            topology,
+            definitions,
+            network,
+            island_id,
+            scratch,
+        ));
 
         debug_assert!(scratch.island_stack.is_empty());
     }
 
-    components
+    pieces
 }
 
 fn walk_island_component(
     topology: &DerivedTopology,
+    definitions: &DefinitionRegistry,
     network: &Network,
     island_id: IslandId,
     scratch: &mut TraversalScratch,
 ) -> IslandComponent {
-    let mut component = IslandComponent::default();
+    let mut result = IslandComponent::default();
 
     while let Some(vertex) = scratch.island_stack.pop() {
-        match vertex.vertex_type() {
-            IslandVertexType::Net => {
-                let net_id = unsafe { vertex.as_net().unwrap_unchecked() };
-
-                component.nets.push(net_id);
+        match vertex {
+            IslandVertex::Net(net_id) => {
+                result.nets.push(net_id);
 
                 let net = topology
                     .nets
                     .get(net_id)
                     .expect("visited island net must be live");
 
-                for &device_id in &net.terminal_devices {
-                    let index = device_id.index();
+                for &wire_id in &net.wires {
+                    for connection in network
+                        .wire_connections(wire_id)
+                        .expect("visited island wire must be live")
+                    {
+                        let Some((device, terminal)) = connection.as_terminal() else {
+                            continue;
+                        };
 
-                    if !scratch.visit_device(index) {
-                        continue;
+                        let neighbor = terminal_component(definitions, network, device, terminal);
+
+                        let component_index = topology.component_index(neighbor);
+
+                        if !scratch.visit_component(component_index) {
+                            continue;
+                        }
+
+                        debug_assert_eq!(
+                            topology.component_island_map[component_index],
+                            Some(island_id),
+                        );
+
+                        scratch.island_stack.push(IslandVertex::Component(neighbor));
                     }
-
-                    debug_assert_eq!(topology.device_island_map[index], Some(island_id));
-
-                    scratch.island_stack.push(device_id.into());
                 }
             }
 
-            IslandVertexType::Device => {
-                let device_id = unsafe { vertex.as_device().unwrap_unchecked() };
+            IslandVertex::Component(device_component) => {
+                result.components.push(device_component);
 
-                component.devices.push(device_id);
+                let device_id = device_component.device();
+
+                let definition_id = network
+                    .device_definition_id(device_id)
+                    .expect("visited component device must have a definition");
+
+                let definition = definitions
+                    .get(definition_id)
+                    .expect("visited component definition must remain registered");
 
                 let device = network.devices()[device_id.index()]
                     .as_ref()
-                    .expect("visited island device must be live");
+                    .expect("visited island component device must be live");
 
-                for connection in device.terminals().iter().flatten().copied() {
+                for (terminal_index, connection) in device.terminals().iter().enumerate() {
+                    if definition.terminal_partitions()[terminal_index]
+                        != device_component.partition()
+                    {
+                        continue;
+                    }
+
+                    let Some(connection) = *connection else {
+                        continue;
+                    };
+
                     if let Some(wire_id) = connection.as_wire() {
                         let net_id = topology.wire_net_map[wire_id.index()]
                             .expect("live attached wire must have a NetId");
@@ -277,40 +249,47 @@ fn walk_island_component(
                             continue;
                         }
 
-                        debug_assert_eq!(topology.net_island_map[index], Some(island_id));
+                        debug_assert_eq!(topology.net_island_map[index], Some(island_id),);
 
-                        scratch.island_stack.push(net_id.into());
+                        scratch.island_stack.push(IslandVertex::Net(net_id));
+
                         continue;
                     }
 
-                    if let Some((other_device, _)) = connection.as_terminal() {
-                        let index = other_device.index();
+                    if let Some((other_device, other_terminal)) = connection.as_terminal() {
+                        let neighbor =
+                            terminal_component(definitions, network, other_device, other_terminal);
 
-                        if !scratch.visit_device(index) {
+                        let component_index = topology.component_index(neighbor);
+
+                        if !scratch.visit_component(component_index) {
                             continue;
                         }
 
-                        debug_assert_eq!(topology.device_island_map[index], Some(island_id));
+                        debug_assert_eq!(
+                            topology.component_island_map[component_index],
+                            Some(island_id),
+                        );
 
-                        scratch.island_stack.push(other_device.into());
+                        scratch.island_stack.push(IslandVertex::Component(neighbor));
                     }
                 }
             }
         }
     }
 
-    component
+    result
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct TraversalScratch {
     wire_seen: Vec<bool>,
     net_seen: Vec<bool>,
-    device_seen: Vec<bool>,
+    component_seen: Vec<u64>,
 
     touched_wires: Vec<usize>,
     touched_nets: Vec<usize>,
-    touched_devices: Vec<usize>,
+    touched_component_words: Vec<usize>,
 
     wire_stack: Vec<WireId>,
     island_stack: Vec<IslandVertex>,
@@ -336,14 +315,18 @@ impl TraversalScratch {
     }
 
     #[inline]
-    fn begin_island_traversal(&mut self, net_slots: usize, device_slots: usize) {
+    fn begin_island_traversal(&mut self, net_slots: usize, component_slots: usize) {
         Self::reset_marks(&mut self.net_seen, &mut self.touched_nets, net_slots);
 
-        Self::reset_marks(
-            &mut self.device_seen,
-            &mut self.touched_devices,
-            device_slots,
-        );
+        for word_index in self.touched_component_words.drain(..) {
+            self.component_seen[word_index] = 0;
+        }
+
+        let required_words = component_slots.div_ceil(64);
+
+        if self.component_seen.len() < required_words {
+            self.component_seen.resize(required_words, 0);
+        }
 
         self.island_stack.clear();
     }
@@ -371,13 +354,22 @@ impl TraversalScratch {
     }
 
     #[inline]
-    fn visit_device(&mut self, index: usize) -> bool {
-        if self.device_seen[index] {
+    fn visit_component(&mut self, index: usize) -> bool {
+        let word_index = index / 64;
+        let mask = 1_u64 << (index % 64);
+
+        let word = self.component_seen[word_index];
+
+        if word & mask != 0 {
             return false;
         }
 
-        self.device_seen[index] = true;
-        self.touched_devices.push(index);
+        if word == 0 {
+            self.touched_component_words.push(word_index);
+        }
+
+        self.component_seen[word_index] = word | mask;
+
         true
     }
 }
@@ -418,17 +410,17 @@ mod tests {
         scratch.begin_island_traversal(4, 4);
 
         assert!(scratch.visit_net(1));
-        assert!(scratch.visit_device(2));
+        assert!(scratch.visit_component(2));
 
         assert!(!scratch.visit_net(1));
-        assert!(!scratch.visit_device(2));
+        assert!(!scratch.visit_component(2));
 
         scratch.begin_island_traversal(8, 8);
 
         assert!(scratch.visit_net(1));
-        assert!(scratch.visit_device(2));
+        assert!(scratch.visit_component(2));
 
         assert!(scratch.visit_net(7));
-        assert!(scratch.visit_device(7));
+        assert!(scratch.visit_component(7));
     }
 }

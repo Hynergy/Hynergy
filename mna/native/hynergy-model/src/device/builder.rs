@@ -981,7 +981,6 @@ mod tests {
         };
 
         let child_id = registry.register(child).unwrap();
-
         let mut builder = DeviceDefinitionBuilder::new(&registry);
 
         let [a, b] = terminals(&mut builder);
@@ -995,6 +994,11 @@ mod tests {
         assert_eq!(
             definition.terminal_partitions(),
             &[DevicePartitionId::new(0), DevicePartitionId::new(0),],
+        );
+
+        assert_eq!(
+            definition.element_partitions(),
+            &[DevicePartitionId::new(0), DevicePartitionId::new(1),],
         );
 
         assert_eq!(definition.partition_count(), 2);
@@ -1050,6 +1054,16 @@ mod tests {
         assert_eq!(
             definition.terminal_partitions(),
             &[DevicePartitionId::new(0), DevicePartitionId::new(0),],
+        );
+
+        assert_eq!(
+            definition.element_partitions(),
+            &[
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(1),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(2),
+            ],
         );
 
         assert_eq!(definition.partition_count(), 3);

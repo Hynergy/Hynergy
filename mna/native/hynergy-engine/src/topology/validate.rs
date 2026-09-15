@@ -1,90 +1,16 @@
-use crate::topology::{DerivedTopology, NetId};
-use hynergy_model::device::definition::DeviceId;
+use crate::topology::{DerivedTopology, DeviceComponent, NetId, terminal_component};
+use hynergy_model::device::definition::{DeviceId, DevicePartitionId};
+use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{Network, WireId};
-use std::num::NonZeroU32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrimitiveVertexType {
-    Wire,
-    Device,
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PrimitiveVertex(NonZeroU32);
-
-impl PrimitiveVertex {
-    const TYPE_BIT: u32 = 1 << 31;
-    const ID_MASK: u32 = Self::TYPE_BIT - 1;
-
-    #[inline]
-    fn new(id: impl Into<NonZeroU32>, ty: PrimitiveVertexType) -> Option<Self> {
-        let id = id.into();
-
-        if id.get() > Self::ID_MASK {
-            return None;
-        }
-
-        let raw = match ty {
-            PrimitiveVertexType::Wire => id.get(),
-            PrimitiveVertexType::Device => id.get() | Self::TYPE_BIT,
-        };
-
-        Some(Self(NonZeroU32::new(raw).expect(
-            "a non-zero vertex ID produces a non-zero primitive vertex",
-        )))
-    }
-
-    #[inline]
-    fn as_wire(self) -> Option<WireId> {
-        (self.vertex_type() == PrimitiveVertexType::Wire).then(|| {
-            WireId::from(
-                NonZeroU32::new(self.0.get() & Self::ID_MASK)
-                    .expect("packed primitive vertex ID is non-zero"),
-            )
-        })
-    }
-
-    #[inline]
-    fn as_device(self) -> Option<DeviceId> {
-        (self.vertex_type() == PrimitiveVertexType::Device).then(|| {
-            DeviceId::from(
-                NonZeroU32::new(self.0.get() & Self::ID_MASK)
-                    .expect("packed primitive vertex ID is non-zero"),
-            )
-        })
-    }
-
-    #[inline]
-    fn vertex_type(self) -> PrimitiveVertexType {
-        if self.0.get() & Self::TYPE_BIT != 0 {
-            PrimitiveVertexType::Device
-        } else {
-            PrimitiveVertexType::Wire
-        }
-    }
-}
-
-impl TryFrom<WireId> for PrimitiveVertex {
-    type Error = ();
-
-    #[inline]
-    fn try_from(id: WireId) -> Result<Self, Self::Error> {
-        Self::new(id, PrimitiveVertexType::Wire).ok_or(())
-    }
-}
-
-impl TryFrom<DeviceId> for PrimitiveVertex {
-    type Error = ();
-
-    #[inline]
-    fn try_from(id: DeviceId) -> Result<Self, Self::Error> {
-        Self::new(id, PrimitiveVertexType::Device).ok_or(())
-    }
+enum PrimitiveVertex {
+    Wire(WireId),
+    Component(DeviceComponent),
 }
 
 impl DerivedTopology {
-    pub(crate) fn assert_consistent(&self, network: &Network) {
+    pub(crate) fn assert_consistent(&self, definitions: &DefinitionRegistry, network: &Network) {
         assert_eq!(
             self.wire_net_map.len(),
             network.wires().len(),
@@ -98,19 +24,18 @@ impl DerivedTopology {
         );
 
         assert_eq!(
-            self.device_island_map.len(),
+            self.device_component_spans.len(),
             network.devices().len(),
-            "device map must mirror Network device slots"
+            "device component spans must mirror Network device slots"
         );
 
         self.assert_membership_maps(network);
         self.assert_net_partition_matches_network(network);
-        self.assert_island_partition_matches_network(network);
+        self.assert_island_partition_matches_network(definitions, network);
     }
 
     fn assert_membership_maps(&self, network: &Network) {
         let mut seen_wires = vec![false; network.wires().len()];
-        let mut seen_devices = vec![false; network.devices().len()];
 
         for (net_id, net) in self.nets.iter() {
             assert!(
@@ -214,59 +139,92 @@ impl DerivedTopology {
             }
         }
 
+        let mut seen_components = vec![false; self.component_island_map.len()];
+
         for (island_id, island) in self.islands.iter() {
             assert!(
-                !island.devices.is_empty(),
-                "live islands must contain at least one device"
+                !island.components.is_empty(),
+                "live islands must contain at least one device component",
             );
 
-            for &device in &island.devices {
+            for &component in &island.components {
+                let device = component.device();
+
                 assert!(
                     network
                         .devices()
                         .get(device.index())
                         .is_some_and(|slot| slot.is_some()),
-                    "island references a removed or out-of-range device"
+                    "island references a removed or out-of-range device",
                 );
 
+                let span = self.device_component_spans[device.index()]
+                    .expect("island component device must have a component span");
+
+                assert!(
+                    component.partition().index() < span.len(),
+                    "island contains an out-of-range device component",
+                );
+
+                let component_index = self.component_index(component);
+
                 assert_eq!(
-                    self.device_island_map[device.index()],
+                    self.component_island_map[component_index],
                     Some(island_id),
-                    "device -> island map disagrees with IslandTopology::devices"
+                    "component -> island map disagrees with IslandTopology::components",
                 );
 
                 assert!(
-                    !seen_devices[device.index()],
-                    "device appears in more than one island"
+                    !seen_components[component_index],
+                    "device component appears in more than one island",
                 );
 
-                seen_devices[device.index()] = true;
+                seen_components[component_index] = true;
             }
         }
 
-        for (index, slot) in network.devices().iter().enumerate() {
+        for (device_index, slot) in network.devices().iter().enumerate() {
             match slot {
                 Some(_) => {
-                    assert!(
-                        seen_devices[index],
-                        "live device is missing from derived islands"
-                    );
+                    let span = self.device_component_spans[device_index]
+                        .expect("live device must have a component span");
 
-                    let island_id = self.device_island_map[index]
-                        .expect("live device must have a derived IslandId");
+                    let end = span
+                        .start()
+                        .checked_add(span.len())
+                        .expect("device component index overflow");
 
-                    assert!(
-                        self.islands.get(island_id).is_some(),
-                        "live device references a retired IslandId"
-                    );
+                    for component_index in span.start()..end {
+                        assert!(
+                            seen_components[component_index],
+                            "live device component is missing from derived islands",
+                        );
+
+                        let island_id = self.component_island_map[component_index]
+                            .expect("live device component must have a derived IslandId");
+
+                        assert!(
+                            self.islands.get(island_id).is_some(),
+                            "live device component references a retired IslandId",
+                        );
+                    }
                 }
 
                 None => {
                     assert_eq!(
-                        self.device_island_map[index], None,
-                        "removed device still has a derived IslandId"
+                        self.device_component_spans[device_index], None,
+                        "removed device still has a component span",
                     );
                 }
+            }
+        }
+
+        for (component_index, island) in self.component_island_map.iter().enumerate() {
+            if island.is_some() {
+                assert!(
+                    seen_components[component_index],
+                    "component -> island map contains an orphaned live entry",
+                );
             }
         }
     }
@@ -332,128 +290,177 @@ impl DerivedTopology {
         );
     }
 
-    fn assert_island_partition_matches_network(&self, network: &Network) {
+    fn assert_island_partition_matches_network(
+        &self,
+        definitions: &DefinitionRegistry,
+        network: &Network,
+    ) {
         let mut visited_wires = vec![false; network.wires().len()];
-        let mut visited_devices = vec![false; network.devices().len()];
+        let mut visited_components = vec![false; self.component_island_map.len()];
         let mut seen_islands = vec![false; self.islands.slot_count()];
         let mut stack = Vec::new();
-        let mut component_count = 0usize;
+        let mut connected_component_count = 0usize;
 
-        for (index, slot) in network.devices().iter().enumerate() {
-            if slot.is_none() || visited_devices[index] {
+        for (device_index, slot) in network.devices().iter().enumerate() {
+            if slot.is_none() {
                 continue;
             }
 
-            let device = device_id(index);
+            let device = device_id(device_index);
 
-            let expected_island =
-                self.device_island_map[index].expect("live device must have a derived IslandId");
+            let span = self.device_component_spans[device_index]
+                .expect("live device must have a component span");
 
-            assert!(
-                self.islands.get(expected_island).is_some(),
-                "device references a retired IslandId"
-            );
+            for partition_index in 0..span.len() {
+                let flat_index = span
+                    .start()
+                    .checked_add(partition_index)
+                    .expect("device component index overflow");
 
-            assert!(
-                !seen_islands[expected_island.index()],
-                "one IslandId represents multiple disconnected primitive components"
-            );
+                if visited_components[flat_index] {
+                    continue;
+                }
 
-            seen_islands[expected_island.index()] = true;
-            component_count += 1;
+                let partition = DevicePartitionId::new(
+                    u16::try_from(partition_index)
+                        .expect("device partition index must fit DevicePartitionId"),
+                );
 
-            visited_devices[index] = true;
+                let component = DeviceComponent::new(device, partition);
 
-            stack.push(
-                PrimitiveVertex::try_from(device)
-                    .expect("DeviceId must fit the packed 31-bit vertex representation"),
-            );
+                let expected_island = self.component_island_map[flat_index]
+                    .expect("live component must have a derived IslandId");
 
-            while let Some(vertex) = stack.pop() {
-                match vertex.vertex_type() {
-                    PrimitiveVertexType::Wire => {
-                        let wire = vertex.as_wire().expect("wire vertex must decode as WireId");
+                assert!(
+                    self.islands.get(expected_island).is_some(),
+                    "component references a retired IslandId"
+                );
 
-                        let net_id = self.wire_net_map[wire.index()]
-                            .expect("live wire must have a derived NetId");
+                assert!(
+                    !seen_islands[expected_island.index()],
+                    "one IslandId represents multiple disconnected electrical components"
+                );
 
-                        assert!(
-                            self.nets.get(net_id).is_some(),
-                            "wire reachable from a device references a retired NetId"
-                        );
+                seen_islands[expected_island.index()] = true;
+                connected_component_count += 1;
 
-                        assert_eq!(
-                            self.net_island_map[net_id.index()],
-                            Some(expected_island),
-                            "net reachable from a device belongs to the wrong island"
-                        );
+                visited_components[flat_index] = true;
+                stack.push(PrimitiveVertex::Component(component));
 
-                        for connection in network
-                            .wire_connections(wire)
-                            .expect("visited wire must exist")
-                        {
-                            if let Some(neighbor) = connection.as_wire() {
-                                if !visited_wires[neighbor.index()] {
-                                    visited_wires[neighbor.index()] = true;
+                while let Some(vertex) = stack.pop() {
+                    match vertex {
+                        PrimitiveVertex::Wire(wire) => {
+                            let net_id = self.wire_net_map[wire.index()]
+                                .expect("live wire must have a derived NetId");
 
-                                    stack.push(PrimitiveVertex::try_from(neighbor).expect(
-                                        "WireId must fit the packed 31-bit vertex representation",
-                                    ));
+                            assert!(
+                                self.nets.get(net_id).is_some(),
+                                "wire reachable from a component references a retired NetId"
+                            );
+
+                            assert_eq!(
+                                self.net_island_map[net_id.index()],
+                                Some(expected_island),
+                                "net reachable from a component belongs to the wrong island"
+                            );
+
+                            for connection in network
+                                .wire_connections(wire)
+                                .expect("visited wire must exist")
+                            {
+                                if let Some(neighbor) = connection.as_wire() {
+                                    if !visited_wires[neighbor.index()] {
+                                        visited_wires[neighbor.index()] = true;
+                                        stack.push(PrimitiveVertex::Wire(neighbor));
+                                    }
+
+                                    continue;
                                 }
 
-                                continue;
-                            }
+                                if let Some((neighbor_device, neighbor_terminal)) =
+                                    connection.as_terminal()
+                                {
+                                    let neighbor = terminal_component(
+                                        definitions,
+                                        network,
+                                        neighbor_device,
+                                        neighbor_terminal,
+                                    );
 
-                            if let Some((neighbor, _)) = connection.as_terminal()
-                                && !visited_devices[neighbor.index()]
-                            {
-                                visited_devices[neighbor.index()] = true;
+                                    let neighbor_index = self.component_index(neighbor);
 
-                                stack.push(PrimitiveVertex::try_from(neighbor).expect(
-                                    "DeviceId must fit the packed 31-bit vertex representation",
-                                ));
+                                    if !visited_components[neighbor_index] {
+                                        visited_components[neighbor_index] = true;
+                                        stack.push(PrimitiveVertex::Component(neighbor));
+                                    }
+                                }
                             }
                         }
-                    }
 
-                    PrimitiveVertexType::Device => {
-                        let current = vertex
-                            .as_device()
-                            .expect("device vertex must decode as DeviceId");
+                        PrimitiveVertex::Component(component) => {
+                            let component_index = self.component_index(component);
 
-                        assert_eq!(
-                            self.device_island_map[current.index()],
-                            Some(expected_island),
-                            "connected devices disagree on IslandId"
-                        );
+                            assert_eq!(
+                                self.component_island_map[component_index],
+                                Some(expected_island),
+                                "connected components disagree on IslandId"
+                            );
 
-                        let device_slot = network
-                            .devices()
-                            .get(current.index())
-                            .and_then(Option::as_ref)
-                            .expect("visited device must exist");
+                            let device = component.device();
 
-                        for connection in device_slot.terminals().iter().flatten().copied() {
-                            if let Some(wire) = connection.as_wire()
-                                && !visited_wires[wire.index()]
+                            let device_slot = network
+                                .devices()
+                                .get(device.index())
+                                .and_then(Option::as_ref)
+                                .expect("visited component device must exist");
+
+                            let definition_id = network
+                                .device_definition_id(device)
+                                .expect("visited component device must have a definition");
+
+                            let definition = definitions
+                                .get(definition_id)
+                                .expect("visited component definition must remain registered");
+
+                            for (terminal_index, connection) in
+                                device_slot.terminals().iter().enumerate()
                             {
-                                visited_wires[wire.index()] = true;
+                                if definition.terminal_partitions()[terminal_index]
+                                    != component.partition()
+                                {
+                                    continue;
+                                }
 
-                                stack.push(PrimitiveVertex::try_from(wire).expect(
-                                    "WireId must fit the packed 31-bit vertex representation",
-                                ));
+                                let Some(connection) = *connection else {
+                                    continue;
+                                };
 
-                                continue;
-                            }
+                                if let Some(wire) = connection.as_wire() {
+                                    if !visited_wires[wire.index()] {
+                                        visited_wires[wire.index()] = true;
+                                        stack.push(PrimitiveVertex::Wire(wire));
+                                    }
 
-                            if let Some((neighbor, _)) = connection.as_terminal()
-                                && !visited_devices[neighbor.index()]
-                            {
-                                visited_devices[neighbor.index()] = true;
+                                    continue;
+                                }
 
-                                stack.push(PrimitiveVertex::try_from(neighbor).expect(
-                                    "DeviceId must fit the packed 31-bit vertex representation",
-                                ));
+                                if let Some((neighbor_device, neighbor_terminal)) =
+                                    connection.as_terminal()
+                                {
+                                    let neighbor = terminal_component(
+                                        definitions,
+                                        network,
+                                        neighbor_device,
+                                        neighbor_terminal,
+                                    );
+
+                                    let neighbor_index = self.component_index(neighbor);
+
+                                    if !visited_components[neighbor_index] {
+                                        visited_components[neighbor_index] = true;
+                                        stack.push(PrimitiveVertex::Component(neighbor));
+                                    }
+                                }
                             }
                         }
                     }
@@ -476,14 +483,14 @@ impl DerivedTopology {
             assert_eq!(
                 self.net_island_map[net_id.index()],
                 None,
-                "wire component with no reachable device must be islandless"
+                "wire component with no reachable device component must be islandless"
             );
         }
 
         assert_eq!(
-            component_count,
+            connected_component_count,
             self.islands.len(),
-            "derived island count differs from primitive connected components containing devices"
+            "derived island count differs from electrical connected-component count"
         );
     }
 }

@@ -159,33 +159,33 @@ impl Engine {
                 world.add_wire(wire)?;
             }
             WorldCommand::RemoveWire { wire } => {
-                world.remove_wire(wire)?;
+                world.remove_wire(definitions, wire)?;
             }
             WorldCommand::ConnectWires { wire_a, wire_b } => {
-                world.connect_wires(wire_a, wire_b)?;
+                world.connect_wires(definitions, wire_a, wire_b)?;
             }
             WorldCommand::DisconnectWires { wire_a, wire_b } => {
-                world.disconnect_wires(wire_a, wire_b)?;
+                world.disconnect_wires(definitions, wire_a, wire_b)?;
             }
             WorldCommand::AddDevice { device, definition } => {
                 world.add_device(definitions, device, definition)?;
             }
             WorldCommand::RemoveDevice { device } => {
-                world.remove_device(device)?;
+                world.remove_device(definitions, device)?;
             }
             WorldCommand::AttachTerminal {
                 wire,
                 device,
                 terminal,
             } => {
-                world.attach_terminal(wire, device, terminal)?;
+                world.attach_terminal(definitions, wire, device, terminal)?;
             }
             WorldCommand::DetachTerminal {
                 wire,
                 device,
                 terminal,
             } => {
-                world.detach_terminal(wire, device, terminal)?;
+                world.detach_terminal(definitions, wire, device, terminal)?;
             }
             WorldCommand::SetDeviceParameter {
                 device,
@@ -226,43 +226,54 @@ impl World {
     pub fn add_wire(&mut self, wire: WireId) -> Result<(), NetworkModelError> {
         self.network.add_wire(wire)?;
         self.derived_topology.add_wire(wire);
-        self.debug_validate_topology();
+
         Ok(())
     }
 
-    pub fn remove_wire(&mut self, wire: WireId) -> Result<(), NetworkModelError> {
+    pub fn remove_wire(
+        &mut self,
+        definitions: &DefinitionRegistry,
+        wire: WireId,
+    ) -> Result<(), NetworkModelError> {
         self.network.remove_wire(wire)?;
-        self.derived_topology
-            .remove_wire(&self.network, &mut self.topology_scratch, wire);
-        self.debug_validate_topology();
+        self.derived_topology.remove_wire(
+            definitions,
+            &self.network,
+            &mut self.topology_scratch,
+            wire,
+        );
+
         Ok(())
     }
 
     pub fn connect_wires(
         &mut self,
+        definitions: &DefinitionRegistry,
         wire_a: WireId,
         wire_b: WireId,
     ) -> Result<(), NetworkModelError> {
         self.network.connect_wires(wire_a, wire_b)?;
         self.derived_topology
-            .connect_wires(&self.network, wire_a, wire_b);
-        self.debug_validate_topology();
+            .connect_wires(definitions, &self.network, wire_a, wire_b);
+
         Ok(())
     }
 
     pub fn disconnect_wires(
         &mut self,
+        definitions: &DefinitionRegistry,
         wire_a: WireId,
         wire_b: WireId,
     ) -> Result<(), NetworkModelError> {
         self.network.disconnect_wires(wire_a, wire_b)?;
         self.derived_topology.disconnect_wires(
+            definitions,
             &self.network,
             &mut self.topology_scratch,
             wire_a,
             wire_b,
         );
-        self.debug_validate_topology();
+
         Ok(())
     }
 
@@ -273,54 +284,69 @@ impl World {
         definition: DefinitionId,
     ) -> Result<(), NetworkModelError> {
         self.network.add_device(definitions, device, definition)?;
-        self.derived_topology.add_device(device);
-        self.debug_validate_topology();
+
+        let definition = definitions
+            .get(definition)
+            .expect("successfully added device definition must remain registered");
+
+        self.derived_topology.add_device(device, definition);
+
         Ok(())
     }
 
-    pub fn remove_device(&mut self, device: DeviceId) -> Result<(), NetworkModelError> {
+    pub fn remove_device(
+        &mut self,
+        definitions: &DefinitionRegistry,
+        device: DeviceId,
+    ) -> Result<(), NetworkModelError> {
         let affected_nets = self.derived_topology.device_nets(&self.network, device);
 
         self.network.remove_device(device)?;
 
         self.derived_topology.remove_device(
+            definitions,
             &self.network,
             &mut self.topology_scratch,
             device,
             &affected_nets,
         );
 
-        self.debug_validate_topology();
         Ok(())
     }
 
     pub fn attach_terminal(
         &mut self,
+        definitions: &DefinitionRegistry,
         wire: WireId,
         device: DeviceId,
         terminal: TerminalId,
     ) -> Result<(), NetworkModelError> {
         self.network.attach_terminal(wire, device, terminal)?;
+
         self.derived_topology
-            .attach_terminal(&self.network, wire, device);
-        self.debug_validate_topology();
+            .attach_terminal(definitions, &self.network, wire, device, terminal);
+
         Ok(())
     }
 
     pub fn detach_terminal(
         &mut self,
+
+        definitions: &DefinitionRegistry,
         wire: WireId,
         device: DeviceId,
         terminal: TerminalId,
     ) -> Result<(), NetworkModelError> {
         self.network.detach_terminal(wire, device, terminal)?;
         self.derived_topology.detach_terminal(
+            definitions,
             &self.network,
             &mut self.topology_scratch,
             wire,
             device,
+            terminal,
         );
-        self.debug_validate_topology();
+
         Ok(())
     }
 
@@ -341,16 +367,18 @@ impl World {
     }
 
     #[inline]
-    fn debug_validate_topology(&self) {
+    fn debug_validate_topology(&self, definitions: &DefinitionRegistry) {
         #[cfg(debug_assertions)]
-        self.derived_topology.assert_consistent(&self.network);
+        self.derived_topology
+            .assert_consistent(definitions, &self.network);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hynergy_model::device::definition::PrimitiveElementKind;
+    use crate::topology::DeviceComponent;
+    use hynergy_model::device::definition::{DevicePartitionId, PrimitiveElementKind};
     use hynergy_model::device::registry::DefinitionRegistry;
     use hynergy_model::parameter::{ParameterConstraintError, ParameterId};
 
@@ -376,37 +404,47 @@ mod tests {
 
         world.add_wire(a).unwrap();
         world.add_wire(b).unwrap();
-        world.connect_wires(a, b).unwrap();
+        world.connect_wires(&definitions, a, b).unwrap();
         world.add_device(&definitions, d, admittance()).unwrap();
-        world.attach_terminal(a, d, TerminalId::new(0)).unwrap();
-        world.detach_terminal(a, d, TerminalId::new(0)).unwrap();
-        world.disconnect_wires(a, b).unwrap();
-        world.remove_device(d).unwrap();
-        world.remove_wire(b).unwrap();
-        world.remove_wire(a).unwrap();
+        world
+            .attach_terminal(&definitions, a, d, TerminalId::new(0))
+            .unwrap();
+        world
+            .detach_terminal(&definitions, a, d, TerminalId::new(0))
+            .unwrap();
+        world.disconnect_wires(&definitions, a, b).unwrap();
+        world.remove_device(&definitions, d).unwrap();
+        world.remove_wire(&definitions, b).unwrap();
+        world.remove_wire(&definitions, a).unwrap();
 
-        world.derived_topology.assert_consistent(&world.network);
+        world
+            .derived_topology
+            .assert_consistent(&definitions, &world.network);
     }
 
     #[test]
     fn failed_network_mutation_does_not_change_topology() {
+        let definitions = DefinitionRegistry::new();
+
         let mut world = World::default();
         let a = wire(1);
         let b = wire(2);
 
         world.add_wire(a).unwrap();
         world.add_wire(b).unwrap();
-        world.connect_wires(a, b).unwrap();
+        world.connect_wires(&definitions, a, b).unwrap();
 
         let before = world.derived_topology.clone();
 
         assert_eq!(
-            world.connect_wires(a, b),
+            world.connect_wires(&definitions, a, b),
             Err(NetworkModelError::AlreadyConnected)
         );
         assert_eq!(world.derived_topology, before);
 
-        world.derived_topology.assert_consistent(&world.network);
+        world
+            .derived_topology
+            .assert_consistent(&definitions, &world.network);
     }
 
     #[test]
@@ -417,7 +455,9 @@ mod tests {
 
         world.add_device(&definitions, d, admittance()).unwrap();
 
-        let island = world.derived_topology.device_island(d);
+        let component = DeviceComponent::new(d, DevicePartitionId::new(0));
+        let island = world.derived_topology.component_island(component);
+
         let revision = world.derived_topology.island(island).unwrap().revision();
 
         world.derived_topology.clear_invalidation();
@@ -470,7 +510,9 @@ mod tests {
     #[test]
     fn every_world_command_variant_dispatches() {
         let mut engine = Engine::new();
+        let definitions = DefinitionRegistry::new();
         let world = engine.new_world().unwrap();
+
         let a = wire(1);
         let b = wire(2);
         let d = device(1);
@@ -563,7 +605,9 @@ mod tests {
         assert!(world.network.wires().iter().all(Option::is_none));
         assert!(world.network.devices().iter().all(Option::is_none));
 
-        world.derived_topology.assert_consistent(&world.network);
+        world
+            .derived_topology
+            .assert_consistent(&definitions, &world.network);
     }
 
     #[test]

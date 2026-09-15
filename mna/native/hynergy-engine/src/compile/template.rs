@@ -963,7 +963,7 @@ mod tests {
     fn state_requires_exactly_one_next_state_producer() {
         let mut builder = DefinitionTemplateBuilder::new();
 
-        let state = builder.state().unwrap();
+        let _state = builder.state().unwrap();
 
         assert!(matches!(
             builder.finish(),
