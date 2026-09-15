@@ -1,5 +1,19 @@
+use crate::compile::UnknownRange;
 use hynergy_ir::{InputSlot, MatrixAdd, RhsAdd, ValueBuildError, ValueProgramBuilder, ValueSlot};
 use hynergy_mna::pattern::{MnaPattern, PatternBuilder, PatternError, UnknownIndex};
+use smallvec::SmallVec;
+
+#[derive(Debug)]
+pub(crate) struct BoundUnknowns {
+    values: SmallVec<[Option<UnknownIndex>; 4]>,
+}
+
+impl BoundUnknowns {
+    #[inline]
+    fn get(&self, local: LocalUnknownId) -> Option<UnknownIndex> {
+        self.values[local.index()]
+    }
+}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -71,6 +85,18 @@ enum LocalUnknownKind {
     BranchCurrent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalUnknownBinding {
+    Terminal(u32),
+    Allocated(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalUnknownInfo {
+    kind: LocalUnknownKind,
+    binding: LocalUnknownBinding,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LocalValueNode {
     Parameter(LocalParameterId),
@@ -135,12 +161,13 @@ pub(crate) enum DefinitionTemplateBuildError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionLinkError {
-    WrongUnknownBindingCount {
+    WrongTerminalBindingCount {
         expected: usize,
         actual: usize,
     },
-    RequiredUnknownBoundToReference {
-        local_unknown: usize,
+    WrongAllocatedUnknownCount {
+        expected: usize,
+        actual: usize,
     },
     Pattern(PatternError),
     Values(ValueBuildError),
@@ -166,13 +193,13 @@ impl From<ValueBuildError> for DefinitionLinkError {
 
 #[derive(Debug, Default)]
 pub(crate) struct DefinitionTemplateBuilder {
-    unknowns: Vec<LocalUnknownKind>,
-
+    unknowns: Vec<LocalUnknownInfo>,
     values: Vec<LocalValueInfo>,
     parameter_count: usize,
-
     matrix_terms: Vec<PendingMatrixTerm>,
     rhs_terms: Vec<LocalRhsTerm>,
+    terminal_count: usize,
+    allocated_unknown_count: usize,
 }
 
 impl DefinitionTemplateBuilder {
@@ -181,16 +208,32 @@ impl DefinitionTemplateBuilder {
         Self::default()
     }
 
-    pub(crate) fn voltage_unknown(
+    pub(crate) fn terminal_voltage(
         &mut self,
     ) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
-        self.allocate_unknown(LocalUnknownKind::Voltage)
+        let terminal = u32::try_from(self.terminal_count)
+            .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+
+        self.terminal_count += 1;
+
+        self.allocate_unknown(LocalUnknownInfo {
+            kind: LocalUnknownKind::Voltage,
+            binding: LocalUnknownBinding::Terminal(terminal),
+        })
     }
 
     pub(crate) fn branch_current_unknown(
         &mut self,
     ) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
-        self.allocate_unknown(LocalUnknownKind::BranchCurrent)
+        let allocated = u32::try_from(self.allocated_unknown_count)
+            .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+
+        self.allocated_unknown_count += 1;
+
+        self.allocate_unknown(LocalUnknownInfo {
+            kind: LocalUnknownKind::BranchCurrent,
+            binding: LocalUnknownBinding::Allocated(allocated),
+        })
     }
 
     pub(crate) fn parameter(&mut self) -> Result<LocalValueId, DefinitionTemplateBuildError> {
@@ -357,17 +400,19 @@ impl DefinitionTemplateBuilder {
             rhs_terms: self.rhs_terms.into_boxed_slice(),
 
             parameter_count: self.parameter_count,
+            terminal_count: self.terminal_count,
+            allocated_unknown_count: self.allocated_unknown_count,
         })
     }
 
     fn allocate_unknown(
         &mut self,
-        kind: LocalUnknownKind,
+        info: LocalUnknownInfo,
     ) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
         let index = u32::try_from(self.unknowns.len())
             .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
 
-        self.unknowns.push(kind);
+        self.unknowns.push(info);
 
         Ok(LocalUnknownId::new(index))
     }
@@ -428,43 +473,28 @@ enum LocalBinaryOp {
 
 #[derive(Debug)]
 pub(crate) struct CompiledDefinitionTemplate {
-    unknowns: Box<[LocalUnknownKind]>,
+    unknowns: Box<[LocalUnknownInfo]>,
     values: Box<[LocalValueInfo]>,
     matrix_entries: Box<[LocalMatrixEntry]>,
     matrix_terms: Box<[LocalMatrixTerm]>,
     rhs_terms: Box<[LocalRhsTerm]>,
     parameter_count: usize,
+    terminal_count: usize,
+    allocated_unknown_count: usize,
 }
 
 impl CompiledDefinitionTemplate {
-    #[inline]
-    pub(crate) fn unknown_count(&self) -> usize {
-        self.unknowns.len()
-    }
-
-    #[inline]
-    pub(crate) fn matrix_entry_count(&self) -> usize {
-        self.matrix_entries.len()
-    }
-
-    #[inline]
-    pub(crate) fn parameter_count(&self) -> usize {
-        self.parameter_count
-    }
-
     pub(crate) fn request_pattern(
         &self,
-        unknowns: &[Option<UnknownIndex>],
+        unknowns: &BoundUnknowns,
         pattern: &mut PatternBuilder,
     ) -> Result<(), DefinitionLinkError> {
-        self.validate_unknown_bindings(unknowns)?;
-
         for entry in &self.matrix_entries {
-            let Some(row) = unknowns[entry.row.index()] else {
+            let Some(row) = unknowns.get(entry.row) else {
                 continue;
             };
 
-            let Some(column) = unknowns[entry.column.index()] else {
+            let Some(column) = unknowns.get(entry.column) else {
                 continue;
             };
 
@@ -476,24 +506,22 @@ impl CompiledDefinitionTemplate {
 
     pub(crate) fn bind(
         &self,
-        unknowns: &[Option<UnknownIndex>],
+        unknowns: &BoundUnknowns,
         pattern: &MnaPattern,
         value_builder: &mut ValueProgramBuilder,
         matrix_ops: &mut Vec<MatrixAdd>,
         rhs_ops: &mut Vec<RhsAdd>,
     ) -> Result<BoundDefinitionInputs, DefinitionLinkError> {
-        self.validate_unknown_bindings(unknowns)?;
-
         let (values, parameters) = self.bind_values(value_builder)?;
 
         for term in &self.matrix_terms {
             let entry = self.matrix_entries[term.destination.index()];
 
-            let Some(row) = unknowns[entry.row.index()] else {
+            let Some(row) = unknowns.get(entry.row) else {
                 continue;
             };
 
-            let Some(column) = unknowns[entry.column.index()] else {
+            let Some(column) = unknowns.get(entry.column) else {
                 continue;
             };
 
@@ -509,7 +537,7 @@ impl CompiledDefinitionTemplate {
         }
 
         for term in &self.rhs_terms {
-            let Some(destination) = unknowns[term.destination.index()] else {
+            let Some(destination) = unknowns.get(term.destination) else {
                 continue;
             };
 
@@ -574,26 +602,67 @@ impl CompiledDefinitionTemplate {
         Ok((values, parameters))
     }
 
-    fn validate_unknown_bindings(
+    pub(crate) fn bind_unknowns(
         &self,
-        unknowns: &[Option<UnknownIndex>],
-    ) -> Result<(), DefinitionLinkError> {
-        if unknowns.len() != self.unknown_count() {
-            return Err(DefinitionLinkError::WrongUnknownBindingCount {
-                expected: self.unknown_count(),
-                actual: unknowns.len(),
+        terminals: &[Option<UnknownIndex>],
+        allocated: UnknownRange,
+    ) -> Result<BoundUnknowns, DefinitionLinkError> {
+        if terminals.len() != self.terminal_count {
+            return Err(DefinitionLinkError::WrongTerminalBindingCount {
+                expected: self.terminal_count,
+                actual: terminals.len(),
             });
         }
 
-        for (index, (&kind, binding)) in self.unknowns.iter().zip(unknowns).enumerate() {
-            if kind == LocalUnknownKind::BranchCurrent && binding.is_none() {
-                return Err(DefinitionLinkError::RequiredUnknownBoundToReference {
-                    local_unknown: index,
-                });
-            }
+        if allocated.len() != self.allocated_unknown_count {
+            return Err(DefinitionLinkError::WrongAllocatedUnknownCount {
+                expected: self.allocated_unknown_count,
+                actual: allocated.len(),
+            });
         }
 
-        Ok(())
+        let mut values = SmallVec::<[Option<UnknownIndex>; 4]>::with_capacity(self.unknowns.len());
+
+        values.resize(self.unknowns.len(), None);
+
+        for (local_index, info) in self.unknowns.iter().enumerate() {
+            values[local_index] = match info.binding {
+                LocalUnknownBinding::Terminal(terminal) => terminals[terminal as usize],
+
+                LocalUnknownBinding::Allocated(index) => Some(
+                    allocated
+                        .get(index as usize)
+                        .expect("allocated range length was validated"),
+                ),
+            };
+        }
+
+        Ok(BoundUnknowns { values })
+    }
+
+    #[inline]
+    pub(crate) fn unknown_count(&self) -> usize {
+        self.unknowns.len()
+    }
+
+    #[inline]
+    pub(crate) fn matrix_entry_count(&self) -> usize {
+        self.matrix_entries.len()
+    }
+
+    #[inline]
+    pub(crate) fn parameter_count(&self) -> usize {
+        self.parameter_count
+    }
+
+    #[inline]
+    pub(crate) const fn terminal_count(&self) -> usize {
+        self.terminal_count
+    }
+
+    #[inline]
+    pub(crate) const fn allocated_unknown_count(&self) -> usize {
+        self.allocated_unknown_count
     }
 }
 
@@ -676,7 +745,7 @@ fn canonicalize_rhs_terms(terms: &mut Vec<LocalRhsTerm>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hynergy_mna::pattern::PatternBuilder;
+    use crate::compile::unknown::UnknownAllocator;
 
     #[test]
     fn folds_constant_local_expressions_once() {
@@ -694,7 +763,7 @@ mod tests {
     fn canonicalizes_duplicate_local_matrix_terms() {
         let mut builder = DefinitionTemplateBuilder::new();
 
-        let node = builder.voltage_unknown().unwrap();
+        let node = builder.terminal_voltage().unwrap();
         let parameter = builder.parameter().unwrap();
 
         builder.add_matrix(node, node, parameter, 1.0);
@@ -709,18 +778,32 @@ mod tests {
     }
 
     #[test]
-    fn branch_current_cannot_bind_to_reference() {
+    fn allocated_unknown_is_bound_after_node_voltages() {
         let mut builder = DefinitionTemplateBuilder::new();
 
-        builder.branch_current_unknown().unwrap();
+        let terminal = builder.terminal_voltage().unwrap();
+
+        let branch = builder.branch_current_unknown().unwrap();
 
         let template = builder.finish().unwrap();
 
-        let mut pattern = PatternBuilder::new(0).unwrap();
+        assert_eq!(template.terminal_count(), 1);
+        assert_eq!(template.allocated_unknown_count(), 1);
 
-        assert_eq!(
-            template.request_pattern(&[None], &mut pattern,),
-            Err(DefinitionLinkError::RequiredUnknownBoundToReference { local_unknown: 0 },),
-        );
+        let node = UnknownIndex::new(0);
+
+        let mut allocator = UnknownAllocator::new(1).unwrap();
+
+        let allocated = allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let bound = template.bind_unknowns(&[Some(node)], allocated).unwrap();
+
+        assert_eq!(bound.get(terminal), Some(UnknownIndex::new(0)),);
+
+        assert_eq!(bound.get(branch), Some(UnknownIndex::new(1)),);
+
+        assert_eq!(allocator.dimension(), 2);
     }
 }
