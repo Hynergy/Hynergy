@@ -150,7 +150,7 @@ impl Network {
                 let terminal = TerminalId::from(endpoint.port());
                 let device = self.devices[endpoint.index()]
                     .as_mut()
-                    .expect("stored terminal connection should reference a valid device");
+                    .expect("stored terminal connection should reference a valid definition_id");
                 let current = Self::terminal_connection(device, terminal)
                     .expect("stored terminal connection should reference a valid terminal");
 
@@ -165,13 +165,18 @@ impl Network {
     }
 
     #[inline]
-    pub fn wires(&self) -> &[Option<WireSlot>] {
-        &self.wires
-    }
-
-    #[inline]
-    pub fn devices(&self) -> &[Option<DeviceSlot>] {
-        &self.devices
+    pub fn device_definition_id(
+        &self,
+        device: DeviceId,
+    ) -> Result<DefinitionId, NetworkModelError> {
+        self.devices
+            .get(device.index())
+            .and_then(Option::as_ref)
+            .map(DeviceSlot::definition_id)
+            .ok_or(NetworkModelError::IdNotAssigned {
+                ty: ConnectionType::Device,
+                id: device.id(),
+            })
     }
 
     #[inline]
@@ -184,6 +189,16 @@ impl Network {
                 ty: ConnectionType::Wire,
                 id: wire.id(),
             })
+    }
+
+    #[inline]
+    pub fn wires(&self) -> &[Option<WireSlot>] {
+        &self.wires
+    }
+
+    #[inline]
+    pub fn devices(&self) -> &[Option<DeviceSlot>] {
+        &self.devices
     }
 }
 

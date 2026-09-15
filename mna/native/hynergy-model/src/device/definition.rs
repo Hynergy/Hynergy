@@ -4,7 +4,7 @@ use hynergy_ids::{define_id, define_non_zero_id};
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 
-define_id!(TerminalId, TerminalPartitionId: u16);
+define_id!(TerminalId, DevicePartitionId: u16);
 define_non_zero_id!(DefinitionId, DeviceId);
 
 use crate::parameter::{Bound, ParameterConstraintError};
@@ -152,7 +152,7 @@ impl PrimitiveElementKind {
         }
     }
 
-    fn terminal_layout(&self) -> (SmallVec<[NodeId; 4]>, TerminalPartitionLayout) {
+    fn partition_layout(&self) -> (SmallVec<[NodeId; 4]>, DevicePartitionLayout) {
         let (terminals, partitions) = match self {
             Self::Resistance
             | Self::Conductance
@@ -179,14 +179,14 @@ impl PrimitiveElementKind {
             ),
         };
 
-        let partition_layout = TerminalPartitionLayout::try_new(partitions)
+        let partition_layout = DevicePartitionLayout::try_new(partitions)
             .expect("primitive terminal partitions must be canonical");
 
         (terminals, partition_layout)
     }
 
     pub(crate) fn definition(self) -> DeviceDefinition {
-        let (terminals, terminal_partition_layout) = self.terminal_layout();
+        let (terminals, terminal_partition_layout) = self.partition_layout();
 
         let param_constraints = (0..self.parameter_count())
             .map(|index| {
@@ -295,7 +295,7 @@ pub struct DeviceDefinition {
     body: DeviceBody,
     terminals: SmallVec<[NodeId; 4]>,
     param_constraints: SmallVec<[ParameterConstraints; 1]>,
-    terminal_partition_layout: TerminalPartitionLayout,
+    partition_layout: DevicePartitionLayout,
     state_count: usize,
 }
 
@@ -304,13 +304,13 @@ impl DeviceDefinition {
         kind: PrimitiveElementKind,
         terminals: impl Into<SmallVec<[NodeId; 4]>>,
         param_constraints: impl Into<SmallVec<[ParameterConstraints; 1]>>,
-        terminal_partition_layout: TerminalPartitionLayout,
+        partition_layout: DevicePartitionLayout,
     ) -> Self {
         Self {
             body: DeviceBody::Primitive(kind),
             terminals: terminals.into(),
             param_constraints: param_constraints.into(),
-            terminal_partition_layout,
+            partition_layout,
             state_count: kind.state_count(),
         }
     }
@@ -319,14 +319,14 @@ impl DeviceDefinition {
         circuit: Circuit,
         terminals: impl Into<SmallVec<[NodeId; 4]>>,
         param_constraints: impl Into<SmallVec<[ParameterConstraints; 1]>>,
-        terminal_partition_layout: TerminalPartitionLayout,
+        partition_layout: DevicePartitionLayout,
         state_count: usize,
     ) -> Self {
         Self {
             body: DeviceBody::Composite(circuit),
             terminals: terminals.into(),
             param_constraints: param_constraints.into(),
-            terminal_partition_layout,
+            partition_layout,
             state_count,
         }
     }
@@ -347,36 +347,58 @@ impl DeviceDefinition {
     }
 
     #[inline]
-    pub fn terminal_partitions(&self) -> &[TerminalPartitionId] {
-        self.terminal_partition_layout.partitions()
-    }
-
-    #[inline]
-    pub fn terminal_partition_count(&self) -> usize {
-        self.terminal_partition_layout.partition_count()
-    }
-
-    #[inline]
     pub const fn state_count(&self) -> usize {
         self.state_count
+    }
+    #[inline]
+    pub fn terminal_partitions(&self) -> &[DevicePartitionId] {
+        self.partition_layout.terminal_partitions()
+    }
+
+    #[inline]
+    pub fn element_partitions(&self) -> &[DevicePartitionId] {
+        self.partition_layout.element_partitions()
+    }
+
+    #[inline]
+    pub fn partition_count(&self) -> usize {
+        self.partition_layout.partition_count()
+    }
+
+    #[inline]
+    pub(crate) fn exposed_partition_count(&self) -> usize {
+        self.partition_layout.exposed_partition_count()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TerminalPartitionLayout {
-    partitions: SmallVec<[TerminalPartitionId; 4]>,
+pub(crate) struct DevicePartitionLayout {
+    terminal_partitions: SmallVec<[DevicePartitionId; 4]>,
+    element_partitions: SmallVec<[DevicePartitionId; 4]>,
     partition_count: usize,
 }
 
-impl TerminalPartitionLayout {
+impl DevicePartitionLayout {
     pub(crate) fn try_new(
-        partitions: impl Into<SmallVec<[TerminalPartitionId; 4]>>,
+        terminal_partitions: impl Into<SmallVec<[DevicePartitionId; 4]>>,
     ) -> Option<Self> {
-        let partitions = partitions.into();
+        let terminal_partitions = terminal_partitions.into();
+        let partition_count = Self::canonical_exposed_partition_count(&terminal_partitions)?;
 
+        Some(Self {
+            terminal_partitions,
+            element_partitions: SmallVec::new(),
+            partition_count,
+        })
+    }
+
+    #[inline]
+    fn canonical_exposed_partition_count(
+        terminal_partitions: &[DevicePartitionId],
+    ) -> Option<usize> {
         let mut next_partition = 0usize;
 
-        for &partition in &partitions {
+        for &partition in terminal_partitions {
             let index = partition.index();
 
             if index > next_partition {
@@ -388,36 +410,73 @@ impl TerminalPartitionLayout {
             }
         }
 
-        Some(Self {
-            partitions,
-            partition_count: next_partition,
-        })
+        Some(next_partition)
     }
 
-    #[inline]
-    pub(crate) fn from_canonical_parts(
-        partitions: SmallVec<[TerminalPartitionId; 4]>,
+    pub(crate) fn from_derived_parts(
+        terminal_partitions: SmallVec<[DevicePartitionId; 4]>,
+        element_partitions: SmallVec<[DevicePartitionId; 4]>,
         partition_count: usize,
     ) -> Self {
-        debug_assert_eq!(
-            Self::try_new(partitions.clone()).map(|layout| layout.partition_count),
-            Some(partition_count),
+        debug_assert!(
+            partition_count <= u16::MAX as usize + 1,
+            "device partition count exceeds DevicePartitionId range",
         );
 
+        debug_assert!(
+            Self::canonical_exposed_partition_count(&terminal_partitions).is_some(),
+            "terminal partition IDs must be canonical",
+        );
+
+        debug_assert!(
+            terminal_partitions
+                .iter()
+                .chain(&element_partitions)
+                .all(|partition| partition.index() < partition_count),
+            "partition mapping contains an out of range partition",
+        );
+
+        #[cfg(debug_assertions)]
+        {
+            let mut seen = vec![false; partition_count];
+
+            for &partition in terminal_partitions.iter().chain(&element_partitions) {
+                seen[partition.index()] = true;
+            }
+
+            debug_assert!(
+                seen.into_iter().all(|seen| seen),
+                "every device partition must be represented",
+            );
+        }
+
         Self {
-            partitions,
+            terminal_partitions,
+            element_partitions,
             partition_count,
         }
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn partitions(&self) -> &[TerminalPartitionId] {
-        &self.partitions
+    pub fn terminal_partitions(&self) -> &[DevicePartitionId] {
+        &self.terminal_partitions
     }
 
     #[inline]
-    #[allow(dead_code)]
+    pub fn element_partitions(&self) -> &[DevicePartitionId] {
+        &self.element_partitions
+    }
+
+    #[inline]
+    pub fn exposed_partition_count(&self) -> usize {
+        self.terminal_partitions
+            .iter()
+            .map(|partition| partition.index() + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[inline]
     pub const fn partition_count(&self) -> usize {
         self.partition_count
     }
@@ -577,10 +636,10 @@ mod tests {
         for partitions in valid {
             let partitions = partitions
                 .into_iter()
-                .map(TerminalPartitionId::new)
-                .collect::<SmallVec<[TerminalPartitionId; 4]>>();
+                .map(DevicePartitionId::new)
+                .collect::<SmallVec<[DevicePartitionId; 4]>>();
 
-            assert!(TerminalPartitionLayout::try_new(partitions).is_some());
+            assert!(DevicePartitionLayout::try_new(partitions).is_some());
         }
 
         let invalid = [vec![1], vec![0, 2], vec![0, 1, 3], vec![0, 2, 1]];
@@ -588,31 +647,31 @@ mod tests {
         for partitions in invalid {
             let partitions = partitions
                 .into_iter()
-                .map(TerminalPartitionId::new)
-                .collect::<SmallVec<[TerminalPartitionId; 4]>>();
+                .map(DevicePartitionId::new)
+                .collect::<SmallVec<[DevicePartitionId; 4]>>();
 
-            assert!(TerminalPartitionLayout::try_new(partitions).is_none());
+            assert!(DevicePartitionLayout::try_new(partitions).is_none());
         }
     }
 
     #[test]
     fn terminal_partition_layout_tracks_partition_count() {
-        let layout = TerminalPartitionLayout::try_new(smallvec![
-            TerminalPartitionId::new(0),
-            TerminalPartitionId::new(1),
-            TerminalPartitionId::new(0),
-            TerminalPartitionId::new(2),
+        let layout = DevicePartitionLayout::try_new(smallvec![
+            DevicePartitionId::new(0),
+            DevicePartitionId::new(1),
+            DevicePartitionId::new(0),
+            DevicePartitionId::new(2),
         ])
         .unwrap();
 
         assert_eq!(layout.partition_count(), 3);
         assert_eq!(
-            layout.partitions(),
+            layout.terminal_partitions(),
             &[
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(1),
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(2),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(1),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(2),
             ]
         );
     }

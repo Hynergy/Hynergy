@@ -43,7 +43,7 @@ pub enum DefinitionRegistrationCode {
     DisconnectedInternalComponent = 32,
     IncompatibleParameterConstraints = 33,
     UnusedParameter = 34,
-    TerminalPartitionIdExhausted = 35,
+    DevicePartitionIdExhausted = 35,
     StateCountExhausted = 36,
 
     InternalPanic = u32::MAX,
@@ -259,8 +259,8 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
         DefinitionRegistrationErrorKind::UnusedParameter => {
             DefinitionRegistrationCode::UnusedParameter
         }
-        DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted => {
-            DefinitionRegistrationCode::TerminalPartitionIdExhausted
+        DefinitionRegistrationErrorKind::DevicePartitionIdExhausted => {
+            DefinitionRegistrationCode::DevicePartitionIdExhausted
         }
         DefinitionRegistrationErrorKind::StateCountExhausted => {
             DefinitionRegistrationCode::StateCountExhausted
@@ -875,7 +875,7 @@ mod tests {
             DisconnectedInternalComponent = 32,
             IncompatibleParameterConstraints = 33,
             UnusedParameter = 34,
-            TerminalPartitionIdExhausted = 35,
+            DevicePartitionIdExhausted = 35,
 
             InternalPanic = u32::MAX,
         });

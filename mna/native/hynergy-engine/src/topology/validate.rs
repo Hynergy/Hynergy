@@ -167,7 +167,8 @@ impl DerivedTopology {
             actual_terminal_devices.sort_unstable_by_key(|device| device.index());
 
             assert_eq!(
-                actual_terminal_devices, expected_terminal_devices,
+                actual_terminal_devices.as_slice(),
+                expected_terminal_devices.as_slice(),
                 "Net terminal incidence disagrees with Network wire connections"
             );
 

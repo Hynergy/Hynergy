@@ -991,15 +991,10 @@ mod tests {
         let mut builder = DefinitionTemplateBuilder::new();
 
         let terminal = builder.terminal_voltage().unwrap();
-
         let previous = builder.state().unwrap();
-
         let timestep = builder.timestep().unwrap();
-
         let voltage = builder.unknown_value(terminal).unwrap();
-
         let history_plus_dt = builder.add(previous.value(), timestep).unwrap();
-
         let next = builder.add(history_plus_dt, voltage).unwrap();
 
         builder.write_state(previous, next).unwrap();
@@ -1023,7 +1018,6 @@ mod tests {
         let mut state_allocator = StateAllocator::new();
 
         let states = state_allocator.allocate(template.state_count()).unwrap();
-
         let pattern = PatternBuilder::new(1).unwrap().finish().unwrap();
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
@@ -1037,20 +1031,13 @@ mod tests {
         assert_eq!(ir.state_inputs().len(), 1,);
 
         let timestep_input = ir.timestep_input().unwrap();
-
         let state_input = ir.state_inputs()[0].1;
-
         let solution_input = ir.solution_inputs()[0].1;
 
         let mut workspace = ir.value_program().new_workspace();
 
-        // dt = 0.5
         workspace.set_input(timestep_input, 0.5);
-
-        // previous state = 2
         workspace.set_input(state_input, 2.0);
-
-        // solved voltage = 3
         workspace.set_input(solution_input, 3.0);
 
         ir.value_program().execute_static(&mut workspace);

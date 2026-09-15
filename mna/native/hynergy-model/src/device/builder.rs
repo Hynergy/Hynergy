@@ -1,7 +1,7 @@
 use crate::circuit::{Circuit, Element, ElementId, NodeId, ValueRef};
 use crate::device::definition::{
-    DefinitionId, DeviceBody, DeviceDefinition, PrimitiveParameterError, TerminalPartitionId,
-    TerminalPartitionLayout,
+    DefinitionId, DeviceBody, DeviceDefinition, DevicePartitionId, DevicePartitionLayout,
+    PrimitiveParameterError,
 };
 use crate::device::registry::DefinitionRegistry;
 use crate::parameter::{ParameterConstraintError, ParameterConstraints, ParameterId};
@@ -72,12 +72,6 @@ pub enum DeviceDefinitionBuilderError {
     #[error("internal node {node:?} is unused")]
     UnusedInternalNode { node: NodeId },
 
-    #[error(
-        "instantaneous internal circuit containing node {node:?} \
-         is not connected to any exposed terminal"
-    )]
-    InternalComponentWithoutTerminal { node: NodeId },
-
     #[error("exhausted NodeId range")]
     NodeIdExhausted,
 
@@ -100,8 +94,8 @@ pub enum DeviceDefinitionBuilderError {
     #[error("definition parameter {parameter:?} is unused")]
     UnusedParameter { parameter: ParameterId },
 
-    #[error("exhausted TerminalPartitionId range")]
-    TerminalPartitionIdExhausted,
+    #[error("DevicePartitionId range is exhausted")]
+    DevicePartitionIdExhausted,
 
     #[error("definition state count exceeds the addressable state range")]
     StateCountExhausted,
@@ -290,25 +284,24 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         Ok(())
     }
 
-    #[inline]
     pub fn build_definition(self) -> Result<DeviceDefinition, DeviceDefinitionBuilderError> {
         self.validate_parameter_usage()?;
 
         let state_count = self.derive_state_count()?;
-        let terminal_partition_layout = self.derive_terminal_partition_layout()?;
+        let partition_layout = self.derive_partition_layout()?;
 
         Ok(DeviceDefinition::new_composite(
             Circuit::new(self.node_count, self.elements),
             self.terminals,
             self.param_constraints,
-            terminal_partition_layout,
+            partition_layout,
             state_count,
         ))
     }
 
-    fn derive_terminal_partition_layout(
+    fn derive_partition_layout(
         &self,
-    ) -> Result<TerminalPartitionLayout, DeviceDefinitionBuilderError> {
+    ) -> Result<DevicePartitionLayout, DeviceDefinitionBuilderError> {
         let node_count = self.node_count as usize;
 
         let mut union_find = UnionFind::new(node_count);
@@ -322,8 +315,10 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                 .get(element.definition())
                 .expect("elements are validated before insertion");
 
+            let exposed_partition_count = definition.exposed_partition_count();
+
             partition_anchors.clear();
-            partition_anchors.resize(definition.terminal_partition_count(), None);
+            partition_anchors.resize(exposed_partition_count, None);
 
             for (&node, &partition) in element
                 .terminals()
@@ -333,13 +328,15 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                 let node_index = node.index();
                 referenced[node_index] = true;
 
-                match &mut partition_anchors[partition.index()] {
+                let anchor = &mut partition_anchors[partition.index()];
+
+                match anchor {
                     Some(anchor) => {
                         union_find.union(node_index, *anchor);
                     }
 
-                    anchor => {
-                        *anchor = Some(node_index);
+                    slot => {
+                        *slot = Some(node_index);
                     }
                 }
             }
@@ -348,14 +345,7 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         let mut exposed_node = vec![false; node_count];
 
         for &terminal in &self.terminals {
-            exposed_node[terminal.id() as usize] = true;
-        }
-
-        let mut externally_reachable_component = vec![false; node_count];
-
-        for &terminal in &self.terminals {
-            let root = union_find.find(terminal.id() as usize);
-            externally_reachable_component[root] = true;
+            exposed_node[terminal.index()] = true;
         }
 
         for node_index in 0..node_count {
@@ -366,40 +356,21 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             }
         }
 
-        for (node_index, &is_referenced) in referenced.iter().enumerate() {
-            if !is_referenced {
-                continue;
-            }
-
-            let root = union_find.find(node_index);
-
-            if !externally_reachable_component[root] {
-                return Err(
-                    DeviceDefinitionBuilderError::InternalComponentWithoutTerminal {
-                        node: NodeId::new(node_index as u32),
-                    },
-                );
-            }
-        }
-
         let mut root_partitions = vec![None; node_count];
-        let mut terminal_partitions =
-            SmallVec::<[TerminalPartitionId; 4]>::with_capacity(self.terminals.len());
 
-        let mut next_partition = 0u32;
+        let mut terminal_partitions =
+            SmallVec::<[DevicePartitionId; 4]>::with_capacity(self.terminals.len());
+
+        let mut next_partition = 0usize;
 
         for &terminal in &self.terminals {
-            let root = union_find.find(terminal.id() as usize);
+            let root = union_find.find(terminal.index());
 
             let partition = match root_partitions[root] {
                 Some(partition) => partition,
 
                 None => {
-                    let raw = u16::try_from(next_partition)
-                        .map_err(|_| DeviceDefinitionBuilderError::TerminalPartitionIdExhausted)?;
-
-                    let partition = TerminalPartitionId::new(raw);
-                    next_partition += 1;
+                    let partition = allocate_partition(&mut next_partition)?;
 
                     root_partitions[root] = Some(partition);
 
@@ -410,9 +381,86 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             terminal_partitions.push(partition);
         }
 
-        Ok(TerminalPartitionLayout::from_canonical_parts(
+        for (node_index, &is_referenced) in referenced.iter().enumerate() {
+            if !is_referenced {
+                continue;
+            }
+
+            let root = union_find.find(node_index);
+
+            if root_partitions[root].is_some() {
+                continue;
+            }
+
+            let partition = allocate_partition(&mut next_partition)?;
+
+            root_partitions[root] = Some(partition);
+        }
+
+        let total_child_partition_count =
+            self.elements.iter().try_fold(0usize, |total, element| {
+                let definition = self
+                    .registry
+                    .get(element.definition())
+                    .expect("elements are validated before insertion");
+
+                total
+                    .checked_add(definition.partition_count())
+                    .ok_or(DeviceDefinitionBuilderError::DevicePartitionIdExhausted)
+            })?;
+
+        let mut element_partitions =
+            SmallVec::<[DevicePartitionId; 4]>::with_capacity(total_child_partition_count);
+
+        for element in &self.elements {
+            let definition = self
+                .registry
+                .get(element.definition())
+                .expect("elements are validated before insertion");
+
+            let exposed_partition_count = definition.exposed_partition_count();
+
+            debug_assert!(
+                exposed_partition_count <= definition.partition_count(),
+                "exposed partition count exceeds device partition count",
+            );
+
+            partition_anchors.clear();
+            partition_anchors.resize(exposed_partition_count, None);
+
+            for (&node, &partition) in element
+                .terminals()
+                .iter()
+                .zip(definition.terminal_partitions())
+            {
+                let anchor = &mut partition_anchors[partition.index()];
+
+                if anchor.is_none() {
+                    *anchor = Some(node.index());
+                }
+            }
+
+            for child_partition_index in 0..definition.partition_count() {
+                let parent_partition = if child_partition_index < exposed_partition_count {
+                    let node_index = partition_anchors[child_partition_index]
+                        .expect("every exposed child partition has a terminal");
+
+                    let root = union_find.find(node_index);
+
+                    root_partitions[root]
+                        .expect("every referenced node component has a parent partition")
+                } else {
+                    allocate_partition(&mut next_partition)?
+                };
+
+                element_partitions.push(parent_partition);
+            }
+        }
+
+        Ok(DevicePartitionLayout::from_derived_parts(
             terminal_partitions,
-            next_partition as usize,
+            element_partitions,
+            next_partition,
         ))
     }
 
@@ -456,6 +504,18 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                 .ok_or(DeviceDefinitionBuilderError::StateCountExhausted)
         })
     }
+}
+
+#[inline]
+fn allocate_partition(
+    next_partition: &mut usize,
+) -> Result<DevicePartitionId, DeviceDefinitionBuilderError> {
+    let raw = u16::try_from(*next_partition)
+        .map_err(|_| DeviceDefinitionBuilderError::DevicePartitionIdExhausted)?;
+
+    *next_partition += 1;
+
+    Ok(DevicePartitionId::new(raw))
 }
 
 struct UnionFind {
@@ -511,7 +571,7 @@ impl UnionFind {
 mod tests {
     use super::{DeviceDefinitionBuilder, DeviceDefinitionBuilderError};
     use crate::circuit::{Element, NodeId, ValueRef};
-    use crate::device::definition::{DefinitionId, PrimitiveElementKind, TerminalPartitionId};
+    use crate::device::definition::{DefinitionId, DevicePartitionId, PrimitiveElementKind};
     use crate::device::registry::DefinitionRegistry;
 
     use crate::parameter::{Bound, ParameterConstraintError, ParameterConstraints, ParameterId};
@@ -744,7 +804,7 @@ mod tests {
 
         assert_eq!(
             builder.build_definition(),
-            Err(DeviceDefinitionBuilderError::TerminalPartitionIdExhausted)
+            Err(DeviceDefinitionBuilderError::DevicePartitionIdExhausted)
         );
     }
 
@@ -778,9 +838,9 @@ mod tests {
         assert_eq!(
             definition.terminal_partitions(),
             &[
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(0),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(0),
             ]
         );
     }
@@ -813,10 +873,10 @@ mod tests {
         assert_eq!(
             definition.terminal_partitions(),
             &[
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(1),
-                TerminalPartitionId::new(1),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(1),
+                DevicePartitionId::new(1),
             ]
         );
     }
@@ -846,19 +906,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_internal_component_without_exposed_terminal() {
+    fn internal_component_without_terminal_becomes_hidden_partition() {
         let registry = DefinitionRegistry::new();
+        let resistance = DefinitionId::from(PrimitiveElementKind::Resistance);
+
         let mut builder = DeviceDefinitionBuilder::new(&registry);
 
-        let a = builder.add_terminal().unwrap();
-        let b = builder.add_terminal().unwrap();
-
+        let [a, b] = terminals(&mut builder);
         let internal_a = builder.add_node().unwrap();
         let internal_b = builder.add_node().unwrap();
 
         builder
             .add_element(Element::new(
-                DefinitionId::from(PrimitiveElementKind::Resistance),
+                resistance,
                 vec![a, b],
                 vec![ValueRef::Literal(1.0)],
             ))
@@ -866,20 +926,133 @@ mod tests {
 
         builder
             .add_element(Element::new(
-                DefinitionId::from(PrimitiveElementKind::Resistance),
+                resistance,
                 vec![internal_a, internal_b],
                 vec![ValueRef::Literal(1.0)],
             ))
             .unwrap();
 
-        assert!(matches!(
-            builder.build_definition(),
-            Err(
-                DeviceDefinitionBuilderError::InternalComponentWithoutTerminal {
-                    node
-                }
-            ) if node == internal_a
-        ));
+        let definition = builder.build_definition().unwrap();
+
+        assert_eq!(
+            definition.terminal_partitions(),
+            &[DevicePartitionId::new(0), DevicePartitionId::new(0),],
+        );
+
+        assert_eq!(
+            definition.element_partitions(),
+            &[DevicePartitionId::new(0), DevicePartitionId::new(1),],
+        );
+
+        assert_eq!(definition.partition_count(), 2);
+    }
+
+    #[test]
+    fn hidden_child_partition_is_preserved_by_parent_definition() {
+        let mut registry = DefinitionRegistry::new();
+
+        let resistance = DefinitionId::from(PrimitiveElementKind::Resistance);
+
+        let child = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let [a, b] = terminals(&mut builder);
+
+            let internal_a = builder.add_node().unwrap();
+            let internal_b = builder.add_node().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![a, b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![internal_a, internal_b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let child_id = registry.register(child).unwrap();
+
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        let [a, b] = terminals(&mut builder);
+
+        builder
+            .add_element(Element::new(child_id, vec![a, b], Vec::<ValueRef>::new()))
+            .unwrap();
+
+        let definition = builder.build_definition().unwrap();
+
+        assert_eq!(
+            definition.terminal_partitions(),
+            &[DevicePartitionId::new(0), DevicePartitionId::new(0),],
+        );
+
+        assert_eq!(definition.partition_count(), 2);
+    }
+
+    #[test]
+    fn hidden_partitions_of_child_instances_remain_distinct() {
+        let mut registry = DefinitionRegistry::new();
+
+        let resistance = DefinitionId::from(PrimitiveElementKind::Resistance);
+
+        let child = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let [a, b] = terminals(&mut builder);
+
+            let internal_a = builder.add_node().unwrap();
+            let internal_b = builder.add_node().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![a, b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![internal_a, internal_b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let child_id = registry.register(child).unwrap();
+
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        let [a, b] = terminals(&mut builder);
+
+        for _ in 0..2 {
+            builder
+                .add_element(Element::new(child_id, vec![a, b], Vec::<ValueRef>::new()))
+                .unwrap();
+        }
+
+        let definition = builder.build_definition().unwrap();
+
+        assert_eq!(
+            definition.terminal_partitions(),
+            &[DevicePartitionId::new(0), DevicePartitionId::new(0),],
+        );
+
+        assert_eq!(definition.partition_count(), 3);
     }
 
     #[test]
@@ -929,11 +1102,7 @@ mod tests {
                 _ => 1,
             };
 
-            assert_eq!(
-                definition.terminal_partition_count(),
-                expected_count,
-                "{kind:?}",
-            );
+            assert_eq!(definition.partition_count(), expected_count, "{kind:?}",);
         }
     }
 
@@ -964,9 +1133,9 @@ mod tests {
         assert_eq!(
             registry.get(child_id).unwrap().terminal_partitions(),
             &[
-                TerminalPartitionId::new(0),
-                TerminalPartitionId::new(1),
-                TerminalPartitionId::new(0),
+                DevicePartitionId::new(0),
+                DevicePartitionId::new(1),
+                DevicePartitionId::new(0),
             ]
         );
     }

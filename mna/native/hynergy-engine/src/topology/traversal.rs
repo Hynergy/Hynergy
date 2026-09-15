@@ -384,8 +384,8 @@ impl TraversalScratch {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct WireComponent {
-    pub(super) wires: Vec<WireId>,
-    pub(super) terminal_devices: Vec<DeviceId>,
+    pub(super) wires: SmallVec<[WireId; 4]>,
+    pub(super) terminal_devices: SmallVec<[DeviceId; 2]>,
 }
 
 #[cfg(test)]

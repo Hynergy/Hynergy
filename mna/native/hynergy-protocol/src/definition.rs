@@ -72,7 +72,7 @@ pub enum DefinitionRegistrationErrorKind {
     DisconnectedInternalComponent,
     IncompatibleParameterConstraints,
     UnusedParameter,
-    TerminalPartitionIdExhausted,
+    DevicePartitionIdExhausted,
     StateCountExhausted,
 }
 
@@ -493,10 +493,6 @@ fn map_builder_error(
             DefinitionRegistrationErrorKind::UnusedInternalNode
         }
 
-        DeviceDefinitionBuilderError::InternalComponentWithoutTerminal { .. } => {
-            DefinitionRegistrationErrorKind::DisconnectedInternalComponent
-        }
-
         DeviceDefinitionBuilderError::NodeIdExhausted => {
             DefinitionRegistrationErrorKind::NodeIdExhausted
         }
@@ -517,8 +513,8 @@ fn map_builder_error(
             DefinitionRegistrationErrorKind::UnusedParameter
         }
 
-        DeviceDefinitionBuilderError::TerminalPartitionIdExhausted => {
-            DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted
+        DeviceDefinitionBuilderError::DevicePartitionIdExhausted => {
+            DefinitionRegistrationErrorKind::DevicePartitionIdExhausted
         }
         DeviceDefinitionBuilderError::StateCountExhausted => {
             DefinitionRegistrationErrorKind::StateCountExhausted
@@ -1099,10 +1095,6 @@ mod tests {
                 DefinitionRegistrationErrorKind::UnusedInternalNode,
             ),
             (
-                DeviceDefinitionBuilderError::InternalComponentWithoutTerminal { node },
-                DefinitionRegistrationErrorKind::DisconnectedInternalComponent,
-            ),
-            (
                 DeviceDefinitionBuilderError::NodeIdExhausted,
                 DefinitionRegistrationErrorKind::NodeIdExhausted,
             ),
@@ -1127,8 +1119,8 @@ mod tests {
                 DefinitionRegistrationErrorKind::UnusedParameter,
             ),
             (
-                DeviceDefinitionBuilderError::TerminalPartitionIdExhausted,
-                DefinitionRegistrationErrorKind::TerminalPartitionIdExhausted,
+                DeviceDefinitionBuilderError::DevicePartitionIdExhausted,
+                DefinitionRegistrationErrorKind::DevicePartitionIdExhausted,
             ),
         ];
 

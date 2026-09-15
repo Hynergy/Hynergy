@@ -4,7 +4,8 @@ mod traversal;
 mod validate;
 
 use hynergy_ids::define_non_zero_id;
-use hynergy_model::device::definition::DeviceId;
+use hynergy_model::device::definition::{DeviceId, DevicePartitionId, TerminalId};
+use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{Network, WireId};
 use smallvec::{SmallVec, smallvec};
 use store::{DenseId, DenseIdStore};
@@ -46,6 +47,29 @@ impl DenseId for IslandId {
     #[inline]
     fn slot(self) -> usize {
         self.index()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DeviceComponent {
+    device: DeviceId,
+    partition: DevicePartitionId,
+}
+
+impl DeviceComponent {
+    #[inline]
+    pub(crate) const fn new(device: DeviceId, partition: DevicePartitionId) -> Self {
+        Self { device, partition }
+    }
+
+    #[inline]
+    pub(crate) const fn device(self) -> DeviceId {
+        self.device
+    }
+
+    #[inline]
+    pub(crate) const fn partition(self) -> DevicePartitionId {
+        self.partition
     }
 }
 
@@ -156,8 +180,8 @@ impl DerivedTopology {
         debug_assert!(self.wire_net_map[wire.index()].is_none());
 
         let net_id = self.nets.insert(Net {
-            wires: vec![wire],
-            terminal_devices: Vec::new(),
+            wires: smallvec![wire],
+            terminal_devices: SmallVec::new(),
         });
 
         debug_assert_eq!(net_id.index(), self.net_island_map.len());
@@ -332,7 +356,6 @@ impl DerivedTopology {
                 .position(|&member| member == device)
                 .expect("net must contain an incidence for the detached terminal");
 
-            // Multiplicity matters: remove exactly one attached terminal.
             net.terminal_devices.swap_remove(position);
         }
 
@@ -816,8 +839,8 @@ impl IslandTopology {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Net {
-    wires: Vec<WireId>,
-    terminal_devices: Vec<DeviceId>,
+    wires: SmallVec<[WireId; 4]>,
+    terminal_devices: SmallVec<[DeviceId; 2]>,
 }
 
 impl Net {
@@ -912,9 +935,35 @@ impl WorldInvalidation {
     }
 }
 
+// todo! remove #[cfg(test)] when this method will be used
+#[cfg(test)]
+#[inline]
+fn terminal_component(
+    definitions: &DefinitionRegistry,
+    network: &Network,
+    device: DeviceId,
+    terminal: TerminalId,
+) -> DeviceComponent {
+    let definition_id = network
+        .device_definition_id(device)
+        .expect("topology device must exist in Network");
+
+    let definition = definitions
+        .get(definition_id)
+        .expect("topology device definition must remain registered");
+
+    let partition = *definition
+        .terminal_partitions()
+        .get(terminal.index())
+        .expect("topology terminal must exist in its definition");
+
+    DeviceComponent::new(device, partition)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DerivedTopology, IslandId, NetId, TraversalScratch};
+    use super::*;
+    use hynergy_model::device::definition::DevicePartitionId;
     use hynergy_model::device::definition::{DeviceId, PrimitiveElementKind, TerminalId};
     use hynergy_model::device::registry::DefinitionRegistry;
     use hynergy_model::network::{Network, WireId};
@@ -1021,6 +1070,13 @@ mod tests {
         topology.assert_consistent(network);
 
         affected_nets
+    }
+
+    #[test]
+    fn device_component_stays_compact() {
+        use std::mem::size_of;
+
+        assert_eq!(size_of::<DeviceComponent>(), 8);
     }
 
     #[test]
@@ -1825,5 +1881,47 @@ mod tests {
         );
         assert_eq!(topology.invalidation().retired_islands(), &[retired]);
         assert!(topology.invalidation().numerical_dirty_islands().is_empty());
+    }
+
+    #[test]
+    fn device_component_round_trips_and_uses_option_niche() {
+        use std::mem::size_of;
+
+        let component = DeviceComponent::new(device(0x7fff_ffff), DevicePartitionId::new(u16::MAX));
+
+        assert_eq!(component.device(), device(0x7fff_ffff));
+        assert_eq!(component.partition(), DevicePartitionId::new(u16::MAX),);
+
+        assert_eq!(size_of::<DeviceComponent>(), 8);
+        assert_eq!(size_of::<Option<DeviceComponent>>(), 8);
+    }
+
+    #[test]
+    fn terminal_component_uses_definition_partition_layout() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let delay = device(1);
+
+        network
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        for (terminal, partition) in [(0, 0), (1, 0), (2, 1), (3, 1)] {
+            let component =
+                terminal_component(&definitions, &network, delay, TerminalId::new(terminal));
+
+            assert_eq!(component.device(), delay);
+            assert_eq!(component.partition(), DevicePartitionId::new(partition),);
+        }
+    }
+    #[test]
+    fn device_component_option_has_no_extra_storage() {
+        use std::mem::size_of;
+
+        assert_eq!(
+            size_of::<Option<DeviceComponent>>(),
+            size_of::<DeviceComponent>(),
+        );
     }
 }

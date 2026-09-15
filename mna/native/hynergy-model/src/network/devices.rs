@@ -75,7 +75,8 @@ impl Network {
             }
 
             let terminal = TerminalId::from(
-                u32::try_from(terminal_index).expect("device terminal count fits in TerminalId"),
+                u32::try_from(terminal_index)
+                    .expect("definition_id terminal count fits in TerminalId"),
             );
             let removed_ref = Self::terminal_ref(id, terminal)
                 .expect("stored terminal index fits packed connection");
@@ -94,12 +95,11 @@ impl Network {
         value: f64,
     ) -> Result<(), NetworkModelError> {
         let slot = Self::device_mut(&mut self.devices, device)?;
-        let definition =
-            definition_registry
-                .get(slot.device())
-                .ok_or(NetworkModelError::UnknownDefinition {
-                    definition: slot.device(),
-                })?;
+        let definition = definition_registry.get(slot.definition_id()).ok_or(
+            NetworkModelError::UnknownDefinition {
+                definition: slot.definition_id(),
+            },
+        )?;
         let constraints = definition
             .parameters()
             .get(parameter.index())

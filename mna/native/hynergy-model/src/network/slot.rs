@@ -56,7 +56,7 @@ impl DeviceSlot {
     }
 
     #[inline]
-    pub(super) fn device(&self) -> DefinitionId {
+    pub(super) fn definition_id(&self) -> DefinitionId {
         self.definition_id
     }
 
