@@ -464,6 +464,12 @@ impl World {
             .retired_islands()
             .to_vec();
 
+        let numerical_dirty = self
+            .derived_topology
+            .invalidation()
+            .numerical_dirty_islands()
+            .to_vec();
+
         for island in retired {
             if let Some(runtime) = self.island_runtimes.get_mut(island.index()) {
                 *runtime = None;
@@ -495,6 +501,17 @@ impl World {
             self.island_runtimes[island.index()] = Some(runtime);
         }
 
+        for island in numerical_dirty {
+            let Some(runtime) = self
+                .island_runtimes
+                .get_mut(island.index())
+                .and_then(Option::as_mut)
+            else {
+                continue;
+            };
+
+            runtime.mark_numerical_dirty();
+        }
         self.derived_topology.clear_invalidation();
 
         Ok(())
@@ -646,12 +663,26 @@ impl PhysicalStateStore {
                 return Err(PhysicalStateError::DuplicateWrite { state });
             }
 
-            let value = self
+            let exists = self
                 .devices
-                .get_mut(state.device().index())
-                .and_then(Option::as_mut)
-                .and_then(|values| values.get_mut(state.state().index()))
-                .ok_or(PhysicalStateError::StateNotInitialized { state })?;
+                .get(state.device().index())
+                .and_then(Option::as_ref)
+                .and_then(|values| values.get(state.state().index()))
+                .is_some();
+
+            if !exists {
+                return Err(PhysicalStateError::StateNotInitialized { state });
+            }
+        }
+
+        for write in writes {
+            let state = write.state();
+
+            let value = self.devices[state.device().index()]
+                .as_mut()
+                .expect("validated state device must remain initialized")
+                .get_mut(state.state().index())
+                .expect("validated state slot must remain initialized");
 
             *value = write.value();
         }
@@ -1028,7 +1059,6 @@ mod tests {
     #[test]
     fn tick_delay_state_initializes_once_from_parameter() {
         let definitions = DefinitionRegistry::new();
-
         let mut world = World::default();
 
         let delay = device(1);
@@ -1050,7 +1080,6 @@ mod tests {
 
         assert_eq!(world.physical_state.get(state), Some(4.25),);
 
-        // The parameter is only the initial value.
         world
             .set_device_parameter(&definitions, delay, ParameterId::new(0), 9.0)
             .unwrap();
@@ -1073,7 +1102,6 @@ mod tests {
     #[test]
     fn removing_device_removes_physical_state() {
         let definitions = DefinitionRegistry::new();
-
         let mut world = World::default();
 
         let capacitor = device(1);
@@ -1103,7 +1131,6 @@ mod tests {
     #[test]
     fn world_tick_delays_value_across_separate_islands() {
         let definitions = DefinitionRegistry::new();
-
         let mut world = World::default();
 
         let input_negative = wire(1);
@@ -1195,7 +1222,6 @@ mod tests {
         assert_ne!(input_island, output_island,);
 
         let positive_node = IslandNode::net(world.derived_topology.wire_net(output_positive));
-
         let negative_node = IslandNode::net(world.derived_topology.wire_net(output_negative));
 
         let physical_state = DeviceState::new(delay, DefinitionStateId::new(0));
@@ -1223,5 +1249,120 @@ mod tests {
             - runtime.node_voltage(negative_node).unwrap();
 
         assert!((second_output - 9.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn failed_state_commit_does_not_modify_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::default();
+
+        let capacitor = device(1);
+
+        world
+            .add_device(
+                &definitions,
+                capacitor,
+                PrimitiveElementKind::Capacitor.into(),
+            )
+            .unwrap();
+
+        world
+            .physical_state
+            .initialize_device(&definitions, &world.network, capacitor)
+            .unwrap();
+
+        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+
+        assert_eq!(world.physical_state.get(state), Some(0.0),);
+
+        let error = world
+            .physical_state
+            .commit_staged(&[
+                StagedStateWrite::new(state, 3.0),
+                StagedStateWrite::new(state, 7.0),
+            ])
+            .unwrap_err();
+
+        assert_eq!(error, PhysicalStateError::DuplicateWrite { state },);
+
+        assert_eq!(world.physical_state.get(state), Some(0.0),);
+    }
+
+    #[test]
+    fn parameter_change_refreshes_cached_island_runtime() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::default();
+
+        let negative = wire(1);
+        let positive = wire(2);
+
+        let source = device(1);
+        let conductance = device(2);
+
+        world.add_wire(negative).unwrap();
+        world.add_wire(positive).unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                conductance,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        for device in [source, conductance] {
+            world
+                .attach_terminal(&definitions, positive, device, TerminalId::new(0))
+                .unwrap();
+
+            world
+                .attach_terminal(&definitions, negative, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        world.tick(&definitions, 1.0).unwrap();
+
+        let island = world
+            .derived_topology
+            .component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+
+        let positive_node = IslandNode::net(world.derived_topology.wire_net(positive));
+        let negative_node = IslandNode::net(world.derived_topology.wire_net(negative));
+
+        let runtime = world.island_runtimes[island.index()].as_ref().unwrap();
+
+        let voltage = runtime.node_voltage(positive_node).unwrap()
+            - runtime.node_voltage(negative_node).unwrap();
+
+        assert!((voltage - 5.0).abs() < 1.0e-12);
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 9.0)
+            .unwrap();
+
+        world.tick(&definitions, 1.0).unwrap();
+
+        let runtime = world.island_runtimes[island.index()].as_ref().unwrap();
+
+        let voltage = runtime.node_voltage(positive_node).unwrap()
+            - runtime.node_voltage(negative_node).unwrap();
+
+        assert!((voltage - 9.0).abs() < 1.0e-12);
     }
 }

@@ -19,16 +19,13 @@ pub(crate) enum IslandIrBuildError {
 #[derive(Debug)]
 pub(crate) struct IslandIrBuilder<'a> {
     pattern: &'a MnaPattern,
-
     values: ValueProgramBuilder,
-
+    matrix_static_inputs: Vec<InputSlot>,
     matrix_ops: Vec<MatrixAdd>,
     rhs_ops: Vec<RhsAdd>,
     state_writes: Vec<StateWrite>,
-
     timestep_input: Option<InputSlot>,
     zero_value: Option<ValueSlot>,
-
     solution_inputs: BTreeMap<UnknownIndex, InputSlot>,
     state_inputs: BTreeMap<StateSlot, InputSlot>,
 }
@@ -37,16 +34,13 @@ impl<'a> IslandIrBuilder<'a> {
     pub(crate) fn new(pattern: &'a MnaPattern) -> Self {
         Self {
             pattern,
-
             values: ValueProgramBuilder::new(),
-
+            matrix_static_inputs: Vec::new(),
             matrix_ops: Vec::new(),
             rhs_ops: Vec::new(),
             state_writes: Vec::new(),
-
             timestep_input: None,
             zero_value: None,
-
             solution_inputs: BTreeMap::new(),
             state_inputs: BTreeMap::new(),
         }
@@ -58,8 +52,17 @@ impl<'a> IslandIrBuilder<'a> {
     }
 
     #[inline]
-    pub(crate) fn parameter_input(&mut self) -> Result<InputSlot, ValueBuildError> {
-        self.values.static_input()
+    pub(crate) fn parameter_input(
+        &mut self,
+        affects_matrix: bool,
+    ) -> Result<InputSlot, ValueBuildError> {
+        let input = self.values.static_input()?;
+
+        if affects_matrix {
+            self.mark_matrix_static_input(input);
+        }
+
+        Ok(input)
     }
 
     #[inline]
@@ -67,14 +70,25 @@ impl<'a> IslandIrBuilder<'a> {
         self.values.constant(value)
     }
 
-    pub(crate) fn timestep_value(&mut self) -> Result<ValueSlot, ValueBuildError> {
+    pub(crate) fn timestep_value(
+        &mut self,
+        affects_matrix: bool,
+    ) -> Result<ValueSlot, ValueBuildError> {
         if let Some(input) = self.timestep_input {
+            if affects_matrix {
+                self.mark_matrix_static_input(input);
+            }
+
             return Ok(input.value());
         }
 
         let input = self.values.static_input()?;
 
         self.timestep_input = Some(input);
+
+        if affects_matrix {
+            self.mark_matrix_static_input(input);
+        }
 
         Ok(input.value())
     }
@@ -180,7 +194,7 @@ impl<'a> IslandIrBuilder<'a> {
         self.state_writes.push(StateWrite::new(destination, source));
     }
 
-    pub(crate) fn finish(self) -> Result<CompiledIslandIr, IslandIrBuildError> {
+    pub(crate) fn finish(mut self) -> Result<CompiledIslandIr, IslandIrBuildError> {
         let state_transition = StateTransitionProgram::new(self.state_writes)?;
 
         let solution_inputs = self
@@ -195,34 +209,35 @@ impl<'a> IslandIrBuilder<'a> {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        self.matrix_static_inputs.sort_unstable();
+        self.matrix_static_inputs.dedup();
+
         Ok(CompiledIslandIr {
             value_program: self.values.finish(),
-
             matrix_program: MatrixProgram::new(self.matrix_ops),
-
             rhs_program: RhsProgram::new(self.rhs_ops),
-
             state_transition,
-
+            matrix_static_inputs: self.matrix_static_inputs.into_boxed_slice(),
             timestep_input: self.timestep_input,
-
             solution_inputs,
             state_inputs,
         })
+    }
+
+    #[inline]
+    fn mark_matrix_static_input(&mut self, input: InputSlot) {
+        self.matrix_static_inputs.push(input);
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct CompiledIslandIr {
     value_program: ValueProgram,
-
     matrix_program: MatrixProgram,
     rhs_program: RhsProgram,
-
     state_transition: StateTransitionProgram,
-
+    matrix_static_inputs: Box<[InputSlot]>,
     timestep_input: Option<InputSlot>,
-
     solution_inputs: Box<[(UnknownIndex, InputSlot)]>,
     state_inputs: Box<[(StateSlot, InputSlot)]>,
 }
@@ -246,6 +261,11 @@ impl CompiledIslandIr {
     #[inline]
     pub(crate) fn state_transition(&self) -> &StateTransitionProgram {
         &self.state_transition
+    }
+
+    #[inline]
+    pub(crate) fn static_input_affects_matrix(&self, input: InputSlot) -> bool {
+        self.matrix_static_inputs.binary_search(&input).is_ok()
     }
 
     #[inline]
@@ -328,8 +348,8 @@ mod tests {
         let pattern = empty_pattern(0);
         let mut builder = IslandIrBuilder::new(&pattern);
 
-        let first = builder.timestep_value().unwrap();
-        let second = builder.timestep_value().unwrap();
+        let first = builder.timestep_value(false).unwrap();
+        let second = builder.timestep_value(false).unwrap();
 
         assert_eq!(first, second);
 

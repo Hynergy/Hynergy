@@ -48,6 +48,7 @@ pub(crate) struct IslandRuntime {
     static_initialized: bool,
     matrix_dirty: bool,
     last_timestep: f64,
+    static_inputs_dirty: bool,
     #[cfg(test)]
     matrix_stamp_count: usize,
 }
@@ -74,17 +75,13 @@ impl IslandRuntime {
             unknowns,
             states,
             partition_inputs,
-
             workspace,
-
             solution: vec![0.0; dimension].into_boxed_slice(),
-
             solution_valid: false,
-
             static_initialized: false,
             matrix_dirty: true,
             last_timestep: f64::NAN,
-
+            static_inputs_dirty: true,
             #[cfg(test)]
             matrix_stamp_count: 0,
         })
@@ -191,8 +188,8 @@ impl IslandRuntime {
         Ok(writes)
     }
 
-    fn load_parameters(&mut self, network: &Network) -> Result<bool, IslandRuntimeError> {
-        let mut changed = false;
+    fn load_parameters(&mut self, network: &Network) -> Result<StaticChanges, IslandRuntimeError> {
+        let mut changes = StaticChanges::default();
 
         for partition in &self.partition_inputs {
             let device = partition.device();
@@ -223,11 +220,11 @@ impl IslandRuntime {
 
                 self.workspace.set_input(input, value);
 
-                changed = true;
+                changes.record(self.ir.static_input_affects_matrix(input));
             }
         }
 
-        Ok(changed)
+        Ok(changes)
     }
 
     fn prepare_static(
@@ -235,7 +232,13 @@ impl IslandRuntime {
         network: &Network,
         timestep: f64,
     ) -> Result<(), IslandRuntimeError> {
-        let mut changed = self.load_parameters(network)?;
+        let mut changes = StaticChanges::default();
+
+        if self.static_inputs_dirty {
+            changes = self.load_parameters(network)?;
+
+            self.static_inputs_dirty = false;
+        }
 
         if let Some(input) = self.ir.timestep_input() {
             if !timestep.is_finite() || timestep <= 0.0 {
@@ -244,23 +247,25 @@ impl IslandRuntime {
 
             if self.last_timestep != timestep {
                 self.workspace.set_input(input, timestep);
-
                 self.last_timestep = timestep;
 
-                changed = true;
+                changes.record(self.ir.static_input_affects_matrix(input));
             }
         }
 
-        if !self.static_initialized || changed {
-            self.ir.value_program().execute_static(&mut self.workspace);
+        let initialize = !self.static_initialized;
 
+        if initialize || changes.values {
+            self.ir.value_program().execute_static(&mut self.workspace);
             self.static_initialized = true;
+        }
+
+        if initialize || changes.matrix {
             self.matrix_dirty = true;
         }
 
         Ok(())
     }
-
     pub(crate) fn node_voltage(&self, node: IslandNode) -> Option<f64> {
         if !self.solution_valid {
             return None;
@@ -271,6 +276,11 @@ impl IslandRuntime {
 
             Some(unknown) => self.solution[unknown.index()],
         })
+    }
+
+    #[inline]
+    pub(crate) fn mark_numerical_dirty(&mut self) {
+        self.static_inputs_dirty = true;
     }
 
     #[cfg(test)]
@@ -300,6 +310,20 @@ impl StagedStateWrite {
     #[inline]
     pub(crate) const fn value(self) -> f64 {
         self.value
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StaticChanges {
+    values: bool,
+    matrix: bool,
+}
+
+impl StaticChanges {
+    #[inline]
+    fn record(&mut self, affects_matrix: bool) {
+        self.values = true;
+        self.matrix |= affects_matrix;
     }
 }
 
@@ -516,19 +540,15 @@ mod test {
     #[test]
     fn unchanged_static_inputs_reuse_matrix_factorization() {
         let definitions = DefinitionRegistry::new();
-
         let mut network = Network::new();
 
         let negative = WireId::try_from(1).unwrap();
-
         let positive = WireId::try_from(2).unwrap();
 
         let source = DeviceId::try_from(1).unwrap();
-
         let conductance = DeviceId::try_from(2).unwrap();
 
         network.add_wire(negative).unwrap();
-
         network.add_wire(positive).unwrap();
 
         network
@@ -577,22 +597,184 @@ mod test {
         let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
 
         assert!(writes.is_empty());
-
         assert_eq!(runtime.matrix_stamp_count(), 1,);
 
         let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
 
         assert!(writes.is_empty());
-
         assert_eq!(runtime.matrix_stamp_count(), 1,);
 
         network
             .set_device_parameter(&definitions, conductance, ParameterId::new(0), 2.0)
             .unwrap();
 
+        runtime.mark_numerical_dirty();
+
         let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
 
         assert!(writes.is_empty());
+        assert_eq!(runtime.matrix_stamp_count(), 2,);
+    }
+
+    #[test]
+    fn rhs_only_parameter_change_reuses_matrix_factorization() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let negative = WireId::try_from(1).unwrap();
+        let positive = WireId::try_from(2).unwrap();
+
+        let source = DeviceId::try_from(1).unwrap();
+        let conductance = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(negative).unwrap();
+
+        network.add_wire(positive).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                conductance,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        for device in [source, conductance] {
+            network
+                .attach_terminal(positive, device, TerminalId::new(0))
+                .unwrap();
+
+            network
+                .attach_terminal(negative, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+
+        let positive_node = IslandNode::net(topology.wire_net(positive));
+        let negative_node = IslandNode::net(topology.wire_net(negative));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1,);
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 9.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1,);
+
+        let voltage = runtime.node_voltage(positive_node).unwrap()
+            - runtime.node_voltage(negative_node).unwrap();
+
+        assert!((voltage - 9.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn matrix_affecting_timestep_change_restamps_matrix() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let a = WireId::try_from(1).unwrap();
+        let b = WireId::try_from(2).unwrap();
+
+        let conductance = DeviceId::try_from(1).unwrap();
+        let capacitor = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(a).unwrap();
+        network.add_wire(b).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                conductance,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                capacitor,
+                PrimitiveElementKind::Capacitor.into(),
+            )
+            .unwrap();
+
+        for device in [conductance, capacitor] {
+            network
+                .attach_terminal(a, device, TerminalId::new(0))
+                .unwrap();
+
+            network
+                .attach_terminal(b, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, capacitor, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+        let island =
+            topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+
+        runtime
+            .solve_tick(&network, 0.5, |candidate| {
+                (candidate == state).then_some(0.0)
+            })
+            .unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1,);
+
+        runtime
+            .solve_tick(&network, 0.5, |candidate| {
+                (candidate == state).then_some(0.0)
+            })
+            .unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1,);
+
+        runtime
+            .solve_tick(&network, 0.25, |candidate| {
+                (candidate == state).then_some(0.0)
+            })
+            .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 2,);
     }

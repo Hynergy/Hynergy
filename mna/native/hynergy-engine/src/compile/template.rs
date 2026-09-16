@@ -158,18 +158,13 @@ pub(crate) enum DefinitionLinkError {
 pub(crate) struct DefinitionTemplateBuilder {
     unknowns: Vec<LocalUnknownInfo>,
     unknown_values: Vec<Option<LocalValueId>>,
-
     values: Vec<LocalValueInfo>,
     parameter_count: usize,
-
     timestep_value: Option<LocalValueId>,
-
     state_writes: Vec<Option<LocalValueId>>,
     state_requires_write: SmallVec<[u64; 2]>,
-
     matrix_terms: Vec<PendingMatrixTerm>,
     rhs_terms: Vec<LocalRhsTerm>,
-
     terminal_count: usize,
     allocated_unknown_count: usize,
 }
@@ -420,8 +415,10 @@ impl DefinitionTemplateBuilder {
         canonicalize_pending_matrix_terms(&mut self.matrix_terms);
         canonicalize_rhs_terms(&mut self.rhs_terms);
 
-        let pending_state_writes = std::mem::take(&mut self.state_writes);
+        let (matrix_parameter_dependencies, timestep_affects_matrix) =
+            matrix_static_dependencies(&self.values, &self.matrix_terms, self.parameter_count);
 
+        let pending_state_writes = std::mem::take(&mut self.state_writes);
         let state_count = pending_state_writes.len();
         let mut state_writes = Vec::new();
 
@@ -480,14 +477,13 @@ impl DefinitionTemplateBuilder {
         Ok(CompiledDefinitionTemplate {
             unknowns: self.unknowns.into_boxed_slice(),
             values: self.values.into_boxed_slice(),
-
             matrix_entries: matrix_entries.into_boxed_slice(),
             matrix_terms: matrix_terms.into_boxed_slice(),
             rhs_terms: self.rhs_terms.into_boxed_slice(),
-
             state_writes: state_writes.into_boxed_slice(),
             state_count,
-
+            matrix_parameter_dependencies,
+            timestep_affects_matrix,
             parameter_count: self.parameter_count,
             terminal_count: self.terminal_count,
             allocated_unknown_count: self.allocated_unknown_count,
@@ -626,14 +622,13 @@ enum LocalBinaryOp {
 pub(crate) struct CompiledDefinitionTemplate {
     unknowns: Box<[LocalUnknownInfo]>,
     values: Box<[LocalValueInfo]>,
-
     matrix_entries: Box<[LocalMatrixEntry]>,
     matrix_terms: Box<[LocalMatrixTerm]>,
     rhs_terms: Box<[LocalRhsTerm]>,
-
     state_writes: Box<[(LocalStateId, LocalValueId)]>,
     state_count: usize,
-
+    matrix_parameter_dependencies: SmallVec<[u64; 1]>,
+    timestep_affects_matrix: bool,
     parameter_count: usize,
     terminal_count: usize,
     allocated_unknown_count: usize,
@@ -726,7 +721,7 @@ impl CompiledDefinitionTemplate {
         for info in &self.values {
             let value = match info.node {
                 LocalValueNode::Parameter(parameter) => {
-                    let input = ir.parameter_input()?;
+                    let input = ir.parameter_input(self.parameter_affects_matrix(parameter))?;
 
                     parameters[parameter.index()] = Some(input);
 
@@ -735,7 +730,7 @@ impl CompiledDefinitionTemplate {
 
                 LocalValueNode::Constant(value) => ir.constant_value(value)?,
 
-                LocalValueNode::Timestep => ir.timestep_value()?,
+                LocalValueNode::Timestep => ir.timestep_value(self.timestep_affects_matrix)?,
 
                 LocalValueNode::State(state) => {
                     let state = states
@@ -817,6 +812,18 @@ impl CompiledDefinitionTemplate {
     }
 
     #[inline]
+    fn parameter_affects_matrix(&self, parameter: LocalParameterId) -> bool {
+        let index = parameter.index();
+
+        let word = index / 64;
+        let bit = index % 64;
+
+        self.matrix_parameter_dependencies
+            .get(word)
+            .is_some_and(|word| word & (1u64 << bit) != 0)
+    }
+
+    #[inline]
     pub(crate) fn unknown_count(&self) -> usize {
         self.unknowns.len()
     }
@@ -845,6 +852,62 @@ impl CompiledDefinitionTemplate {
     pub(crate) const fn state_count(&self) -> usize {
         self.state_count
     }
+}
+
+fn matrix_static_dependencies(
+    values: &[LocalValueInfo],
+    matrix_terms: &[PendingMatrixTerm],
+    parameter_count: usize,
+) -> (SmallVec<[u64; 1]>, bool) {
+    let word_count = parameter_count / 64 + usize::from(parameter_count % 64 != 0);
+    let mut parameters = SmallVec::<[u64; 1]>::new();
+
+    parameters.resize(word_count, 0);
+
+    let mut timestep = false;
+    let mut visited = vec![false; values.len()];
+
+    let mut pending = matrix_terms
+        .iter()
+        .map(|term| term.source)
+        .collect::<Vec<_>>();
+
+    while let Some(value) = pending.pop() {
+        let index = value.index();
+
+        if visited[index] {
+            continue;
+        }
+
+        visited[index] = true;
+
+        match values[index].node {
+            LocalValueNode::Parameter(parameter) => {
+                let index = parameter.index();
+                let word = index / 64;
+                let bit = index % 64;
+
+                parameters[word] |= 1u64 << bit;
+            }
+            LocalValueNode::Timestep => {
+                timestep = true;
+            }
+            LocalValueNode::Add(lhs, rhs)
+            | LocalValueNode::Sub(lhs, rhs)
+            | LocalValueNode::Mul(lhs, rhs)
+            | LocalValueNode::Div(lhs, rhs) => {
+                pending.push(lhs);
+                pending.push(rhs);
+            }
+            LocalValueNode::Neg(operand) => {
+                pending.push(operand);
+            }
+            LocalValueNode::Constant(_) | LocalValueNode::State(_) | LocalValueNode::Unknown(_) => {
+            }
+        }
+    }
+
+    (parameters, timestep)
 }
 
 #[derive(Debug)]
@@ -1128,5 +1191,95 @@ mod tests {
             .execute(&mut next_state, workspace.values());
 
         assert_eq!(next_state[7], 3.0);
+    }
+
+    #[test]
+    fn matrix_dependency_follows_parameter_value_graph() {
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let terminal = builder.terminal_voltage().unwrap();
+
+        let matrix_parameter = builder.parameter().unwrap();
+
+        let rhs_parameter = builder.parameter().unwrap();
+
+        let two = builder.constant(2.0).unwrap();
+
+        let matrix_value = builder.mul(matrix_parameter, two).unwrap();
+
+        builder.add_matrix(terminal, terminal, matrix_value, 1.0);
+
+        builder.add_rhs(terminal, rhs_parameter, 1.0);
+
+        let template = builder.finish().unwrap();
+
+        let mut unknown_allocator = UnknownAllocator::new(1).unwrap();
+
+        let unknowns = template
+            .bind_unknowns(
+                &[Some(UnknownIndex::new(0))],
+                unknown_allocator.allocate(0).unwrap(),
+            )
+            .unwrap();
+
+        let mut pattern_builder = PatternBuilder::new(1).unwrap();
+
+        template
+            .request_pattern(&unknowns, &mut pattern_builder)
+            .unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+
+        let states = BoundStateSlots::new(SmallVec::new());
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        let inputs = template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+
+        let ir = ir_builder.finish().unwrap();
+
+        assert!(ir.static_input_affects_matrix(inputs.parameter(0).unwrap(),));
+
+        assert!(!ir.static_input_affects_matrix(inputs.parameter(1).unwrap(),));
+    }
+
+    #[test]
+    fn matrix_dependency_follows_timestep_value_graph() {
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let terminal = builder.terminal_voltage().unwrap();
+
+        let timestep = builder.timestep().unwrap();
+
+        builder.add_matrix(terminal, terminal, timestep, 1.0);
+
+        let template = builder.finish().unwrap();
+
+        let mut unknown_allocator = UnknownAllocator::new(1).unwrap();
+
+        let unknowns = template
+            .bind_unknowns(
+                &[Some(UnknownIndex::new(0))],
+                unknown_allocator.allocate(0).unwrap(),
+            )
+            .unwrap();
+
+        let mut pattern_builder = PatternBuilder::new(1).unwrap();
+
+        template
+            .request_pattern(&unknowns, &mut pattern_builder)
+            .unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+
+        let states = BoundStateSlots::new(SmallVec::new());
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+
+        let ir = ir_builder.finish().unwrap();
+
+        assert!(ir.static_input_affects_matrix(ir.timestep_input().unwrap(),));
     }
 }
