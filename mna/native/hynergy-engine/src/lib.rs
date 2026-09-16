@@ -82,8 +82,7 @@ impl From<WorldTickError> for EngineTickError {
                     }
                 },
 
-                IslandRuntimeError::InvalidTimestep
-                | IslandRuntimeError::MissingDevice { .. }
+                IslandRuntimeError::MissingDevice { .. }
                 | IslandRuntimeError::MissingState { .. } => Self::InternalInvariant,
             },
 
@@ -343,19 +342,6 @@ pub struct World {
     island_runtimes: Vec<Option<IslandRuntime>>,
 }
 
-impl Clone for World {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config,
-            network: self.network.clone(),
-            derived_topology: self.derived_topology.clone(),
-            topology_scratch: TraversalScratch::default(),
-            physical_state: self.physical_state.clone(),
-            island_runtimes: Vec::new(),
-        }
-    }
-}
-
 impl World {
     fn new(config: WorldConfig) -> Self {
         Self {
@@ -392,7 +378,7 @@ impl World {
                 .and_then(Option::as_mut)
                 .expect("live island must have a runtime after synchronization");
 
-            let writes = runtime.solve_tick(network, timestep, |state| old_state.get(state))?;
+            let writes = runtime.solve_tick(network, |state| old_state.get(state))?;
 
             staged.extend(writes);
         }
@@ -580,6 +566,8 @@ impl World {
         &mut self,
         definitions: &DefinitionRegistry,
     ) -> Result<(), WorldTickError> {
+        let timestep = self.config.timestep();
+
         let live_islands = self
             .derived_topology
             .islands()
@@ -630,7 +618,7 @@ impl World {
                 island,
             )?;
 
-            let runtime = IslandRuntime::new(compiled)?;
+            let runtime = IslandRuntime::new(compiled, timestep)?;
 
             self.island_runtimes[island.index()] = Some(runtime);
         }

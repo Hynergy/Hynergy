@@ -22,18 +22,8 @@ impl BoundStateSlots {
     }
 
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[StateSlot] {
-        &self.slots
-    }
-
-    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
     }
 
     #[inline]

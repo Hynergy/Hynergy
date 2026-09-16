@@ -52,9 +52,6 @@ pub(crate) enum IslandRuntimeError {
         state: DefinitionStateId,
     },
 
-    #[error("timestep must be finite and greater than zero")]
-    InvalidTimestep,
-
     #[error("nonlinear island did not converge after {iterations} iterations")]
     NonlinearDidNotConverge { iterations: usize },
 
@@ -77,7 +74,6 @@ pub(crate) struct IslandRuntime {
     solution_valid: bool,
     static_initialized: bool,
     matrix_dirty: bool,
-    last_timestep: f64,
     static_inputs_dirty: bool,
     nonlinear_scratch: Option<Box<NonlinearScratch>>,
 
@@ -88,7 +84,10 @@ pub(crate) struct IslandRuntime {
 }
 
 impl IslandRuntime {
-    pub(crate) fn new(compiled: CompiledIsland) -> Result<Self, IslandRuntimeError> {
+    pub(crate) fn new(compiled: CompiledIsland, timestep: f64) -> Result<Self, IslandRuntimeError> {
+        debug_assert!(timestep.is_finite());
+        debug_assert!(timestep > 0.0);
+
         let CompiledIslandParts {
             pattern,
             ir,
@@ -98,7 +97,13 @@ impl IslandRuntime {
         } = compiled.into_parts();
 
         let dimension = pattern.dimension();
-        let workspace = ir.value_program().new_workspace();
+
+        let mut workspace = ir.value_program().new_workspace();
+
+        if let Some(input) = ir.timestep_input() {
+            workspace.set_input(input, timestep);
+        }
+
         let system = MnaSystem::new(pattern)?;
 
         let nonlinear_scratch = ir.requires_nonlinear_iteration().then(|| {
@@ -119,7 +124,6 @@ impl IslandRuntime {
             solution_valid: false,
             static_initialized: false,
             matrix_dirty: true,
-            last_timestep: f64::NAN,
             static_inputs_dirty: true,
             nonlinear_scratch,
             #[cfg(test)]
@@ -273,7 +277,6 @@ impl IslandRuntime {
     pub(crate) fn solve_tick<F>(
         &mut self,
         network: &Network,
-        timestep: f64,
         mut old_state: F,
     ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError>
     where
@@ -281,7 +284,7 @@ impl IslandRuntime {
     {
         self.solution_valid = false;
 
-        self.prepare_static(network, timestep)?;
+        self.prepare_static(network)?;
 
         for &(slot, input) in self.ir.state_inputs() {
             let state = self
@@ -291,7 +294,6 @@ impl IslandRuntime {
 
             let value = old_state(state).ok_or(IslandRuntimeError::MissingState {
                 device: state.device(),
-
                 state: state.state(),
             })?;
 
@@ -378,30 +380,12 @@ impl IslandRuntime {
         Ok(changes)
     }
 
-    fn prepare_static(
-        &mut self,
-        network: &Network,
-        timestep: f64,
-    ) -> Result<(), IslandRuntimeError> {
+    fn prepare_static(&mut self, network: &Network) -> Result<(), IslandRuntimeError> {
         let mut changes = StaticChanges::default();
 
         if self.static_inputs_dirty {
             changes = self.load_parameters(network)?;
-
             self.static_inputs_dirty = false;
-        }
-
-        if let Some(input) = self.ir.timestep_input() {
-            if !timestep.is_finite() || timestep <= 0.0 {
-                return Err(IslandRuntimeError::InvalidTimestep);
-            }
-
-            if self.last_timestep != timestep {
-                self.workspace.set_input(input, timestep);
-                self.last_timestep = timestep;
-
-                changes.record(self.ir.static_input_affects_matrix(input));
-            }
         }
 
         let initialize = !self.static_initialized;
@@ -417,6 +401,7 @@ impl IslandRuntime {
 
         Ok(())
     }
+
     pub(crate) fn node_voltage(&self, node: IslandNode) -> Option<f64> {
         if !self.solution_valid {
             return None;
@@ -576,7 +561,7 @@ mod test {
     use crate::compile::island::{DeviceState, IslandNode, compile_topology_island};
     use crate::compile::island_ir::IslandIrBuilder;
     use crate::runtime::island::{
-        IslandRuntime, advance_iteration_latches, all_finite, initialize_iteration_latches,
+        IslandRuntime, advance_iteration_latches, initialize_iteration_latches,
         iteration_stability_matches, solutions_converged,
     };
     use crate::topology::{DerivedTopology, DeviceComponent};
@@ -590,6 +575,8 @@ mod test {
     use hynergy_model::device::registry::DefinitionRegistry;
     use hynergy_model::network::{Network, WireId};
     use hynergy_model::parameter::ParameterId;
+
+    const DEFAULT_TIMESTEP: f64 = 1.0;
 
     fn voltage_source_island() -> (Network, crate::compile::island::CompiledIsland) {
         let definitions = DefinitionRegistry::new();
@@ -637,9 +624,9 @@ mod test {
     fn linear_island_solves_once() {
         let (network, compiled) = voltage_source_island();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.solve_count(), 1);
     }
@@ -650,9 +637,9 @@ mod test {
 
         compiled.force_nonlinear_iteration_for_test(false);
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.solve_count(), 2);
         assert_eq!(runtime.matrix_stamp_count(), 1);
@@ -664,9 +651,9 @@ mod test {
 
         compiled.force_nonlinear_iteration_for_test(true);
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.solve_count(), 2);
         assert_eq!(runtime.matrix_stamp_count(), 2);
@@ -678,13 +665,13 @@ mod test {
 
         compiled.force_nonlinear_iteration_for_test(false);
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.solve_count(), 2);
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.solve_count(), 3);
     }
@@ -692,20 +679,16 @@ mod test {
     #[test]
     fn voltage_source_and_conductance_solve_node_voltage() {
         let definitions = DefinitionRegistry::new();
-
         let mut network = Network::new();
 
-        let wire_negative = WireId::try_from(1).unwrap();
-
-        let wire_positive = WireId::try_from(2).unwrap();
+        let negative = WireId::try_from(1).unwrap();
+        let positive = WireId::try_from(2).unwrap();
 
         let source = DeviceId::try_from(1).unwrap();
-
         let conductance = DeviceId::try_from(2).unwrap();
 
-        network.add_wire(wire_negative).unwrap();
-
-        network.add_wire(wire_positive).unwrap();
+        network.add_wire(negative).unwrap();
+        network.add_wire(positive).unwrap();
 
         network
             .add_device(
@@ -723,21 +706,15 @@ mod test {
             )
             .unwrap();
 
-        network
-            .attach_terminal(wire_positive, source, TerminalId::new(0))
-            .unwrap();
+        for device in [source, conductance] {
+            network
+                .attach_terminal(positive, device, TerminalId::new(0))
+                .unwrap();
 
-        network
-            .attach_terminal(wire_negative, source, TerminalId::new(1))
-            .unwrap();
-
-        network
-            .attach_terminal(wire_positive, conductance, TerminalId::new(0))
-            .unwrap();
-
-        network
-            .attach_terminal(wire_negative, conductance, TerminalId::new(1))
-            .unwrap();
+            network
+                .attach_terminal(negative, device, TerminalId::new(1))
+                .unwrap();
+        }
 
         network
             .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
@@ -749,47 +726,39 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island_id =
+        let island =
             topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
 
-        let positive = IslandNode::net(topology.wire_net(wire_positive));
+        let positive_node = IslandNode::net(topology.wire_net(positive));
+        let negative_node = IslandNode::net(topology.wire_net(negative));
 
-        let negative = IslandNode::net(topology.wire_net(wire_negative));
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let compiled =
-            compile_topology_island(&definitions, &network, &topology, island_id).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
-
-        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        let writes = runtime.solve_tick(&network, |_| None).unwrap();
 
         assert!(writes.is_empty());
 
-        let positive_voltage = runtime.node_voltage(positive).unwrap();
+        let voltage = runtime.node_voltage(positive_node).unwrap()
+            - runtime.node_voltage(negative_node).unwrap();
 
-        let negative_voltage = runtime.node_voltage(negative).unwrap();
-
-        assert!((positive_voltage - negative_voltage - 5.0).abs() < 1.0e-12);
+        assert!((voltage - 5.0).abs() < 1.0e-12);
     }
 
     #[test]
     fn capacitor_tick_reads_old_state_and_stages_next_state() {
         let definitions = DefinitionRegistry::new();
-
         let mut network = Network::new();
 
         let wire_a = WireId::try_from(1).unwrap();
-
         let wire_b = WireId::try_from(2).unwrap();
 
         let conductance = DeviceId::try_from(1).unwrap();
-
         let capacitor = DeviceId::try_from(2).unwrap();
-
         let source = DeviceId::try_from(3).unwrap();
 
         network.add_wire(wire_a).unwrap();
-
         network.add_wire(wire_b).unwrap();
 
         network
@@ -855,199 +824,33 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island_id =
+        let island =
             topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
 
         let node_a = IslandNode::net(topology.wire_net(wire_a));
-
         let node_b = IslandNode::net(topology.wire_net(wire_b));
 
-        let compiled =
-            compile_topology_island(&definitions, &network, &topology, island_id).unwrap();
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, 0.5).unwrap();
 
         let capacitor_state = DeviceState::new(capacitor, DefinitionStateId::new(0));
 
         let writes = runtime
-            .solve_tick(&network, 0.5, |state| {
-                (state == capacitor_state).then_some(3.0)
-            })
+            .solve_tick(&network, |state| (state == capacitor_state).then_some(3.0))
             .unwrap();
 
         let voltage = runtime.node_voltage(node_a).unwrap() - runtime.node_voltage(node_b).unwrap();
 
         assert!((voltage - 2.8).abs() < 1.0e-12);
 
-        assert_eq!(writes.len(), 1,);
-
-        assert_eq!(writes[0].state(), capacitor_state,);
-
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].state(), capacitor_state);
         assert!((writes[0].value() - 2.8).abs() < 1.0e-12);
     }
 
     #[test]
-    fn unchanged_static_inputs_reuse_matrix_factorization() {
-        let definitions = DefinitionRegistry::new();
-        let mut network = Network::new();
-
-        let negative = WireId::try_from(1).unwrap();
-        let positive = WireId::try_from(2).unwrap();
-
-        let source = DeviceId::try_from(1).unwrap();
-        let conductance = DeviceId::try_from(2).unwrap();
-
-        network.add_wire(negative).unwrap();
-        network.add_wire(positive).unwrap();
-
-        network
-            .add_device(
-                &definitions,
-                source,
-                PrimitiveElementKind::VoltageSource.into(),
-            )
-            .unwrap();
-
-        network
-            .add_device(
-                &definitions,
-                conductance,
-                PrimitiveElementKind::Conductance.into(),
-            )
-            .unwrap();
-
-        for device in [source, conductance] {
-            network
-                .attach_terminal(positive, device, TerminalId::new(0))
-                .unwrap();
-
-            network
-                .attach_terminal(negative, device, TerminalId::new(1))
-                .unwrap();
-        }
-
-        network
-            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
-            .unwrap();
-
-        network
-            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
-            .unwrap();
-
-        let topology = DerivedTopology::from_network(&network, &definitions);
-
-        let island =
-            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
-
-        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
-
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
-
-        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
-
-        assert!(writes.is_empty());
-        assert_eq!(runtime.matrix_stamp_count(), 1,);
-
-        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
-
-        assert!(writes.is_empty());
-        assert_eq!(runtime.matrix_stamp_count(), 1,);
-
-        network
-            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 2.0)
-            .unwrap();
-
-        runtime.mark_numerical_dirty();
-
-        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
-
-        assert!(writes.is_empty());
-        assert_eq!(runtime.matrix_stamp_count(), 2,);
-    }
-
-    #[test]
-    fn rhs_only_parameter_change_reuses_matrix_factorization() {
-        let definitions = DefinitionRegistry::new();
-        let mut network = Network::new();
-
-        let negative = WireId::try_from(1).unwrap();
-        let positive = WireId::try_from(2).unwrap();
-
-        let source = DeviceId::try_from(1).unwrap();
-        let conductance = DeviceId::try_from(2).unwrap();
-
-        network.add_wire(negative).unwrap();
-
-        network.add_wire(positive).unwrap();
-
-        network
-            .add_device(
-                &definitions,
-                source,
-                PrimitiveElementKind::VoltageSource.into(),
-            )
-            .unwrap();
-
-        network
-            .add_device(
-                &definitions,
-                conductance,
-                PrimitiveElementKind::Conductance.into(),
-            )
-            .unwrap();
-
-        for device in [source, conductance] {
-            network
-                .attach_terminal(positive, device, TerminalId::new(0))
-                .unwrap();
-
-            network
-                .attach_terminal(negative, device, TerminalId::new(1))
-                .unwrap();
-        }
-
-        network
-            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
-            .unwrap();
-
-        network
-            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
-            .unwrap();
-
-        let topology = DerivedTopology::from_network(&network, &definitions);
-
-        let island =
-            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
-
-        let positive_node = IslandNode::net(topology.wire_net(positive));
-        let negative_node = IslandNode::net(topology.wire_net(negative));
-
-        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
-
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
-
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
-
-        assert_eq!(runtime.matrix_stamp_count(), 1,);
-
-        network
-            .set_device_parameter(&definitions, source, ParameterId::new(0), 9.0)
-            .unwrap();
-
-        runtime.mark_numerical_dirty();
-
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
-
-        assert_eq!(runtime.matrix_stamp_count(), 1,);
-
-        let voltage = runtime.node_voltage(positive_node).unwrap()
-            - runtime.node_voltage(negative_node).unwrap();
-
-        assert!((voltage - 9.0).abs() < 1.0e-12);
-    }
-
-    #[test]
-    fn matrix_affecting_timestep_change_restamps_matrix() {
+    fn fixed_timestep_capacitor_reuses_matrix_factorization() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
 
@@ -1095,67 +898,47 @@ mod test {
             .unwrap();
 
         let topology = DerivedTopology::from_network(&network, &definitions);
+
         let island =
             topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
+
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, 0.5).unwrap();
 
         let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
 
         runtime
-            .solve_tick(&network, 0.5, |candidate| {
-                (candidate == state).then_some(0.0)
-            })
+            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
             .unwrap();
 
-        assert_eq!(runtime.matrix_stamp_count(), 1,);
+        assert_eq!(runtime.matrix_stamp_count(), 1);
 
         runtime
-            .solve_tick(&network, 0.5, |candidate| {
-                (candidate == state).then_some(0.0)
-            })
+            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
             .unwrap();
 
-        assert_eq!(runtime.matrix_stamp_count(), 1,);
-
-        runtime
-            .solve_tick(&network, 0.25, |candidate| {
-                (candidate == state).then_some(0.0)
-            })
-            .unwrap();
-
-        assert_eq!(runtime.matrix_stamp_count(), 2,);
+        assert_eq!(runtime.matrix_stamp_count(), 1);
     }
 
-    fn controlled_conductance_with_fixed_control(control_voltage: f64) -> f64 {
+    #[test]
+    fn matrix_affecting_parameter_change_restamps_matrix() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
 
-        let common = WireId::try_from(1).unwrap();
-        let output = WireId::try_from(2).unwrap();
-        let control = WireId::try_from(3).unwrap();
+        let negative = WireId::try_from(1).unwrap();
+        let positive = WireId::try_from(2).unwrap();
 
-        let controlled = DeviceId::try_from(1).unwrap();
-        let control_source = DeviceId::try_from(2).unwrap();
-        let current_source = DeviceId::try_from(3).unwrap();
+        let source = DeviceId::try_from(1).unwrap();
+        let conductance = DeviceId::try_from(2).unwrap();
 
-        network.add_wire(common).unwrap();
-        network.add_wire(output).unwrap();
-        network.add_wire(control).unwrap();
+        network.add_wire(negative).unwrap();
+        network.add_wire(positive).unwrap();
 
         network
             .add_device(
                 &definitions,
-                controlled,
-                PrimitiveElementKind::VoltageControlledConductance.into(),
-            )
-            .unwrap();
-
-        network
-            .add_device(
-                &definitions,
-                control_source,
+                source,
                 PrimitiveElementKind::VoltageSource.into(),
             )
             .unwrap();
@@ -1163,111 +946,135 @@ mod test {
         network
             .add_device(
                 &definitions,
-                current_source,
-                PrimitiveElementKind::CurrentSource.into(),
+                conductance,
+                PrimitiveElementKind::Conductance.into(),
             )
             .unwrap();
 
-        network
-            .attach_terminal(output, controlled, TerminalId::new(0))
-            .unwrap();
-
-        network
-            .attach_terminal(common, controlled, TerminalId::new(1))
-            .unwrap();
-
-        network
-            .attach_terminal(control, controlled, TerminalId::new(2))
-            .unwrap();
-
-        network
-            .attach_terminal(control, control_source, TerminalId::new(0))
-            .unwrap();
-
-        network
-            .attach_terminal(common, control_source, TerminalId::new(1))
-            .unwrap();
-
-        // Inject 6 A from common into output.
-        network
-            .attach_terminal(common, current_source, TerminalId::new(0))
-            .unwrap();
-
-        network
-            .attach_terminal(output, current_source, TerminalId::new(1))
-            .unwrap();
-
-        // threshold = 2
-        // transition = 2
-        // low = 1
-        // high = 3
-        // G_min = 1
-        // G_max = 5
-        for (index, value) in [2.0, 2.0, 1.0, 5.0].into_iter().enumerate() {
+        for device in [source, conductance] {
             network
-                .set_device_parameter(
-                    &definitions,
-                    controlled,
-                    ParameterId::new(index as u32),
-                    value,
-                )
+                .attach_terminal(positive, device, TerminalId::new(0))
+                .unwrap();
+
+            network
+                .attach_terminal(negative, device, TerminalId::new(1))
                 .unwrap();
         }
 
         network
-            .set_device_parameter(
-                &definitions,
-                control_source,
-                ParameterId::new(0),
-                control_voltage,
-            )
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
             .unwrap();
 
         network
-            .set_device_parameter(&definitions, current_source, ParameterId::new(0), 6.0)
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
             .unwrap();
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
         let island =
-            topology.component_island(DeviceComponent::new(controlled, DevicePartitionId::new(0)));
-
-        let output_node = IslandNode::net(topology.wire_net(output));
-        let common_node = IslandNode::net(topology.wire_net(common));
+            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
-        runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap()
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1);
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1);
+
+        network
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 2);
     }
 
     #[test]
-    fn controlled_conductance_below_transition_uses_g_min() {
-        let voltage = controlled_conductance_with_fixed_control(0.0);
+    fn rhs_only_parameter_change_reuses_matrix_factorization() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
 
-        // I / G_min = 6 / 1.
-        assert!((voltage - 6.0).abs() < 1.0e-9);
-    }
+        let negative = WireId::try_from(1).unwrap();
+        let positive = WireId::try_from(2).unwrap();
 
-    #[test]
-    fn controlled_conductance_above_transition_uses_g_max() {
-        let voltage = controlled_conductance_with_fixed_control(4.0);
+        let source = DeviceId::try_from(1).unwrap();
+        let conductance = DeviceId::try_from(2).unwrap();
 
-        // I / G_max = 6 / 5.
-        assert!((voltage - 1.2).abs() < 1.0e-9);
-    }
+        network.add_wire(negative).unwrap();
+        network.add_wire(positive).unwrap();
 
-    #[test]
-    fn controlled_conductance_inside_transition_interpolates_exactly() {
-        let voltage = controlled_conductance_with_fixed_control(2.0);
+        network
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
 
-        // Midpoint:
-        //
-        // G = 1 + (5 - 1) * 0.5 = 3
-        // V = 6 / 3 = 2
-        assert!((voltage - 2.0).abs() < 1.0e-9);
+        network
+            .add_device(
+                &definitions,
+                conductance,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        for device in [source, conductance] {
+            network
+                .attach_terminal(positive, device, TerminalId::new(0))
+                .unwrap();
+
+            network
+                .attach_terminal(negative, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+
+        let positive_node = IslandNode::net(topology.wire_net(positive));
+        let negative_node = IslandNode::net(topology.wire_net(negative));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1);
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 9.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.matrix_stamp_count(), 1);
+
+        let voltage = runtime.node_voltage(positive_node).unwrap()
+            - runtime.node_voltage(negative_node).unwrap();
+
+        assert!((voltage - 9.0).abs() < 1.0e-12);
     }
 
     #[test]
@@ -1308,11 +1115,12 @@ mod test {
             .attach_terminal(common, controlled, TerminalId::new(1))
             .unwrap();
 
-        // Vc = Vout.
+        // Control voltage is the output voltage.
         network
             .attach_terminal(output, controlled, TerminalId::new(2))
             .unwrap();
 
+        // Inject 6 A from common into output.
         network
             .attach_terminal(common, current_source, TerminalId::new(0))
             .unwrap();
@@ -1321,6 +1129,10 @@ mod test {
             .attach_terminal(output, current_source, TerminalId::new(1))
             .unwrap();
 
+        // threshold = 2
+        // transition = 2
+        // G_min = 1
+        // G_max = 5
         for (index, value) in [2.0, 2.0, 1.0, 5.0].into_iter().enumerate() {
             network
                 .set_device_parameter(
@@ -1346,9 +1158,9 @@ mod test {
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -1368,8 +1180,8 @@ mod test {
     }
 
     #[test]
-    fn iteration_stability_uses_exact_values() {
-        assert!(solutions_converged(&[0.0], &[5.0e-10],));
+    fn iteration_stability_requires_exact_values() {
+        assert!(solutions_converged(&[0.0], &[5.0e-10]));
 
         assert!(!iteration_stability_matches(&[0.0], [5.0e-10].into_iter(),));
 
@@ -1396,6 +1208,7 @@ mod test {
         let mut workspace = ir.value_program().new_workspace();
 
         let state_input = ir.state_inputs()[0].1;
+
         workspace.set_input(state_input, 0.0);
 
         ir.value_program().execute_tick(&mut workspace);
@@ -1515,6 +1328,7 @@ mod test {
             .unwrap();
 
         let topology = DerivedTopology::from_network(&network, &definitions);
+
         let island =
             topology.component_island(DeviceComponent::new(switch, DevicePartitionId::new(0)));
 
@@ -1539,7 +1353,7 @@ mod test {
         let (definitions, mut network, compiled, output_node, common_node, switch, control_source) =
             voltage_controlled_switch_island();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
         let state = DeviceState::new(switch, DefinitionStateId::new(0));
 
@@ -1547,9 +1361,7 @@ mod test {
 
         // Below lower threshold: remain OFF.
         let writes = runtime
-            .solve_tick(&network, 1.0, |candidate| {
-                (candidate == state).then_some(mode)
-            })
+            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
             .unwrap();
 
         assert_eq!(writes.len(), 1);
@@ -1559,7 +1371,6 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // 8 A / G_min(1 S)
         assert!((voltage - 8.0).abs() < 1.0e-9);
 
         mode = writes[0].value();
@@ -1572,9 +1383,7 @@ mod test {
         runtime.mark_numerical_dirty();
 
         let writes = runtime
-            .solve_tick(&network, 1.0, |candidate| {
-                (candidate == state).then_some(mode)
-            })
+            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
             .unwrap();
 
         assert_eq!(writes[0].value(), 1.0);
@@ -1582,12 +1391,11 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // 8 A / G_max(4 S)
         assert!((voltage - 2.0).abs() < 1.0e-9);
 
         mode = writes[0].value();
 
-        // Inside deadband: retain ON.
+        // Inside the deadband: retain ON.
         network
             .set_device_parameter(&definitions, control_source, ParameterId::new(0), 2.0)
             .unwrap();
@@ -1595,9 +1403,7 @@ mod test {
         runtime.mark_numerical_dirty();
 
         let writes = runtime
-            .solve_tick(&network, 1.0, |candidate| {
-                (candidate == state).then_some(mode)
-            })
+            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
             .unwrap();
 
         assert_eq!(writes[0].value(), 1.0);
@@ -1617,9 +1423,7 @@ mod test {
         runtime.mark_numerical_dirty();
 
         let writes = runtime
-            .solve_tick(&network, 1.0, |candidate| {
-                (candidate == state).then_some(mode)
-            })
+            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
             .unwrap();
 
         assert_eq!(writes[0].value(), 0.0);
@@ -1630,54 +1434,6 @@ mod test {
         assert!((voltage - 8.0).abs() < 1.0e-9);
     }
 
-    #[test]
-    fn finite_value_check_rejects_non_finite_values() {
-        assert!(all_finite(&[]));
-        assert!(all_finite(&[0.0, -1.0, f64::MAX]));
-
-        assert!(!all_finite(&[f64::NAN]));
-        assert!(!all_finite(&[f64::INFINITY]));
-        assert!(!all_finite(&[f64::NEG_INFINITY]));
-    }
-
-    #[test]
-    fn voltage_controlled_switch_with_zero_hysteresis_turns_on_at_threshold() {
-        let (definitions, mut network, compiled, output_node, common_node, switch, control_source) =
-            voltage_controlled_switch_island();
-
-        // threshold = 2
-        // hysteresis = 0
-        //
-        // Exact-threshold convention:
-        // Vc >= threshold => ON.
-        network
-            .set_device_parameter(&definitions, switch, ParameterId::new(1), 0.0)
-            .unwrap();
-
-        network
-            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 2.0)
-            .unwrap();
-
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
-
-        let state = DeviceState::new(switch, DefinitionStateId::new(0));
-
-        let writes = runtime
-            .solve_tick(&network, 1.0, |candidate| {
-                (candidate == state).then_some(0.0)
-            })
-            .unwrap();
-
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].state(), state);
-        assert_eq!(writes[0].value(), 1.0);
-
-        let voltage =
-            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
-
-        // 8 A / G_max(4 S).
-        assert!((voltage - 2.0).abs() < 1.0e-9);
-    }
     #[test]
     fn stateless_composite_solves_through_island_runtime() {
         let mut definitions = DefinitionRegistry::new();
@@ -1695,7 +1451,6 @@ mod test {
 
             let r2 = builder.add_parameter(resistance_constraint).unwrap();
 
-            // R1 = 2 ohm.
             builder
                 .add_element(Element::new(
                     resistance,
@@ -1704,7 +1459,6 @@ mod test {
                 ))
                 .unwrap();
 
-            // R2 comes from the composite parameter.
             builder
                 .add_element(Element::new(
                     resistance,
@@ -1758,12 +1512,11 @@ mod test {
             .attach_terminal(output, source, TerminalId::new(1))
             .unwrap();
 
-        // R2 = 3 ohm, so the composite is 5 ohm total.
+        // R2 = 3 ohm, so total resistance is 5 ohm.
         network
             .set_device_parameter(&definitions, composite, ParameterId::new(0), 3.0)
             .unwrap();
 
-        // I = 2 A.
         network
             .set_device_parameter(&definitions, source, ParameterId::new(0), 2.0)
             .unwrap();
@@ -1774,14 +1527,13 @@ mod test {
             topology.component_island(DeviceComponent::new(composite, DevicePartitionId::new(0)));
 
         let output_node = IslandNode::net(topology.wire_net(output));
-
         let common_node = IslandNode::net(topology.wire_net(common));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        let writes = runtime.solve_tick(&network, |_| None).unwrap();
 
         assert!(writes.is_empty());
 
@@ -1793,29 +1545,23 @@ mod test {
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
-        /*
-         * Change only the forwarded composite parameter.
-         *
-         * R2 = 8 ohm:
-         * total R = 10 ohm
-         * V = 2 A * 10 ohm = 20 V.
-         */
+        // R2 = 8 ohm, so total resistance becomes 10 ohm.
         network
             .set_device_parameter(&definitions, composite, ParameterId::new(0), 8.0)
             .unwrap();
 
         runtime.mark_numerical_dirty();
 
-        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        let writes = runtime.solve_tick(&network, |_| None).unwrap();
 
         assert!(writes.is_empty());
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
+        // 2 A * (2 + 8) ohm = 20 V.
         assert!((voltage - 20.0).abs() < 1.0e-12);
 
-        // Resistance affects the matrix, so it must restamp.
         assert_eq!(runtime.matrix_stamp_count(), 2);
     }
 }

@@ -527,56 +527,6 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
     code
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Publication {
-    pub subscription_id: u32,
-    pub status: u32,
-    pub value: f64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SolveResult {
-    pub code: u32,
-    pub publication_count: u32,
-    pub required_capacity: u32,
-    pub dirty_island_count: u32,
-    pub solved_island_count: u32,
-    pub failed_island_count: u32,
-}
-
-/// Solves the dirty islands in a world and writes subscription publications.
-///
-/// The function writes at most `publication_capacity` records to
-/// `publications`. It writes the operation summary to `result`. It does not
-/// publish records for unchanged islands.
-///
-/// If the publication capacity is too small, the function reports the
-/// required capacity in `result`. It does not solve an island or publish a
-/// record in this case.
-///
-/// This function is not implemented. The caller must not call it.
-///
-/// # Safety
-///
-/// `engine` must point to a live [`Engine`] with exclusive access for this
-/// call. If `publication_capacity` is not zero, `publications` must point to
-/// writable storage for that number of [`Publication`] records. `result` must
-/// point to writable storage for one [`SolveResult`]. The publication, result,
-/// and engine storage must not overlap. The caller must prevent concurrent use
-/// of the same engine.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hynergy_world_solve(
-    _engine: *mut Engine,
-    _world_id: u32,
-    _publications: *mut Publication,
-    _publication_capacity: u32,
-    _result: *mut SolveResult,
-) -> u32 {
-    todo!("world solving is not implemented")
-}
-
 fn map_world_command_error(error: WorldCommandError) -> CommandResult {
     let code = match error.kind() {
         WorldCommandErrorKind::InvalidMagic => CommandCode::InvalidMagic,
