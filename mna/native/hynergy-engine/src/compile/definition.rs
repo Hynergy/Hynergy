@@ -485,21 +485,25 @@ fn stamp_vcvs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hynergy_ir::StateSlot;
 
-    use crate::compile::{
-        island_ir::IslandIrBuilder, state::StateAllocator, unknown::UnknownAllocator,
-    };
+    use crate::compile::{island_ir::IslandIrBuilder, unknown::UnknownAllocator};
 
     use hynergy_mna::{
         pattern::{PatternBuilder, UnknownIndex},
         system::MnaSystem,
     };
 
+    use crate::compile::state::BoundStateSlots;
     use hynergy_model::device::{
         definition::{DefinitionId, PrimitiveElementKind},
         registry::DefinitionRegistry,
     };
     use hynergy_model::parameter::ParameterId;
+
+    fn state_slots(indices: &[u32]) -> BoundStateSlots {
+        BoundStateSlots::new(indices.iter().copied().map(StateSlot::new).collect())
+    }
 
     fn template(kind: PrimitiveElementKind) -> CompiledDefinitionTemplate {
         let registry = DefinitionRegistry::new();
@@ -543,12 +547,7 @@ mod tests {
 
         let pattern = pattern_builder.finish().unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-
-        let states = state_allocator
-            .allocate(source.state_count())
-            .unwrap()
-            .into();
+        let states = state_slots(&[]);
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
         let inputs = source.bind(&unknowns, &states, &mut ir_builder).unwrap();
@@ -623,16 +622,8 @@ mod tests {
 
         let pattern = pattern_builder.finish().unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-
-        let conductance_states = state_allocator
-            .allocate(conductance.state_count())
-            .unwrap()
-            .into();
-        let source_states = state_allocator
-            .allocate(source.state_count())
-            .unwrap()
-            .into();
+        let conductance_states = state_slots(&[]);
+        let source_states = state_slots(&[]);
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
@@ -748,36 +739,19 @@ mod tests {
 
         let pattern = pattern_builder.finish().unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-
-        let voltage_source_states = state_allocator
-            .allocate(voltage_source.state_count())
-            .unwrap()
-            .into();
-
-        let conductance_states = state_allocator
-            .allocate(conductance.state_count())
-            .unwrap()
-            .into();
-        let vccs_states = state_allocator.allocate(vccs.state_count()).unwrap().into();
+        let states = state_slots(&[]);
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
         let voltage_source_inputs = voltage_source
-            .bind(
-                &voltage_source_unknowns,
-                &voltage_source_states,
-                &mut ir_builder,
-            )
+            .bind(&voltage_source_unknowns, &states, &mut ir_builder)
             .unwrap();
 
         let conductance_inputs = conductance
-            .bind(&conductance_unknowns, &conductance_states, &mut ir_builder)
+            .bind(&conductance_unknowns, &states, &mut ir_builder)
             .unwrap();
 
-        let vccs_inputs = vccs
-            .bind(&vccs_unknowns, &vccs_states, &mut ir_builder)
-            .unwrap();
+        let vccs_inputs = vccs.bind(&vccs_unknowns, &states, &mut ir_builder).unwrap();
 
         let ir = ir_builder.finish().unwrap();
 
@@ -849,28 +823,15 @@ mod tests {
 
         let pattern = pattern_builder.finish().unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-
-        let control_source_states = state_allocator
-            .allocate(voltage_source.state_count())
-            .unwrap()
-            .into();
-
-        let vcvs_states = state_allocator.allocate(vcvs.state_count()).unwrap().into();
+        let states = state_slots(&[]);
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
         let control_source_inputs = voltage_source
-            .bind(
-                &control_source_unknowns,
-                &control_source_states,
-                &mut ir_builder,
-            )
+            .bind(&control_source_unknowns, &states, &mut ir_builder)
             .unwrap();
 
-        let vcvs_inputs = vcvs
-            .bind(&vcvs_unknowns, &vcvs_states, &mut ir_builder)
-            .unwrap();
+        let vcvs_inputs = vcvs.bind(&vcvs_unknowns, &states, &mut ir_builder).unwrap();
 
         let ir = ir_builder.finish().unwrap();
 
@@ -946,23 +907,15 @@ mod tests {
 
         let pattern = pattern_builder.finish().unwrap();
 
-        let mut state_allocator = StateAllocator::new();
+        let source_states = state_slots(&[]);
 
-        let capacitor_states = state_allocator.allocate(capacitor.state_count()).unwrap();
-        let source_states = state_allocator
-            .allocate(source.state_count())
-            .unwrap()
-            .into();
+        let capacitor_states = state_slots(&[0]);
         let capacitor_state = capacitor_states.get(0).unwrap();
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
         let capacitor_inputs = capacitor
-            .bind(
-                &capacitor_unknowns,
-                &capacitor_states.into(),
-                &mut ir_builder,
-            )
+            .bind(&capacitor_unknowns, &capacitor_states, &mut ir_builder)
             .unwrap();
 
         let source_inputs = source
@@ -1091,13 +1044,8 @@ mod tests {
 
         let pattern = pattern_builder.finish().unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-
-        let source_states = state_allocator
-            .allocate(source.state_count())
-            .unwrap()
-            .into();
-        let inductor_states = state_allocator.allocate(inductor.state_count()).unwrap();
+        let source_states = state_slots(&[]);
+        let inductor_states = state_slots(&[0]);
         let inductor_state = inductor_states.get(0).unwrap();
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
@@ -1107,7 +1055,7 @@ mod tests {
             .unwrap();
 
         let inductor_inputs = inductor
-            .bind(&inductor_unknowns, &inductor_states.into(), &mut ir_builder)
+            .bind(&inductor_unknowns, &inductor_states, &mut ir_builder)
             .unwrap();
 
         let ir = ir_builder.finish().unwrap();
@@ -1343,16 +1291,12 @@ mod tests {
         .finish()
         .unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-        let states = state_allocator.allocate(template.state_count()).unwrap();
-
+        let states = state_slots(&[0]);
         let state = states.get(0).unwrap();
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
-        template
-            .bind(&unknowns, &states.into(), &mut ir_builder)
-            .unwrap();
+        template.bind(&unknowns, &states, &mut ir_builder).unwrap();
 
         let ir = ir_builder.finish().unwrap();
 

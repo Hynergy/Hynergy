@@ -930,6 +930,10 @@ mod tests {
     use crate::compile::unknown::UnknownAllocator;
     use hynergy_ir::StateSlot;
 
+    fn state_slots(indices: &[u32]) -> BoundStateSlots {
+        BoundStateSlots::new(indices.iter().copied().map(StateSlot::new).collect())
+    }
+
     #[test]
     fn folds_constant_local_expressions_once() {
         let mut builder = DefinitionTemplateBuilder::new();
@@ -1017,7 +1021,7 @@ mod tests {
 
     #[test]
     fn state_timestep_and_solution_dependencies_bind_to_island_ir() {
-        use crate::compile::{island_ir::IslandIrBuilder, state::StateAllocator};
+        use crate::compile::island_ir::IslandIrBuilder;
 
         let mut builder = DefinitionTemplateBuilder::new();
 
@@ -1046,12 +1050,7 @@ mod tests {
             .bind_unknowns(&[Some(unknown)], allocated_unknowns)
             .unwrap();
 
-        let mut state_allocator = StateAllocator::new();
-
-        let states = state_allocator
-            .allocate(template.state_count())
-            .unwrap()
-            .into();
+        let states = state_slots(&[0]);
         let pattern = PatternBuilder::new(1).unwrap().finish().unwrap();
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
@@ -1061,7 +1060,6 @@ mod tests {
         let ir = ir_builder.finish().unwrap();
 
         assert_eq!(ir.solution_inputs().len(), 1,);
-
         assert_eq!(ir.state_inputs().len(), 1,);
 
         let timestep_input = ir.timestep_input().unwrap();

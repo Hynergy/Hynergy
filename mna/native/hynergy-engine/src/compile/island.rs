@@ -3,7 +3,7 @@ use crate::compile::definition::{
     CompiledDefinition, CompiledPartitionTemplate, DefinitionCompileError, DefinitionStateId,
 };
 use crate::compile::island_ir::{CompiledIslandIr, IslandIrBuildError, IslandIrBuilder};
-use crate::compile::state::{BoundStateSlots, StateAllocationError, StateAllocator};
+use crate::compile::state::{BoundStateSlots, StateAllocationError};
 use crate::compile::template::{BoundDefinitionInputs, BoundUnknowns, DefinitionLinkError};
 use crate::compile::unknown::{UnknownAllocationError, UnknownAllocator};
 use crate::topology::{DerivedTopology, IslandId, NetId};
@@ -252,10 +252,10 @@ impl IslandStateLayout {
             {
                 StateSlot::new(u32::try_from(index).expect("island state index must fit StateSlot"))
             } else {
-                if self.states.len() >= StateAllocator::MAX_STATE_COUNT {
+                if self.states.len() >= crate::compile::state::MAX_STATE_COUNT {
                     return Err(StateAllocationError::StateCountTooLarge {
                         requested: self.states.len() + 1,
-                        max: StateAllocator::MAX_STATE_COUNT,
+                        max: crate::compile::state::MAX_STATE_COUNT,
                     });
                 }
 
@@ -506,9 +506,6 @@ pub(crate) enum IslandRuntimeError {
         parameter: ParameterId,
     },
 
-    #[error("static solve cannot execute an island with tick inputs")]
-    RequiresTickContext,
-
     #[error(transparent)]
     Mna(#[from] MnaError),
 
@@ -635,7 +632,7 @@ impl IslandRuntime {
     {
         self.solution_valid = false;
 
-        self.prepare_static(network, Some(timestep))?;
+        self.prepare_static(network, timestep)?;
 
         for &(slot, input) in self.ir.state_inputs() {
             let state = self
@@ -719,13 +716,11 @@ impl IslandRuntime {
     fn prepare_static(
         &mut self,
         network: &Network,
-        timestep: Option<f64>,
+        timestep: f64,
     ) -> Result<(), IslandRuntimeError> {
         let mut changed = self.load_parameters(network)?;
 
         if let Some(input) = self.ir.timestep_input() {
-            let timestep = timestep.ok_or(IslandRuntimeError::RequiresTickContext)?;
-
             if !timestep.is_finite() || timestep <= 0.0 {
                 return Err(IslandRuntimeError::InvalidTimestep);
             }
@@ -734,7 +729,6 @@ impl IslandRuntime {
                 self.workspace.set_input(input, timestep);
 
                 self.last_timestep = timestep;
-
                 changed = true;
             }
         }

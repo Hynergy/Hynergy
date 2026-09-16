@@ -136,7 +136,7 @@ impl Engine {
             .and_then(Option::as_ref)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[inline]
     fn world_mut(&mut self, world_id: u32) -> Option<&mut World> {
         self.universe
