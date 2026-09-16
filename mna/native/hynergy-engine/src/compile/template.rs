@@ -67,6 +67,7 @@ enum LocalValueNode {
     Sub(LocalValueId, LocalValueId),
     Mul(LocalValueId, LocalValueId),
     Div(LocalValueId, LocalValueId),
+    LessEqual(LocalValueId, LocalValueId),
 
     Neg(LocalValueId),
 }
@@ -348,6 +349,14 @@ impl DefinitionTemplateBuilder {
         self.binary(lhs, rhs, LocalBinaryOp::Div)
     }
 
+    pub(crate) fn less_equal(
+        &mut self,
+        lhs: LocalValueId,
+        rhs: LocalValueId,
+    ) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+        self.binary(lhs, rhs, LocalBinaryOp::LessEqual)
+    }
+
     pub(crate) fn neg(
         &mut self,
         operand: LocalValueId,
@@ -535,6 +544,14 @@ impl DefinitionTemplateBuilder {
                 LocalBinaryOp::Sub => lhs_value - rhs_value,
                 LocalBinaryOp::Mul => lhs_value * rhs_value,
                 LocalBinaryOp::Div => lhs_value / rhs_value,
+
+                LocalBinaryOp::LessEqual => {
+                    if lhs_value <= rhs_value {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
             };
 
             return self.constant(value);
@@ -545,6 +562,7 @@ impl DefinitionTemplateBuilder {
             LocalBinaryOp::Sub => LocalValueNode::Sub(lhs, rhs),
             LocalBinaryOp::Mul => LocalValueNode::Mul(lhs, rhs),
             LocalBinaryOp::Div => LocalValueNode::Div(lhs, rhs),
+            LocalBinaryOp::LessEqual => LocalValueNode::LessEqual(lhs, rhs),
         };
 
         self.allocate_value(LocalValueInfo {
@@ -616,6 +634,7 @@ enum LocalBinaryOp {
     Sub,
     Mul,
     Div,
+    LessEqual,
 }
 
 #[derive(Debug)]
@@ -758,6 +777,10 @@ impl CompiledDefinitionTemplate {
                     ir.div_value(values[lhs.index()], values[rhs.index()])?
                 }
 
+                LocalValueNode::LessEqual(lhs, rhs) => {
+                    ir.less_equal_value(values[lhs.index()], values[rhs.index()])?
+                }
+
                 LocalValueNode::Neg(operand) => ir.neg_value(values[operand.index()])?,
             };
 
@@ -859,7 +882,7 @@ fn matrix_static_dependencies(
     matrix_terms: &[PendingMatrixTerm],
     parameter_count: usize,
 ) -> (SmallVec<[u64; 1]>, bool) {
-    let word_count = parameter_count / 64 + usize::from(parameter_count % 64 != 0);
+    let word_count = parameter_count / 64 + usize::from(!parameter_count.is_multiple_of(64));
     let mut parameters = SmallVec::<[u64; 1]>::new();
 
     parameters.resize(word_count, 0);
@@ -895,7 +918,8 @@ fn matrix_static_dependencies(
             LocalValueNode::Add(lhs, rhs)
             | LocalValueNode::Sub(lhs, rhs)
             | LocalValueNode::Mul(lhs, rhs)
-            | LocalValueNode::Div(lhs, rhs) => {
+            | LocalValueNode::Div(lhs, rhs)
+            | LocalValueNode::LessEqual(lhs, rhs) => {
                 pending.push(lhs);
                 pending.push(rhs);
             }
@@ -1281,5 +1305,47 @@ mod tests {
         let ir = ir_builder.finish().unwrap();
 
         assert!(ir.static_input_affects_matrix(ir.timestep_input().unwrap(),));
+    }
+
+    #[test]
+    fn matrix_dependency_follows_comparison_operands() {
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let terminal = builder.terminal_voltage().unwrap();
+
+        let lhs = builder.parameter().unwrap();
+        let rhs = builder.parameter().unwrap();
+
+        let comparison = builder.less_equal(lhs, rhs).unwrap();
+
+        builder.add_matrix(terminal, terminal, comparison, 1.0);
+
+        let template = builder.finish().unwrap();
+
+        let mut unknown_allocator = UnknownAllocator::new(1).unwrap();
+
+        let unknowns = template
+            .bind_unknowns(
+                &[Some(UnknownIndex::new(0))],
+                unknown_allocator.allocate(0).unwrap(),
+            )
+            .unwrap();
+
+        let mut pattern_builder = PatternBuilder::new(1).unwrap();
+
+        template
+            .request_pattern(&unknowns, &mut pattern_builder)
+            .unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+        let states = BoundStateSlots::new(SmallVec::new());
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        let inputs = template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+        let ir = ir_builder.finish().unwrap();
+
+        assert!(ir.static_input_affects_matrix(inputs.parameter(0).unwrap(),),);
+        assert!(ir.static_input_affects_matrix(inputs.parameter(1).unwrap(),),);
     }
 }

@@ -5,6 +5,7 @@ use thiserror::Error;
 pub struct ValueSlot(u32);
 
 impl ValueSlot {
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn new(index: u32) -> Self {
         Self(index)
@@ -90,6 +91,12 @@ enum ValueOp {
         destination: ValueSlot,
         operand: ValueSlot,
     },
+
+    LessEqual {
+        destination: ValueSlot,
+        lhs: ValueSlot,
+        rhs: ValueSlot,
+    },
 }
 
 impl ValueOp {
@@ -128,6 +135,18 @@ impl ValueOp {
                 values[destination.index()] = values[lhs.index()] / values[rhs.index()];
             }
 
+            Self::LessEqual {
+                destination,
+                lhs,
+                rhs,
+            } => {
+                values[destination.index()] = if values[lhs.index()] <= values[rhs.index()] {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+
             Self::Neg {
                 destination,
                 operand,
@@ -144,6 +163,7 @@ enum BinaryOp {
     Sub,
     Mul,
     Div,
+    LessEqual,
 }
 
 #[derive(Debug, Default)]
@@ -210,6 +230,14 @@ impl ValueProgramBuilder {
 
     pub fn div(&mut self, lhs: ValueSlot, rhs: ValueSlot) -> Result<ValueSlot, ValueBuildError> {
         self.binary(BinaryOp::Div, lhs, rhs)
+    }
+
+    pub fn less_equal(
+        &mut self,
+        lhs: ValueSlot,
+        rhs: ValueSlot,
+    ) -> Result<ValueSlot, ValueBuildError> {
+        self.binary(BinaryOp::LessEqual, lhs, rhs)
     }
 
     pub fn neg(&mut self, operand: ValueSlot) -> Result<ValueSlot, ValueBuildError> {
@@ -282,6 +310,13 @@ impl ValueProgramBuilder {
                 BinaryOp::Sub => lhs - rhs,
                 BinaryOp::Mul => lhs * rhs,
                 BinaryOp::Div => lhs / rhs,
+                BinaryOp::LessEqual => {
+                    if lhs <= rhs {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
             };
 
             return self.constant(value);
@@ -304,6 +339,12 @@ impl ValueProgramBuilder {
             },
 
             BinaryOp::Mul => ValueOp::Mul {
+                destination,
+                lhs,
+                rhs,
+            },
+
+            BinaryOp::LessEqual => ValueOp::LessEqual {
                 destination,
                 lhs,
                 rhs,
@@ -661,5 +702,68 @@ mod tests {
 
         assert_eq!(workspace.value(static_value), 6.0);
         assert_eq!(workspace.value(tick_value), 11.0);
+    }
+
+    #[test]
+    fn less_equal_folds_constant_operands() {
+        let mut builder = ValueProgramBuilder::new();
+
+        let two = builder.constant(2.0).unwrap();
+        let three = builder.constant(3.0).unwrap();
+
+        let less = builder.less_equal(two, three).unwrap();
+        let equal = builder.less_equal(two, two).unwrap();
+        let greater = builder.less_equal(three, two).unwrap();
+
+        assert_eq!(builder.rate(less).unwrap(), EvaluationRate::Constant);
+        assert_eq!(builder.rate(equal).unwrap(), EvaluationRate::Constant);
+        assert_eq!(builder.rate(greater).unwrap(), EvaluationRate::Constant,);
+
+        let program = builder.finish();
+
+        assert_eq!(program.static_op_count(), 0);
+        assert_eq!(program.tick_op_count(), 0);
+        assert_eq!(program.iteration_op_count(), 0);
+
+        let workspace = program.new_workspace();
+
+        assert_eq!(workspace.value(less), 1.0);
+        assert_eq!(workspace.value(equal), 1.0);
+        assert_eq!(workspace.value(greater), 0.0);
+    }
+
+    #[test]
+    fn less_equal_executes_at_highest_operand_rate() {
+        let mut builder = ValueProgramBuilder::new();
+
+        let limit = builder.static_input().unwrap();
+        let value = builder.iteration_input().unwrap();
+
+        let comparison = builder.less_equal(value.value(), limit.value()).unwrap();
+
+        assert_eq!(builder.rate(comparison).unwrap(), EvaluationRate::Iteration,);
+
+        let program = builder.finish();
+        let mut workspace = program.new_workspace();
+
+        workspace.set_input(limit, 2.0);
+        program.execute_static(&mut workspace);
+
+        workspace.set_input(value, 1.0);
+        program.execute_iteration(&mut workspace);
+        assert_eq!(workspace.value(comparison), 1.0);
+
+        workspace.set_input(value, 2.0);
+        program.execute_iteration(&mut workspace);
+        assert_eq!(workspace.value(comparison), 1.0);
+
+        workspace.set_input(value, 3.0);
+        program.execute_iteration(&mut workspace);
+        assert_eq!(workspace.value(comparison), 0.0);
+    }
+
+    #[test]
+    fn value_op_remains_compact() {
+        assert_eq!(size_of::<ValueOp>(), 16);
     }
 }

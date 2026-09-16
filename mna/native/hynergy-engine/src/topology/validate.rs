@@ -199,9 +199,14 @@ impl DerivedTopology {
                         .checked_add(span.len())
                         .expect("device component index overflow");
 
-                    for component_index in span.start()..end {
+                    for (component_index, seen_component) in seen_components
+                        .iter()
+                        .enumerate()
+                        .take(end)
+                        .skip(span.start())
+                    {
                         assert!(
-                            seen_components[component_index],
+                            *seen_component,
                             "live device component is missing from derived islands",
                         );
 

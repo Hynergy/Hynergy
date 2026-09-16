@@ -200,6 +200,15 @@ impl<'a> IslandIrBuilder<'a> {
     }
 
     #[inline]
+    pub(crate) fn less_equal_value(
+        &mut self,
+        lhs: ValueSlot,
+        rhs: ValueSlot,
+    ) -> Result<ValueSlot, ValueBuildError> {
+        self.values.less_equal(lhs, rhs)
+    }
+
+    #[inline]
     pub(crate) fn add_matrix(&mut self, destination: MatrixSlot, source: ValueSlot, scale: f64) {
         self.record_iteration_stamp_dependency(source, true);
 
