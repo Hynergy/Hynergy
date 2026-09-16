@@ -396,6 +396,27 @@ fn compile_primitive(
             builder.write_state(previous_current, next_current)?;
         }
 
+        PrimitiveElementKind::VoltageControlledConductance => {
+            let output_positive = builder.terminal_voltage()?;
+            let output_negative = builder.terminal_voltage()?;
+            let control = builder.terminal_voltage()?;
+
+            let parameters = ControlledConductanceParameters {
+                threshold: builder.parameter()?,
+                transition: builder.parameter()?,
+                g_min: builder.parameter()?,
+                g_max: builder.parameter()?,
+            };
+
+            stamp_voltage_controlled_conductance(
+                &mut builder,
+                output_positive,
+                output_negative,
+                control,
+                parameters,
+            )?;
+        }
+
         _ => {
             return Err(DefinitionCompileError::UnsupportedPrimitive { kind });
         }
@@ -478,6 +499,83 @@ fn stamp_vcvs(
     builder.add_matrix(branch_current, output_negative, one, -1.0);
     builder.add_matrix(branch_current, control_positive, gain, -1.0);
     builder.add_matrix(branch_current, control_negative, gain, 1.0);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlledConductanceParameters {
+    threshold: LocalValueId,
+    transition: LocalValueId,
+    g_min: LocalValueId,
+    g_max: LocalValueId,
+}
+
+fn stamp_voltage_controlled_conductance(
+    builder: &mut DefinitionTemplateBuilder,
+    output_positive: LocalUnknownId,
+    output_negative: LocalUnknownId,
+    control: LocalUnknownId,
+    parameters: ControlledConductanceParameters,
+) -> Result<(), DefinitionTemplateBuildError> {
+    let ControlledConductanceParameters {
+        threshold,
+        transition,
+        g_min,
+        g_max,
+    } = parameters;
+
+    let half = builder.constant(0.5)?;
+    let one = builder.constant(1.0)?;
+
+    let half_transition = builder.mul(transition, half)?;
+
+    let low = builder.sub(threshold, half_transition)?;
+    let high = builder.add(threshold, half_transition)?;
+
+    let conductance_range = builder.sub(g_max, g_min)?;
+    let transition_slope = builder.div(conductance_range, transition)?;
+
+    let output_positive_voltage = builder.unknown_value(output_positive)?;
+    let output_negative_voltage = builder.unknown_value(output_negative)?;
+    let control_node_voltage = builder.unknown_value(control)?;
+
+    let output_voltage = builder.sub(output_positive_voltage, output_negative_voltage)?;
+
+    let control_voltage = builder.sub(control_node_voltage, output_negative_voltage)?;
+
+    let below = builder.less_equal(control_voltage, low)?;
+    let above = builder.less_equal(high, control_voltage)?;
+
+    let inside = builder.sub(one, below)?;
+    let inside = builder.sub(inside, above)?;
+
+    let active_slope = builder.mul(transition_slope, inside)?;
+
+    let control_offset = builder.sub(control_voltage, low)?;
+    let transition_delta = builder.mul(active_slope, control_offset)?;
+    let above_delta = builder.mul(conductance_range, above)?;
+
+    let conductance = builder.add(g_min, above_delta)?;
+    let conductance = builder.add(conductance, transition_delta)?;
+
+    let transconductance = builder.mul(active_slope, output_voltage)?;
+
+    let correction = builder.mul(transconductance, control_voltage)?;
+
+    stamp_conductance(builder, output_positive, output_negative, conductance);
+
+    stamp_vccs(
+        builder,
+        output_positive,
+        output_negative,
+        control,
+        output_negative,
+        transconductance,
+    );
+
+    builder.add_rhs(output_positive, correction, 1.0);
+    builder.add_rhs(output_negative, correction, -1.0);
 
     Ok(())
 }

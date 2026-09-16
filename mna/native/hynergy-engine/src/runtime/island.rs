@@ -1022,4 +1022,243 @@ mod test {
 
         assert_eq!(runtime.matrix_stamp_count(), 2,);
     }
+
+    fn controlled_conductance_with_fixed_control(control_voltage: f64) -> f64 {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let common = WireId::try_from(1).unwrap();
+        let output = WireId::try_from(2).unwrap();
+        let control = WireId::try_from(3).unwrap();
+
+        let controlled = DeviceId::try_from(1).unwrap();
+        let control_source = DeviceId::try_from(2).unwrap();
+        let current_source = DeviceId::try_from(3).unwrap();
+
+        network.add_wire(common).unwrap();
+        network.add_wire(output).unwrap();
+        network.add_wire(control).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                controlled,
+                PrimitiveElementKind::VoltageControlledConductance.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                control_source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                current_source,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        network
+            .attach_terminal(output, controlled, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(common, controlled, TerminalId::new(1))
+            .unwrap();
+
+        network
+            .attach_terminal(control, controlled, TerminalId::new(2))
+            .unwrap();
+
+        network
+            .attach_terminal(control, control_source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(common, control_source, TerminalId::new(1))
+            .unwrap();
+
+        // Inject 6 A from common into output.
+        network
+            .attach_terminal(common, current_source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(output, current_source, TerminalId::new(1))
+            .unwrap();
+
+        // threshold = 2
+        // transition = 2
+        // low = 1
+        // high = 3
+        // G_min = 1
+        // G_max = 5
+        for (index, value) in [2.0, 2.0, 1.0, 5.0].into_iter().enumerate() {
+            network
+                .set_device_parameter(
+                    &definitions,
+                    controlled,
+                    ParameterId::new(index as u32),
+                    value,
+                )
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(
+                &definitions,
+                control_source,
+                ParameterId::new(0),
+                control_voltage,
+            )
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, current_source, ParameterId::new(0), 6.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(controlled, DevicePartitionId::new(0)));
+
+        let output_node = IslandNode::net(topology.wire_net(output));
+        let common_node = IslandNode::net(topology.wire_net(common));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+        runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap()
+    }
+
+    #[test]
+    fn controlled_conductance_below_transition_uses_g_min() {
+        let voltage = controlled_conductance_with_fixed_control(0.0);
+
+        // I / G_min = 6 / 1.
+        assert!((voltage - 6.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn controlled_conductance_above_transition_uses_g_max() {
+        let voltage = controlled_conductance_with_fixed_control(4.0);
+
+        // I / G_max = 6 / 5.
+        assert!((voltage - 1.2).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn controlled_conductance_inside_transition_interpolates_exactly() {
+        let voltage = controlled_conductance_with_fixed_control(2.0);
+
+        // Midpoint:
+        //
+        // G = 1 + (5 - 1) * 0.5 = 3
+        // V = 6 / 3 = 2
+        assert!((voltage - 2.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn controlled_conductance_converges_to_self_controlled_operating_point() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let common = WireId::try_from(1).unwrap();
+        let output = WireId::try_from(2).unwrap();
+
+        let controlled = DeviceId::try_from(1).unwrap();
+        let current_source = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(common).unwrap();
+        network.add_wire(output).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                controlled,
+                PrimitiveElementKind::VoltageControlledConductance.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                current_source,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        network
+            .attach_terminal(output, controlled, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(common, controlled, TerminalId::new(1))
+            .unwrap();
+
+        // Vc = Vout.
+        network
+            .attach_terminal(output, controlled, TerminalId::new(2))
+            .unwrap();
+
+        network
+            .attach_terminal(common, current_source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(output, current_source, TerminalId::new(1))
+            .unwrap();
+
+        for (index, value) in [2.0, 2.0, 1.0, 5.0].into_iter().enumerate() {
+            network
+                .set_device_parameter(
+                    &definitions,
+                    controlled,
+                    ParameterId::new(index as u32),
+                    value,
+                )
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, current_source, ParameterId::new(0), 6.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(controlled, DevicePartitionId::new(0)));
+
+        let output_node = IslandNode::net(topology.wire_net(output));
+        let common_node = IslandNode::net(topology.wire_net(common));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        // Inside the transition:
+        //
+        // G(V) = 1 + 2 * (V - 1)
+        //      = 2V - 1
+        //
+        // 6 = G(V) * V
+        //   = (2V - 1)V
+        //
+        // V = 2 is the positive operating point.
+        assert!((voltage - 2.0).abs() < 1.0e-6);
+
+        assert!(runtime.solve_count() > 1);
+    }
 }
