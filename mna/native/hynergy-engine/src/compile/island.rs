@@ -3,19 +3,63 @@ use crate::compile::definition::{
 };
 use crate::compile::island_ir::{CompiledIslandIr, IslandIrBuildError, IslandIrBuilder};
 use crate::compile::state::{BoundStateSlots, StateAllocationError};
-use crate::compile::template::{
-    BoundDefinitionInputs, BoundUnknowns, CompiledDefinitionTemplate, DefinitionLinkError,
-};
+use crate::compile::template::{BoundUnknowns, CompiledDefinitionTemplate, DefinitionLinkError};
 use crate::compile::unknown::{UnknownAllocationError, UnknownAllocator};
 use crate::topology::{DerivedTopology, IslandId, NetId};
-use hynergy_ir::StateSlot;
+use hynergy_ir::{InputSlot, StateSlot, ValueSlot};
 use hynergy_mna::pattern::{MnaPattern, PatternBuilder, UnknownIndex};
-use hynergy_model::device::definition::{DefinitionId, DeviceId, TerminalId};
+use hynergy_model::device::definition::{DefinitionId, DefinitionObserverId, DeviceId, TerminalId};
 use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::Network;
 use hynergy_model::parameter::ParameterId;
 use smallvec::SmallVec;
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DeviceObserver {
+    device: DeviceId,
+    observer: DefinitionObserverId,
+}
+
+impl DeviceObserver {
+    #[inline]
+    pub(crate) const fn new(device: DeviceId, observer: DefinitionObserverId) -> Self {
+        Self { device, observer }
+    }
+
+    #[inline]
+    pub(crate) const fn device(self) -> DeviceId {
+        self.device
+    }
+
+    #[inline]
+    pub(crate) const fn observer(self) -> DefinitionObserverId {
+        self.observer
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompiledObserverOutput {
+    observer: DeviceObserver,
+    value: ValueSlot,
+}
+
+impl CompiledObserverOutput {
+    #[inline]
+    const fn new(observer: DeviceObserver, value: ValueSlot) -> Self {
+        Self { observer, value }
+    }
+
+    #[inline]
+    pub(crate) const fn observer(self) -> DeviceObserver {
+        self.observer
+    }
+
+    #[inline]
+    pub(crate) const fn value(self) -> ValueSlot {
+        self.value
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IslandUnknownLayout {
@@ -212,10 +256,8 @@ struct BoundIslandPartition<'a> {
 #[derive(Debug)]
 pub(crate) struct CompiledPartitionInputs {
     device: DeviceId,
-
     definition_parameters: SmallVec<[ParameterId; 1]>,
-
-    inputs: BoundDefinitionInputs,
+    parameter_inputs: Box<[InputSlot]>,
 }
 
 impl CompiledPartitionInputs {
@@ -230,8 +272,8 @@ impl CompiledPartitionInputs {
     }
 
     #[inline]
-    pub(crate) const fn inputs(&self) -> &BoundDefinitionInputs {
-        &self.inputs
+    pub(crate) fn parameter_inputs(&self) -> &[InputSlot] {
+        &self.parameter_inputs
     }
 }
 
@@ -259,21 +301,18 @@ pub(crate) struct CompiledIsland {
     ir: CompiledIslandIr,
     unknowns: IslandUnknownLayout,
     states: IslandStateLayout,
-
     partition_inputs: Box<[CompiledPartitionInputs]>,
+    observer_outputs: Box<[CompiledObserverOutput]>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CompiledIslandParts {
     pub(crate) pattern: MnaPattern,
-
     pub(crate) ir: CompiledIslandIr,
-
     pub(crate) unknowns: IslandUnknownLayout,
-
     pub(crate) states: IslandStateLayout,
-
     pub(crate) partition_inputs: Box<[CompiledPartitionInputs]>,
+    pub(crate) observer_outputs: Box<[CompiledObserverOutput]>,
 }
 
 impl CompiledIsland {
@@ -284,8 +323,8 @@ impl CompiledIsland {
             ir: self.ir,
             unknowns: self.unknowns,
             states: self.states,
-
             partition_inputs: self.partition_inputs,
+            observer_outputs: self.observer_outputs,
         }
     }
 }
@@ -316,6 +355,10 @@ impl CompiledIsland {
     pub(crate) fn force_nonlinear_iteration_for_test(&mut self, affects_matrix: bool) {
         self.ir.force_nonlinear_iteration_for_test(affects_matrix);
     }
+    #[inline]
+    pub(crate) fn observer_outputs(&self) -> &[CompiledObserverOutput] {
+        &self.observer_outputs
+    }
 }
 
 pub(crate) fn compile_island_parts(
@@ -325,9 +368,7 @@ pub(crate) fn compile_island_parts(
     let unknown_layout = IslandUnknownLayout::new(nodes)?;
 
     let mut unknown_allocator = UnknownAllocator::new(unknown_layout.dimension())?;
-
     let mut state_layout = IslandStateLayout::new();
-
     let mut bound_partitions = Vec::with_capacity(partitions.len());
 
     for partition in partitions {
@@ -345,11 +386,8 @@ pub(crate) fn compile_island_parts(
 
         bound_partitions.push(BoundIslandPartition {
             device: partition.device,
-
             template,
-
             unknowns,
-
             states,
         });
     }
@@ -362,8 +400,8 @@ pub(crate) fn compile_island_parts(
     let pattern = build_island_pattern(unknown_allocator.dimension(), &pattern_partitions)?;
 
     let mut ir_builder = IslandIrBuilder::new(&pattern);
-
     let mut partition_inputs = Vec::with_capacity(bound_partitions.len());
+    let mut observer_outputs = Vec::new();
 
     for (partition, spec) in bound_partitions.iter().zip(partitions) {
         let inputs =
@@ -371,26 +409,49 @@ pub(crate) fn compile_island_parts(
                 .template
                 .bind(&partition.unknowns, &partition.states, &mut ir_builder)?;
 
+        let (parameter_inputs, outputs) = inputs.into_parts();
+        let definition_observers = spec.partition.definition_observers();
+
+        debug_assert_eq!(
+            definition_observers.len(),
+            outputs.len(),
+            "compiled observer IDs must match template outputs",
+        );
+
+        for (&observer, &value) in definition_observers.iter().zip(&outputs) {
+            observer_outputs.push(CompiledObserverOutput::new(
+                DeviceObserver::new(partition.device, observer),
+                value,
+            ));
+        }
+
         partition_inputs.push(CompiledPartitionInputs {
             device: partition.device,
 
             definition_parameters: SmallVec::from_slice(spec.partition.definition_parameters()),
 
-            inputs,
+            parameter_inputs,
         });
     }
+
+    observer_outputs.sort_unstable_by_key(|output| output.observer());
+
+    debug_assert!(
+        observer_outputs
+            .windows(2)
+            .all(|outputs| outputs[0].observer() != outputs[1].observer()),
+        "device observer must have exactly one island output",
+    );
 
     let ir = ir_builder.finish()?;
 
     Ok(CompiledIsland {
         pattern,
         ir,
-
         unknowns: unknown_layout,
-
         states: state_layout,
-
         partition_inputs: partition_inputs.into_boxed_slice(),
+        observer_outputs: observer_outputs.into_boxed_slice(),
     })
 }
 

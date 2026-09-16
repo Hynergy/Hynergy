@@ -5,7 +5,8 @@ use crate::compile::template::{
 use hynergy_ids::define_id;
 use hynergy_model::circuit::{Circuit, NodeId, ValueRef};
 use hynergy_model::device::definition::{
-    DeviceBody, DeviceDefinition, DevicePartitionId, PrimitiveElementKind, TerminalId,
+    DefinitionObserverId, DefinitionObserverSource, DeviceBody, DeviceDefinition,
+    DevicePartitionId, PrimitiveElementKind, TerminalId,
 };
 use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::parameter::ParameterId;
@@ -40,23 +41,17 @@ impl CompiledDefinition {
                 );
 
                 let partition = DevicePartitionId::new(0);
-
                 let definition_parameters = definition_parameters(definition);
-
                 let definition_states = definition_states(definition);
 
                 vec![CompiledPartitionTemplate {
                     definition_terminals: definition_terminals_for_partition(definition, partition),
-
                     definition_parameters,
-
                     definition_state_reads: definition_states.clone(),
-
                     definition_state_writes: definition_states.clone(),
-
                     definition_states,
-
                     template,
+                    definition_observers: SmallVec::new(),
                 }]
                 .into_boxed_slice()
             }
@@ -99,11 +94,12 @@ impl CompiledDefinition {
 
 #[derive(Debug)]
 pub(crate) struct CompiledPartitionTemplate {
-    definition_terminals: SmallVec<[TerminalId; 8]>,
-    definition_parameters: SmallVec<[ParameterId; 1]>,
+    definition_terminals: SmallVec<[TerminalId; 4]>,
+    definition_parameters: SmallVec<[ParameterId; 4]>,
     definition_states: SmallVec<[DefinitionStateId; 4]>,
     definition_state_reads: SmallVec<[DefinitionStateId; 4]>,
     definition_state_writes: SmallVec<[DefinitionStateId; 4]>,
+    definition_observers: SmallVec<[DefinitionObserverId; 4]>,
     template: CompiledDefinitionTemplate,
 }
 
@@ -137,9 +133,14 @@ impl CompiledPartitionTemplate {
     pub(crate) fn definition_parameters(&self) -> &[ParameterId] {
         &self.definition_parameters
     }
+
+    #[inline]
+    pub(crate) fn definition_observers(&self) -> &[DefinitionObserverId] {
+        &self.definition_observers
+    }
 }
 
-fn definition_parameters(definition: &DeviceDefinition) -> SmallVec<[ParameterId; 1]> {
+fn definition_parameters(definition: &DeviceDefinition) -> SmallVec<[ParameterId; 4]> {
     (0..definition.parameters().len())
         .map(|index| {
             ParameterId::new(u32::try_from(index).expect("parameter index must fit ParameterId"))
@@ -230,6 +231,7 @@ fn compile_tick_delay_partitions(
             definition_state_reads,
             definition_state_writes,
             template: builder.finish()?,
+            definition_observers: SmallVec::new(),
         });
     }
 
@@ -239,7 +241,7 @@ fn compile_tick_delay_partitions(
 fn definition_terminals_for_partition(
     definition: &DeviceDefinition,
     partition: DevicePartitionId,
-) -> SmallVec<[TerminalId; 8]> {
+) -> SmallVec<[TerminalId; 4]> {
     definition
         .terminal_partitions()
         .iter()
@@ -552,7 +554,7 @@ fn compile_composite_partition(
     }
 
     let mut parameter_values = vec![None; definition.parameters().len()];
-    let mut definition_parameters = SmallVec::<[ParameterId; 1]>::new();
+    let mut definition_parameters = SmallVec::<[ParameterId; 4]>::new();
 
     let state_count = definition.state_count();
 
@@ -642,6 +644,8 @@ fn compile_composite_partition(
         }
     }
 
+    let mut forwarded_observer_values = vec![None; definition.observers().len()];
+
     child_partition_offset = 0;
 
     for (element_index, element) in circuit.elements().iter().enumerate() {
@@ -664,7 +668,7 @@ fn compile_composite_partition(
                 .partition(child_partition_id)
                 .expect("compiled child partition must exist");
 
-            let mut terminals = SmallVec::<[LocalUnknownId; 8]>::new();
+            let mut terminals = SmallVec::<[LocalUnknownId; 4]>::new();
 
             for &terminal in child_partition.definition_terminals() {
                 let node = element.terminals()[terminal.index()];
@@ -700,12 +704,46 @@ fn compile_composite_partition(
                 );
             }
 
-            child_partition.template().instantiate_into(
+            let child_outputs = child_partition.template().instantiate_into(
                 &mut builder,
                 &terminals,
                 &parameters,
                 &states,
             )?;
+
+            debug_assert_eq!(
+                child_outputs.len(),
+                child_partition.definition_observers().len(),
+            );
+
+            for (&child_observer, &output) in child_partition
+                .definition_observers()
+                .iter()
+                .zip(&child_outputs)
+            {
+                for (parent_index, parent_observer) in definition.observers().iter().enumerate() {
+                    if parent_observer.partition() != parent_partition {
+                        continue;
+                    }
+
+                    let DefinitionObserverSource::Child { element, observer } =
+                        parent_observer.source()
+                    else {
+                        continue;
+                    };
+
+                    if element.index() != element_index || observer != child_observer {
+                        continue;
+                    }
+
+                    debug_assert!(
+                        forwarded_observer_values[parent_index]
+                            .replace(output)
+                            .is_none(),
+                        "forwarded observer must have exactly one child output",
+                    );
+                }
+            }
         }
 
         child_partition_offset += child.partition_count();
@@ -717,12 +755,21 @@ fn compile_composite_partition(
         "element partition layout must cover every child partition",
     );
 
+    let definition_observers = compile_partition_observers(
+        definition,
+        parent_partition,
+        &node_unknowns,
+        &forwarded_observer_values,
+        &mut builder,
+    )?;
+
     Ok(CompiledPartitionTemplate {
         definition_terminals,
         definition_parameters,
         definition_states,
         definition_state_reads,
         definition_state_writes,
+        definition_observers,
         template: builder.finish()?,
     })
 }
@@ -746,7 +793,7 @@ fn composite_node_unknown(
 fn composite_parameter_value(
     builder: &mut DefinitionTemplateBuilder,
     parameter_values: &mut [Option<LocalValueId>],
-    definition_parameters: &mut SmallVec<[ParameterId; 1]>,
+    definition_parameters: &mut SmallVec<[ParameterId; 4]>,
     value: ValueRef,
 ) -> Result<LocalValueId, DefinitionTemplateBuildError> {
     match value {
@@ -760,7 +807,6 @@ fn composite_parameter_value(
             let value = builder.parameter()?;
 
             parameter_values[parameter.index()] = Some(value);
-
             definition_parameters.push(parameter);
 
             Ok(value)
@@ -995,6 +1041,48 @@ fn stamp_voltage_controlled_switch(
     Ok(next_mode)
 }
 
+fn compile_partition_observers(
+    definition: &DeviceDefinition,
+    partition: DevicePartitionId,
+    node_unknowns: &[Option<LocalUnknownId>],
+    forwarded_values: &[Option<LocalValueId>],
+    builder: &mut DefinitionTemplateBuilder,
+) -> Result<SmallVec<[DefinitionObserverId; 4]>, DefinitionTemplateBuildError> {
+    debug_assert_eq!(forwarded_values.len(), definition.observers().len());
+
+    let mut compiled = SmallVec::new();
+
+    for (index, observer) in definition.observers().iter().enumerate() {
+        if observer.partition() != partition {
+            continue;
+        }
+
+        let value = match observer.source() {
+            DefinitionObserverSource::Voltage { positive, negative } => {
+                let positive = node_unknowns[positive.index()]
+                    .expect("observer node must belong to its compiled partition");
+                let negative = node_unknowns[negative.index()]
+                    .expect("observer node must belong to its compiled partition");
+
+                let positive = builder.unknown_value(positive)?;
+                let negative = builder.unknown_value(negative)?;
+
+                builder.sub(positive, negative)?
+            }
+
+            DefinitionObserverSource::Child { .. } => forwarded_values[index]
+                .expect("forwarded child observer must have a compiled child output"),
+        };
+
+        builder.output(value)?;
+        compiled.push(DefinitionObserverId::new(
+            u32::try_from(index).expect("validated observer index must fit DefinitionObserverId"),
+        ));
+    }
+
+    Ok(compiled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,6 +1114,51 @@ mod tests {
         let definition = registry.get(DefinitionId::from(kind)).unwrap();
 
         CompiledDefinitionTemplate::compile(definition).unwrap()
+    }
+
+    #[test]
+    fn composite_direct_voltage_observer_becomes_template_output() {
+        let mut registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let positive = builder.add_terminal().unwrap();
+            let negative = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Conductance.into(),
+                    vec![positive, negative],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder.add_voltage_observer(positive, negative).unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.observers().len(), 1);
+        assert_eq!(
+            definition.observers()[0].partition(),
+            DevicePartitionId::new(0),
+        );
+
+        let definition_id = registry.register(definition).unwrap();
+        let definition = registry.get(definition_id).unwrap();
+
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        assert_eq!(partition.template().output_count(), 1);
+
+        assert_eq!(
+            partition.definition_observers(),
+            &[DefinitionObserverId::new(0)],
+        );
+
+        assert_eq!(partition.template().output_count(), 1);
     }
 
     #[test]
@@ -2145,5 +2278,70 @@ mod tests {
 
         assert_eq!(input.template().state_count(), 1);
         assert_eq!(output.template().state_count(), 1);
+    }
+
+    #[test]
+    fn composite_forwards_child_observer_output() {
+        let mut registry = DefinitionRegistry::new();
+
+        let child = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let positive = builder.add_terminal().unwrap();
+            let negative = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Conductance.into(),
+                    vec![positive, negative],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            let observer = builder.add_voltage_observer(positive, negative).unwrap();
+
+            assert_eq!(observer, DefinitionObserverId::new(0));
+
+            builder.build_definition().unwrap()
+        };
+
+        let child = registry.register(child).unwrap();
+
+        let parent = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let positive = builder.add_terminal().unwrap();
+            let negative = builder.add_terminal().unwrap();
+
+            let child = builder
+                .add_element(Element::new(
+                    child,
+                    vec![positive, negative],
+                    Vec::<ValueRef>::new(),
+                ))
+                .unwrap();
+
+            let observer = builder
+                .add_child_observer(child, DefinitionObserverId::new(0))
+                .unwrap();
+
+            assert_eq!(observer, DefinitionObserverId::new(0));
+
+            builder.build_definition().unwrap()
+        };
+
+        let parent = registry.register(parent).unwrap();
+
+        let compiled =
+            CompiledDefinition::compile(&registry, registry.get(parent).unwrap()).unwrap();
+
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        assert_eq!(
+            partition.definition_observers(),
+            &[DefinitionObserverId::new(0)],
+        );
+
+        assert_eq!(partition.template().output_count(), 1);
     }
 }

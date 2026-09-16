@@ -1,7 +1,7 @@
 use crate::compile::definition::DefinitionStateId;
 use crate::compile::island::{
-    CompiledIsland, CompiledIslandParts, CompiledPartitionInputs, DeviceState, IslandNode,
-    IslandStateLayout, IslandUnknownLayout,
+    CompiledIsland, CompiledIslandParts, CompiledObserverOutput, CompiledPartitionInputs,
+    DeviceObserver, DeviceState, IslandNode, IslandStateLayout, IslandUnknownLayout,
 };
 use crate::compile::island_ir::CompiledIslandIr;
 use hynergy_ir::ValueWorkspace;
@@ -76,6 +76,7 @@ pub(crate) struct IslandRuntime {
     matrix_dirty: bool,
     static_inputs_dirty: bool,
     nonlinear_scratch: Option<Box<NonlinearScratch>>,
+    observer_outputs: Box<[CompiledObserverOutput]>,
 
     #[cfg(test)]
     matrix_stamp_count: usize,
@@ -94,6 +95,7 @@ impl IslandRuntime {
             unknowns,
             states,
             partition_inputs,
+            observer_outputs,
         } = compiled.into_parts();
 
         let dimension = pattern.dimension();
@@ -119,6 +121,7 @@ impl IslandRuntime {
             unknowns,
             states,
             partition_inputs,
+            observer_outputs,
             workspace,
             solution: vec![0.0; dimension].into_boxed_slice(),
             solution_valid: false,
@@ -131,6 +134,19 @@ impl IslandRuntime {
             #[cfg(test)]
             solve_count: 0,
         })
+    }
+
+    pub(crate) fn observer_value(&self, observer: DeviceObserver) -> Option<f64> {
+        if !self.solution_valid {
+            return None;
+        }
+
+        let index = self
+            .observer_outputs
+            .binary_search_by_key(&observer, |output| output.observer())
+            .ok()?;
+
+        Some(self.workspace.value(self.observer_outputs[index].value()))
     }
 
     fn factorize_matrix_if_dirty(&mut self) -> Result<(), IslandRuntimeError> {
@@ -355,7 +371,7 @@ impl IslandRuntime {
 
             let parameter_ids = partition.definition_parameters();
 
-            let parameter_inputs = partition.inputs().parameters();
+            let parameter_inputs = partition.parameter_inputs();
 
             debug_assert_eq!(parameter_ids.len(), parameter_inputs.len(),);
 
@@ -558,7 +574,9 @@ impl StaticChanges {
 #[cfg(test)]
 mod test {
     use crate::compile::definition::DefinitionStateId;
-    use crate::compile::island::{DeviceState, IslandNode, compile_topology_island};
+    use crate::compile::island::{
+        DeviceObserver, DeviceState, IslandNode, compile_topology_island,
+    };
     use crate::compile::island_ir::IslandIrBuilder;
     use crate::runtime::island::{
         IslandRuntime, advance_iteration_latches, initialize_iteration_latches,
@@ -570,7 +588,8 @@ mod test {
     use hynergy_model::circuit::{Element, ValueRef};
     use hynergy_model::device::builder::DeviceDefinitionBuilder;
     use hynergy_model::device::definition::{
-        DefinitionId, DeviceId, DevicePartitionId, PrimitiveElementKind, TerminalId,
+        DefinitionId, DefinitionObserverId, DeviceId, DevicePartitionId, PrimitiveElementKind,
+        TerminalId,
     };
     use hynergy_model::device::registry::DefinitionRegistry;
     use hynergy_model::network::{Network, WireId};
@@ -1563,5 +1582,89 @@ mod test {
         assert!((voltage - 20.0).abs() < 1.0e-12);
 
         assert_eq!(runtime.matrix_stamp_count(), 2);
+    }
+
+    #[test]
+    fn composite_voltage_observer_is_available_after_solve() {
+        let mut definitions = DefinitionRegistry::new();
+
+        let observed_definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let positive = builder.add_terminal().unwrap();
+            let negative = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Conductance.into(),
+                    vec![positive, negative],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            let observer = builder.add_voltage_observer(positive, negative).unwrap();
+
+            assert_eq!(observer, DefinitionObserverId::new(0));
+
+            builder.build_definition().unwrap()
+        };
+
+        let observed_definition = definitions.register(observed_definition).unwrap();
+
+        let mut network = Network::new();
+
+        let negative = WireId::try_from(1).unwrap();
+        let positive = WireId::try_from(2).unwrap();
+
+        let observed = DeviceId::try_from(1).unwrap();
+        let source = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(negative).unwrap();
+        network.add_wire(positive).unwrap();
+
+        network
+            .add_device(&definitions, observed, observed_definition)
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        for device in [observed, source] {
+            network
+                .attach_terminal(positive, device, TerminalId::new(0))
+                .unwrap();
+
+            network
+                .attach_terminal(negative, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(observed, DevicePartitionId::new(0)));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled, 1.0).unwrap();
+
+        let observer = DeviceObserver::new(observed, DefinitionObserverId::new(0));
+
+        assert_eq!(runtime.observer_value(observer), None);
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        let value = runtime.observer_value(observer).unwrap();
+
+        assert!((value - 5.0).abs() < 1.0e-12);
     }
 }

@@ -1248,6 +1248,10 @@ impl BoundDefinitionInputs {
     pub(crate) fn output(&self, index: usize) -> Option<ValueSlot> {
         self.outputs.get(index).copied()
     }
+
+    pub(crate) fn into_parts(self) -> (Box<[InputSlot]>, Box<[ValueSlot]>) {
+        (self.parameters, self.outputs)
+    }
 }
 
 fn canonicalize_pending_matrix_terms(terms: &mut Vec<PendingMatrixTerm>) {
