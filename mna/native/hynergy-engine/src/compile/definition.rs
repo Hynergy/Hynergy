@@ -1,4 +1,4 @@
-use super::{
+use crate::compile::template::{
     CompiledDefinitionTemplate, DefinitionTemplateBuildError, DefinitionTemplateBuilder,
     LocalUnknownId, LocalValueId,
 };
@@ -158,7 +158,7 @@ fn compile_tick_delay_partitions(
 
         let definition_terminals = definition_terminals_for_partition(definition, partition);
 
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         match partition_index {
             0 => {
@@ -265,7 +265,7 @@ impl CompiledDefinitionTemplate {
 fn compile_primitive(
     kind: PrimitiveElementKind,
 ) -> Result<CompiledDefinitionTemplate, DefinitionCompileError> {
-    let mut builder = DefinitionTemplateBuilder::new();
+    let mut builder = DefinitionTemplateBuilder::default();
 
     match kind {
         PrimitiveElementKind::Conductance => {
@@ -417,6 +417,37 @@ fn compile_primitive(
             )?;
         }
 
+        PrimitiveElementKind::VoltageControlledSwitch => {
+            let output_positive = builder.terminal_voltage()?;
+
+            let output_negative = builder.terminal_voltage()?;
+
+            let control_positive = builder.terminal_voltage()?;
+
+            let control_negative = builder.terminal_voltage()?;
+
+            let parameters = ControlledSwitchParameters {
+                threshold: builder.parameter()?,
+                hysteresis: builder.parameter()?,
+                g_max: builder.parameter()?,
+                g_min: builder.parameter()?,
+            };
+
+            let state = builder.state()?;
+
+            let next_mode = stamp_voltage_controlled_switch(
+                &mut builder,
+                output_positive,
+                output_negative,
+                control_positive,
+                control_negative,
+                state.value(),
+                parameters,
+            )?;
+
+            builder.write_state(state, next_mode)?;
+        }
+
         _ => {
             return Err(DefinitionCompileError::UnsupportedPrimitive { kind });
         }
@@ -504,6 +535,14 @@ fn stamp_vcvs(
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ControlledSwitchParameters {
+    threshold: LocalValueId,
+    hysteresis: LocalValueId,
+    g_max: LocalValueId,
+    g_min: LocalValueId,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ControlledConductanceParameters {
     threshold: LocalValueId,
     transition: LocalValueId,
@@ -580,6 +619,70 @@ fn stamp_voltage_controlled_conductance(
     Ok(())
 }
 
+fn stamp_voltage_controlled_switch(
+    builder: &mut DefinitionTemplateBuilder,
+    output_positive: LocalUnknownId,
+    output_negative: LocalUnknownId,
+    control_positive: LocalUnknownId,
+    control_negative: LocalUnknownId,
+    initial_mode: LocalValueId,
+    parameters: ControlledSwitchParameters,
+) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+    let ControlledSwitchParameters {
+        threshold,
+        hysteresis,
+        g_max,
+        g_min,
+    } = parameters;
+
+    let zero = builder.constant(0.0)?;
+    let half = builder.constant(0.5)?;
+    let one = builder.constant(1.0)?;
+
+    let half_hysteresis = builder.mul(hysteresis, half)?;
+
+    let lower = builder.sub(threshold, half_hysteresis)?;
+    let upper = builder.add(threshold, half_hysteresis)?;
+
+    let control_positive_voltage = builder.unknown_value(control_positive)?;
+    let control_negative_voltage = builder.unknown_value(control_negative)?;
+
+    let control_voltage = builder.sub(control_positive_voltage, control_negative_voltage)?;
+
+    let mode = builder.iteration_latch(initial_mode)?;
+
+    let current_mode = mode.value();
+
+    let turn_on = builder.less_equal(upper, control_voltage)?;
+    let turn_off = builder.less_equal(control_voltage, lower)?;
+
+    let off = builder.sub(one, current_mode)?;
+
+    let remain_on = builder.sub(one, turn_off)?;
+
+    let off_to_on = builder.mul(off, turn_on)?;
+    let on_to_on = builder.mul(current_mode, remain_on)?;
+
+    let hysteretic_mode = builder.add(off_to_on, on_to_on)?;
+    let zero_hysteresis = builder.less_equal(hysteresis, zero)?;
+    let direct_mode = builder.less_equal(threshold, control_voltage)?;
+    let use_hysteresis = builder.sub(one, zero_hysteresis)?;
+    let hysteretic_part = builder.mul(use_hysteresis, hysteretic_mode)?;
+    let direct_part = builder.mul(zero_hysteresis, direct_mode)?;
+    let next_mode = builder.add(hysteretic_part, direct_part)?;
+
+    builder.update_iteration_latch(mode, next_mode);
+    builder.require_iteration_stability(next_mode);
+
+    let conductance_range = builder.sub(g_max, g_min)?;
+    let mode_conductance = builder.mul(next_mode, conductance_range)?;
+    let conductance = builder.add(g_min, mode_conductance)?;
+
+    stamp_conductance(builder, output_positive, output_negative, conductance);
+
+    Ok(next_mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +696,7 @@ mod tests {
     };
 
     use crate::compile::state::BoundStateSlots;
+    use crate::compile::template::CompiledDefinitionTemplate;
     use hynergy_model::device::{
         definition::{DefinitionId, PrimitiveElementKind},
         registry::DefinitionRegistry,

@@ -270,7 +270,8 @@ impl PrimitiveElementKind {
 
     pub const fn state_count(self) -> usize {
         match self {
-            Self::Capacitor | Self::Inductor | Self::TickDelay => 1,
+            Self::Capacitor | Self::Inductor | Self::VoltageControlledSwitch | Self::TickDelay => 1,
+
             _ => 0,
         }
     }
@@ -682,7 +683,8 @@ mod tests {
             let expected = match kind {
                 PrimitiveElementKind::Capacitor
                 | PrimitiveElementKind::Inductor
-                | PrimitiveElementKind::TickDelay => 1,
+                | PrimitiveElementKind::TickDelay
+                | PrimitiveElementKind::VoltageControlledSwitch => 1,
 
                 _ => 0,
             };

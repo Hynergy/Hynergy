@@ -35,6 +35,37 @@ impl IterationStampDependency {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingIterationLatch {
+    input: InputSlot,
+    initial: ValueSlot,
+    update: Option<ValueSlot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IterationLatch {
+    input: InputSlot,
+    initial: ValueSlot,
+    update: ValueSlot,
+}
+
+impl IterationLatch {
+    #[inline]
+    pub(crate) const fn input(self) -> InputSlot {
+        self.input
+    }
+
+    #[inline]
+    pub(crate) const fn initial(self) -> ValueSlot {
+        self.initial
+    }
+
+    #[inline]
+    pub(crate) const fn update(self) -> ValueSlot {
+        self.update
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct IslandIrBuilder<'a> {
     pattern: &'a MnaPattern,
@@ -48,6 +79,8 @@ pub(crate) struct IslandIrBuilder<'a> {
     solution_inputs: BTreeMap<UnknownIndex, InputSlot>,
     state_inputs: BTreeMap<StateSlot, InputSlot>,
     iteration_stamp_dependency: IterationStampDependency,
+    iteration_stability_values: Vec<ValueSlot>,
+    iteration_latches: Vec<PendingIterationLatch>,
 }
 
 impl<'a> IslandIrBuilder<'a> {
@@ -64,12 +97,51 @@ impl<'a> IslandIrBuilder<'a> {
             solution_inputs: BTreeMap::new(),
             state_inputs: BTreeMap::new(),
             iteration_stamp_dependency: IterationStampDependency::None,
+            iteration_stability_values: Vec::new(),
+            iteration_latches: Vec::new(),
         }
     }
 
-    #[inline]
-    pub(crate) const fn pattern(&self) -> &MnaPattern {
-        self.pattern
+    pub(crate) fn iteration_latch(
+        &mut self,
+        initial: ValueSlot,
+    ) -> Result<ValueSlot, ValueBuildError> {
+        let rate = self.values.rate(initial)?;
+
+        debug_assert!(
+            rate <= EvaluationRate::Tick,
+            "iteration latch initial value must be available before iteration",
+        );
+
+        let input = self.values.iteration_input()?;
+
+        self.iteration_latches.push(PendingIterationLatch {
+            input,
+            initial,
+            update: None,
+        });
+
+        Ok(input.value())
+    }
+
+    pub(crate) fn update_iteration_latch(&mut self, latch: ValueSlot, update: ValueSlot) {
+        debug_assert_eq!(
+            self.values
+                .rate(update)
+                .expect("iteration latch update must belong to its value program"),
+            EvaluationRate::Iteration,
+        );
+
+        let pending = self
+            .iteration_latches
+            .iter_mut()
+            .find(|candidate| candidate.input.value() == latch)
+            .expect("iteration latch value must belong to this builder");
+
+        assert!(
+            pending.update.replace(update).is_none(),
+            "iteration latch must have exactly one update",
+        );
     }
 
     #[inline]
@@ -242,8 +314,22 @@ impl<'a> IslandIrBuilder<'a> {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let iteration_latches = self
+            .iteration_latches
+            .into_iter()
+            .map(|latch| IterationLatch {
+                input: latch.input,
+                initial: latch.initial,
+                update: latch.update.expect("iteration latch must have an update"),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         self.matrix_static_inputs.sort_unstable();
         self.matrix_static_inputs.dedup();
+
+        self.iteration_stability_values.sort_unstable();
+        self.iteration_stability_values.dedup();
 
         Ok(CompiledIslandIr {
             value_program: self.values.finish(),
@@ -252,9 +338,11 @@ impl<'a> IslandIrBuilder<'a> {
             state_transition,
             matrix_static_inputs: self.matrix_static_inputs.into_boxed_slice(),
             iteration_stamp_dependency: self.iteration_stamp_dependency,
+            iteration_stability_values: self.iteration_stability_values.into_boxed_slice(),
             timestep_input: self.timestep_input,
             solution_inputs,
             state_inputs,
+            iteration_latches,
         })
     }
 
@@ -280,6 +368,24 @@ impl<'a> IslandIrBuilder<'a> {
             self.iteration_stamp_dependency = IterationStampDependency::Rhs;
         }
     }
+
+    #[inline]
+    pub(crate) fn require_iteration_stability(&mut self, value: ValueSlot) {
+        debug_assert_eq!(
+            self.values
+                .rate(value)
+                .expect("stability value must belong to its value program"),
+            EvaluationRate::Iteration,
+            "iteration stability values must be iteration-rate values",
+        );
+
+        self.iteration_stability_values.push(value);
+    }
+
+    #[inline]
+    pub(crate) const fn pattern(&self) -> &MnaPattern {
+        self.pattern
+    }
 }
 
 #[derive(Debug)]
@@ -290,6 +396,8 @@ pub(crate) struct CompiledIslandIr {
     state_transition: StateTransitionProgram,
     matrix_static_inputs: Box<[InputSlot]>,
     iteration_stamp_dependency: IterationStampDependency,
+    iteration_stability_values: Box<[ValueSlot]>,
+    iteration_latches: Box<[IterationLatch]>,
     timestep_input: Option<InputSlot>,
     solution_inputs: Box<[(UnknownIndex, InputSlot)]>,
     state_inputs: Box<[(StateSlot, InputSlot)]>,
@@ -344,6 +452,16 @@ impl CompiledIslandIr {
     #[inline]
     pub(crate) const fn iteration_affects_matrix(&self) -> bool {
         self.iteration_stamp_dependency.affects_matrix()
+    }
+
+    #[inline]
+    pub(crate) fn iteration_stability_values(&self) -> &[ValueSlot] {
+        &self.iteration_stability_values
+    }
+
+    #[inline]
+    pub(crate) fn iteration_latches(&self) -> &[IterationLatch] {
+        &self.iteration_latches
     }
 
     #[cfg(test)]
@@ -522,5 +640,47 @@ mod tests {
 
         assert!(ir.requires_nonlinear_iteration());
         assert!(ir.iteration_affects_matrix());
+    }
+
+    #[test]
+    fn iteration_stability_values_are_deduplicated() {
+        let pattern = empty_pattern(1);
+        let unknown = UnknownIndex::new(0);
+
+        let mut builder = IslandIrBuilder::new(&pattern);
+
+        let value = builder.unknown_value(Some(unknown)).unwrap();
+
+        builder.require_iteration_stability(value);
+        builder.require_iteration_stability(value);
+
+        let ir = builder.finish().unwrap();
+
+        assert_eq!(ir.iteration_stability_values(), &[value]);
+    }
+
+    #[test]
+    fn iteration_latch_records_initial_and_update_values() {
+        let pattern = empty_pattern(1);
+
+        let mut builder = IslandIrBuilder::new(&pattern);
+
+        let initial = builder.state_value(StateSlot::new(0)).unwrap();
+        let latch = builder.iteration_latch(initial).unwrap();
+
+        let unknown = builder.unknown_value(Some(UnknownIndex::new(0))).unwrap();
+        let update = builder.less_equal_value(latch, unknown).unwrap();
+
+        builder.update_iteration_latch(latch, update);
+
+        let ir = builder.finish().unwrap();
+
+        assert_eq!(ir.iteration_latches().len(), 1);
+
+        let compiled = ir.iteration_latches()[0];
+
+        assert_eq!(compiled.initial(), initial);
+        assert_eq!(compiled.input().value(), latch);
+        assert_eq!(compiled.update(), update);
     }
 }

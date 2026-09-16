@@ -610,11 +610,11 @@ impl PhysicalStateStore {
             }
 
             DeviceBody::Primitive(
-                PrimitiveElementKind::Capacitor | PrimitiveElementKind::Inductor,
+                PrimitiveElementKind::Capacitor
+                | PrimitiveElementKind::Inductor
+                | PrimitiveElementKind::VoltageControlledSwitch,
             ) => {
-                debug_assert_eq!(state.len(), 1,);
-
-                // Zero initial voltage/current.
+                debug_assert_eq!(state.len(), 1);
             }
 
             DeviceBody::Primitive(_) => {
@@ -1364,5 +1364,32 @@ mod tests {
             - runtime.node_voltage(negative_node).unwrap();
 
         assert!((voltage - 9.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn voltage_controlled_switch_initializes_off() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let switch = device(1);
+
+        network
+            .add_device(
+                &definitions,
+                switch,
+                PrimitiveElementKind::VoltageControlledSwitch.into(),
+            )
+            .unwrap();
+
+        let mut states = PhysicalStateStore::new();
+
+        states
+            .initialize_device(&definitions, &network, switch)
+            .unwrap();
+
+        assert_eq!(
+            states.get(DeviceState::new(switch, DefinitionStateId::new(0),)),
+            Some(0.0),
+        );
     }
 }

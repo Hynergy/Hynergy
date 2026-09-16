@@ -1,7 +1,6 @@
-use crate::compile::UnknownRange;
 use crate::compile::island_ir::IslandIrBuilder;
 use crate::compile::state::BoundStateSlots;
-use crate::compile::unknown::UnknownAllocationError;
+use crate::compile::unknown::{UnknownAllocationError, UnknownRange};
 use hynergy_ids::{define_id, define_non_zero_id};
 use hynergy_ir::{InputSlot, ValueBuildError, ValueSlot};
 use hynergy_mna::pattern::{PatternBuilder, PatternError, UnknownIndex};
@@ -69,6 +68,8 @@ enum LocalValueNode {
     Div(LocalValueId, LocalValueId),
     LessEqual(LocalValueId, LocalValueId),
 
+    IterationLatch(LocalValueId),
+
     Neg(LocalValueId),
 }
 
@@ -114,6 +115,18 @@ struct LocalRhsTerm {
 
     source: LocalValueId,
     scale: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalIterationLatch {
+    value: LocalValueId,
+}
+
+impl LocalIterationLatch {
+    #[inline]
+    pub(crate) const fn value(self) -> LocalValueId {
+        self.value
+    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -168,12 +181,44 @@ pub(crate) struct DefinitionTemplateBuilder {
     rhs_terms: Vec<LocalRhsTerm>,
     terminal_count: usize,
     allocated_unknown_count: usize,
+    iteration_stability_values: Vec<LocalValueId>,
+    iteration_latches: Vec<(LocalValueId, Option<LocalValueId>)>,
 }
 
 impl DefinitionTemplateBuilder {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn iteration_latch(
+        &mut self,
+        initial: LocalValueId,
+    ) -> Result<LocalIterationLatch, DefinitionTemplateBuildError> {
+        debug_assert!(initial.index() < self.values.len());
+
+        let value = self.allocate_value(LocalValueInfo {
+            node: LocalValueNode::IterationLatch(initial),
+            constant: None,
+        })?;
+
+        self.iteration_latches.push((value, None));
+
+        Ok(LocalIterationLatch { value })
+    }
+
+    pub(crate) fn update_iteration_latch(
+        &mut self,
+        latch: LocalIterationLatch,
+        update: LocalValueId,
+    ) {
+        debug_assert!(update.index() < self.values.len());
+
+        let (_, destination) = self
+            .iteration_latches
+            .iter_mut()
+            .find(|(value, _)| *value == latch.value)
+            .expect("iteration latch must belong to this template");
+
+        assert!(
+            destination.replace(update).is_none(),
+            "iteration latch must have exactly one update",
+        );
     }
 
     pub(crate) fn timestep(&mut self) -> Result<LocalValueId, DefinitionTemplateBuildError> {
@@ -483,6 +528,19 @@ impl DefinitionTemplateBuilder {
             });
         }
 
+        self.iteration_stability_values
+            .sort_unstable_by_key(|value| value.index());
+
+        self.iteration_stability_values
+            .dedup_by_key(|value| value.index());
+
+        let iteration_latches = self
+            .iteration_latches
+            .into_iter()
+            .map(|(latch, update)| (latch, update.expect("iteration latch must have an update")))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Ok(CompiledDefinitionTemplate {
             unknowns: self.unknowns.into_boxed_slice(),
             values: self.values.into_boxed_slice(),
@@ -496,6 +554,8 @@ impl DefinitionTemplateBuilder {
             parameter_count: self.parameter_count,
             terminal_count: self.terminal_count,
             allocated_unknown_count: self.allocated_unknown_count,
+            iteration_stability_values: self.iteration_stability_values.into_boxed_slice(),
+            iteration_latches,
         })
     }
 
@@ -611,6 +671,7 @@ impl DefinitionTemplateBuilder {
             .is_some_and(|word| word & (1u64 << bit) != 0)
     }
 
+    #[inline]
     fn allocate_state_slot(
         &mut self,
         requires_write: bool,
@@ -625,6 +686,13 @@ impl DefinitionTemplateBuilder {
         self.set_state_requires_write(index, requires_write);
 
         Ok(id)
+    }
+
+    #[inline]
+    pub(crate) fn require_iteration_stability(&mut self, value: LocalValueId) {
+        debug_assert!(value.index() < self.values.len());
+
+        self.iteration_stability_values.push(value);
     }
 }
 
@@ -651,6 +719,8 @@ pub(crate) struct CompiledDefinitionTemplate {
     parameter_count: usize,
     terminal_count: usize,
     allocated_unknown_count: usize,
+    iteration_stability_values: Box<[LocalValueId]>,
+    iteration_latches: Box<[(LocalValueId, LocalValueId)]>,
 }
 
 impl CompiledDefinitionTemplate {
@@ -688,6 +758,14 @@ impl CompiledDefinitionTemplate {
         }
 
         let (values, parameters) = self.bind_values(unknowns, states, ir)?;
+
+        for &(latch, update) in &self.iteration_latches {
+            ir.update_iteration_latch(values[latch.index()], values[update.index()]);
+        }
+
+        for &value in &self.iteration_stability_values {
+            ir.require_iteration_stability(values[value.index()]);
+        }
 
         for term in &self.matrix_terms {
             let entry = self.matrix_entries[term.destination.index()];
@@ -781,6 +859,10 @@ impl CompiledDefinitionTemplate {
                     ir.less_equal_value(values[lhs.index()], values[rhs.index()])?
                 }
 
+                LocalValueNode::IterationLatch(initial) => {
+                    ir.iteration_latch(values[initial.index()])?
+                }
+
                 LocalValueNode::Neg(operand) => ir.neg_value(values[operand.index()])?,
             };
 
@@ -844,11 +926,6 @@ impl CompiledDefinitionTemplate {
         self.matrix_parameter_dependencies
             .get(word)
             .is_some_and(|word| word & (1u64 << bit) != 0)
-    }
-
-    #[inline]
-    pub(crate) fn unknown_count(&self) -> usize {
-        self.unknowns.len()
     }
 
     #[inline]
@@ -922,6 +999,9 @@ fn matrix_static_dependencies(
             | LocalValueNode::LessEqual(lhs, rhs) => {
                 pending.push(lhs);
                 pending.push(rhs);
+            }
+            LocalValueNode::IterationLatch(initial) => {
+                pending.push(initial);
             }
             LocalValueNode::Neg(operand) => {
                 pending.push(operand);
@@ -1023,7 +1103,7 @@ mod tests {
 
     #[test]
     fn folds_constant_local_expressions_once() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let four = builder.constant(4.0).unwrap();
         let two = builder.constant(2.0).unwrap();
@@ -1035,7 +1115,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_duplicate_local_matrix_terms() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let node = builder.terminal_voltage().unwrap();
         let parameter = builder.parameter().unwrap();
@@ -1053,7 +1133,7 @@ mod tests {
 
     #[test]
     fn allocated_unknown_is_bound_after_node_voltages() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let terminal = builder.terminal_voltage().unwrap();
 
@@ -1083,7 +1163,7 @@ mod tests {
 
     #[test]
     fn state_requires_exactly_one_next_state_producer() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let _state = builder.state().unwrap();
 
@@ -1092,7 +1172,7 @@ mod tests {
             Err(DefinitionTemplateBuildError::MissingStateProducer { state: 0 })
         ));
 
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let state = builder.state().unwrap();
         let one = builder.constant(1.0).unwrap();
@@ -1110,7 +1190,7 @@ mod tests {
     fn state_timestep_and_solution_dependencies_bind_to_island_ir() {
         use crate::compile::island_ir::IslandIrBuilder;
 
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let terminal = builder.terminal_voltage().unwrap();
         let previous = builder.state().unwrap();
@@ -1175,7 +1255,7 @@ mod tests {
 
     #[test]
     fn state_binding_can_use_non_contiguous_island_slot() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let state = builder.state().unwrap();
 
@@ -1219,7 +1299,7 @@ mod tests {
 
     #[test]
     fn matrix_dependency_follows_parameter_value_graph() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let terminal = builder.terminal_voltage().unwrap();
 
@@ -1269,7 +1349,7 @@ mod tests {
 
     #[test]
     fn matrix_dependency_follows_timestep_value_graph() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let terminal = builder.terminal_voltage().unwrap();
 
@@ -1309,7 +1389,7 @@ mod tests {
 
     #[test]
     fn matrix_dependency_follows_comparison_operands() {
-        let mut builder = DefinitionTemplateBuilder::new();
+        let mut builder = DefinitionTemplateBuilder::default();
 
         let terminal = builder.terminal_voltage().unwrap();
 

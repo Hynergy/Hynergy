@@ -1,9 +1,9 @@
-use crate::compile::CompiledIslandIr;
 use crate::compile::definition::DefinitionStateId;
 use crate::compile::island::{
     CompiledIsland, CompiledIslandParts, CompiledPartitionInputs, DeviceState, IslandNode,
     IslandStateLayout, IslandUnknownLayout,
 };
+use crate::compile::island_ir::CompiledIslandIr;
 use hynergy_ir::ValueWorkspace;
 use hynergy_mna::system::{MnaError, MnaSystem};
 use hynergy_model::device::definition::DeviceId;
@@ -19,13 +19,15 @@ const NONLINEAR_MAX_ITERATIONS: usize = 32;
 struct NonlinearScratch {
     current: Box<[f64]>,
     next: Box<[f64]>,
+    stability: Box<[f64]>,
 }
 
 impl NonlinearScratch {
-    fn new(dimension: usize) -> Self {
+    fn new(dimension: usize, stability_count: usize) -> Self {
         Self {
             current: vec![0.0; dimension].into_boxed_slice(),
             next: vec![0.0; dimension].into_boxed_slice(),
+            stability: vec![0.0; stability_count].into_boxed_slice(),
         }
     }
 }
@@ -55,6 +57,12 @@ pub(crate) enum IslandRuntimeError {
 
     #[error("nonlinear island did not converge after {iterations} iterations")]
     NonlinearDidNotConverge { iterations: usize },
+
+    #[error("island matrix contains a non-finite value")]
+    NonFiniteMatrix,
+
+    #[error("island solution contains a non-finite value")]
+    NonFiniteSolution,
 }
 
 #[derive(Debug)]
@@ -93,9 +101,12 @@ impl IslandRuntime {
         let workspace = ir.value_program().new_workspace();
         let system = MnaSystem::new(pattern)?;
 
-        let nonlinear_scratch = ir
-            .requires_nonlinear_iteration()
-            .then(|| Box::new(NonlinearScratch::new(dimension)));
+        let nonlinear_scratch = ir.requires_nonlinear_iteration().then(|| {
+            Box::new(NonlinearScratch::new(
+                dimension,
+                ir.iteration_stability_values().len(),
+            ))
+        });
 
         Ok(Self {
             system,
@@ -130,6 +141,10 @@ impl IslandRuntime {
                     .execute(&mut matrix, self.workspace.values());
             }
 
+            if !all_finite(self.system.values()) {
+                return Err(IslandRuntimeError::NonFiniteMatrix);
+            }
+
             self.system.factorize()?;
             self.matrix_dirty = false;
 
@@ -161,6 +176,10 @@ impl IslandRuntime {
             self.solve_count += 1;
         }
 
+        if !all_finite(&self.solution) {
+            return Err(IslandRuntimeError::NonFiniteSolution);
+        }
+
         evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
         self.solution_valid = true;
@@ -185,6 +204,10 @@ impl IslandRuntime {
             self.solve_count += 1;
         }
 
+        if !all_finite(candidate) {
+            return Err(IslandRuntimeError::NonFiniteSolution);
+        }
+
         Ok(())
     }
 
@@ -196,16 +219,21 @@ impl IslandRuntime {
 
         evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
+        capture_iteration_stability(&self.ir, &self.workspace, &mut scratch.stability);
+        advance_iteration_latches(&self.ir, &mut self.workspace);
+
         if iteration_affects_matrix {
             self.matrix_dirty = true;
         }
 
         self.solve_nonlinear_candidate(&mut scratch.current)?;
 
-        if solutions_converged(&self.solution, &scratch.current) {
-            std::mem::swap(&mut self.solution, &mut scratch.current);
+        evaluate_iteration(&self.ir, &mut self.workspace, &scratch.current);
 
-            evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
+        if solutions_converged(&self.solution, &scratch.current)
+            && self.iteration_stability_matches(&scratch.stability)
+        {
+            std::mem::swap(&mut self.solution, &mut scratch.current);
 
             self.solution_valid = true;
 
@@ -213,7 +241,8 @@ impl IslandRuntime {
         }
 
         for _ in 1..NONLINEAR_MAX_ITERATIONS {
-            evaluate_iteration(&self.ir, &mut self.workspace, &scratch.current);
+            capture_iteration_stability(&self.ir, &self.workspace, &mut scratch.stability);
+            advance_iteration_latches(&self.ir, &mut self.workspace);
 
             if iteration_affects_matrix {
                 self.matrix_dirty = true;
@@ -221,10 +250,12 @@ impl IslandRuntime {
 
             self.solve_nonlinear_candidate(&mut scratch.next)?;
 
-            if solutions_converged(&scratch.current, &scratch.next) {
-                std::mem::swap(&mut self.solution, &mut scratch.next);
+            evaluate_iteration(&self.ir, &mut self.workspace, &scratch.next);
 
-                evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
+            if solutions_converged(&scratch.current, &scratch.next)
+                && self.iteration_stability_matches(&scratch.stability)
+            {
+                std::mem::swap(&mut self.solution, &mut scratch.next);
 
                 self.solution_valid = true;
 
@@ -268,6 +299,8 @@ impl IslandRuntime {
         }
 
         self.ir.value_program().execute_tick(&mut self.workspace);
+
+        initialize_iteration_latches(&self.ir, &mut self.workspace);
 
         if self.nonlinear_scratch.is_none() {
             self.solve_linear()?;
@@ -401,6 +434,17 @@ impl IslandRuntime {
         self.static_inputs_dirty = true;
     }
 
+    #[inline]
+    fn iteration_stability_matches(&self, expected: &[f64]) -> bool {
+        iteration_stability_matches(
+            expected,
+            self.ir
+                .iteration_stability_values()
+                .iter()
+                .map(|&slot| self.workspace.value(slot)),
+        )
+    }
+
     #[cfg(test)]
     #[inline]
     fn matrix_stamp_count(&self) -> usize {
@@ -415,6 +459,24 @@ impl IslandRuntime {
 }
 
 #[inline]
+fn initialize_iteration_latches(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace) {
+    for &latch in ir.iteration_latches() {
+        let initial = workspace.value(latch.initial());
+
+        workspace.set_input(latch.input(), initial);
+    }
+}
+
+#[inline]
+fn advance_iteration_latches(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace) {
+    for &latch in ir.iteration_latches() {
+        let next = workspace.value(latch.update());
+
+        workspace.set_input(latch.input(), next);
+    }
+}
+
+#[inline]
 fn evaluate_iteration(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace, solution: &[f64]) {
     for &(unknown, input) in ir.solution_inputs() {
         workspace.set_input(input, solution[unknown.index()]);
@@ -424,16 +486,51 @@ fn evaluate_iteration(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace, sol
 }
 
 #[inline]
+fn capture_iteration_stability(
+    ir: &CompiledIslandIr,
+    workspace: &ValueWorkspace,
+    target: &mut [f64],
+) {
+    debug_assert_eq!(target.len(), ir.iteration_stability_values().len(),);
+
+    for (target, &slot) in target.iter_mut().zip(ir.iteration_stability_values()) {
+        *target = workspace.value(slot);
+    }
+}
+
+#[inline]
+fn iteration_stability_matches(
+    expected: &[f64],
+    actual: impl ExactSizeIterator<Item = f64>,
+) -> bool {
+    debug_assert_eq!(expected.len(), actual.len());
+
+    expected
+        .iter()
+        .copied()
+        .zip(actual)
+        .all(|(expected, actual)| expected == actual)
+}
+
+#[inline]
 fn solutions_converged(previous: &[f64], current: &[f64]) -> bool {
     debug_assert_eq!(previous.len(), current.len());
+    debug_assert!(all_finite(previous));
+    debug_assert!(all_finite(current));
 
     previous.iter().zip(current).all(|(&previous, &current)| {
         let delta = (current - previous).abs();
+
         let limit = NONLINEAR_ABSOLUTE_TOLERANCE
             + NONLINEAR_RELATIVE_TOLERANCE * current.abs().max(previous.abs());
 
         delta <= limit
     })
+}
+
+#[inline]
+fn all_finite(values: &[f64]) -> bool {
+    values.iter().all(|value| value.is_finite())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -477,8 +574,14 @@ impl StaticChanges {
 mod test {
     use crate::compile::definition::DefinitionStateId;
     use crate::compile::island::{DeviceState, IslandNode, compile_topology_island};
-    use crate::runtime::island::IslandRuntime;
+    use crate::compile::island_ir::IslandIrBuilder;
+    use crate::runtime::island::{
+        IslandRuntime, advance_iteration_latches, all_finite, initialize_iteration_latches,
+        iteration_stability_matches, solutions_converged,
+    };
     use crate::topology::{DerivedTopology, DeviceComponent};
+    use hynergy_ir::StateSlot;
+    use hynergy_mna::pattern::PatternBuilder;
     use hynergy_model::device::definition::{
         DefinitionId, DeviceId, DevicePartitionId, PrimitiveElementKind, TerminalId,
     };
@@ -1260,5 +1363,278 @@ mod test {
         assert!((voltage - 2.0).abs() < 1.0e-6);
 
         assert!(runtime.solve_count() > 1);
+    }
+
+    #[test]
+    fn iteration_stability_uses_exact_values() {
+        assert!(solutions_converged(&[0.0], &[5.0e-10],));
+
+        assert!(!iteration_stability_matches(&[0.0], [5.0e-10].into_iter(),));
+
+        assert!(iteration_stability_matches(
+            &[0.0, 1.0],
+            [0.0, 1.0].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn iteration_latch_advances_to_computed_value() {
+        let pattern = PatternBuilder::new(1).unwrap().finish().unwrap();
+
+        let mut builder = IslandIrBuilder::new(&pattern);
+
+        let initial = builder.state_value(StateSlot::new(0)).unwrap();
+        let latch = builder.iteration_latch(initial).unwrap();
+        let one = builder.constant_value(1.0).unwrap();
+        let update = builder.sub_value(one, latch).unwrap();
+
+        builder.update_iteration_latch(latch, update);
+
+        let ir = builder.finish().unwrap();
+        let mut workspace = ir.value_program().new_workspace();
+
+        let state_input = ir.state_inputs()[0].1;
+        workspace.set_input(state_input, 0.0);
+
+        ir.value_program().execute_tick(&mut workspace);
+
+        initialize_iteration_latches(&ir, &mut workspace);
+
+        ir.value_program().execute_iteration(&mut workspace);
+
+        assert_eq!(workspace.value(update), 1.0);
+
+        advance_iteration_latches(&ir, &mut workspace);
+
+        ir.value_program().execute_iteration(&mut workspace);
+
+        assert_eq!(workspace.value(update), 0.0);
+    }
+
+    fn voltage_controlled_switch_island() -> (
+        DefinitionRegistry,
+        Network,
+        crate::compile::island::CompiledIsland,
+        IslandNode,
+        IslandNode,
+        DeviceId,
+        DeviceId,
+    ) {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let common = WireId::try_from(1).unwrap();
+        let output = WireId::try_from(2).unwrap();
+        let control = WireId::try_from(3).unwrap();
+
+        let switch = DeviceId::try_from(1).unwrap();
+        let control_source = DeviceId::try_from(2).unwrap();
+        let current_source = DeviceId::try_from(3).unwrap();
+
+        network.add_wire(common).unwrap();
+        network.add_wire(output).unwrap();
+        network.add_wire(control).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                switch,
+                PrimitiveElementKind::VoltageControlledSwitch.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                control_source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                current_source,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        network
+            .attach_terminal(output, switch, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(common, switch, TerminalId::new(1))
+            .unwrap();
+
+        network
+            .attach_terminal(control, switch, TerminalId::new(2))
+            .unwrap();
+
+        network
+            .attach_terminal(common, switch, TerminalId::new(3))
+            .unwrap();
+
+        network
+            .attach_terminal(control, control_source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(common, control_source, TerminalId::new(1))
+            .unwrap();
+
+        // Inject 8 A into the output.
+        network
+            .attach_terminal(common, current_source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(output, current_source, TerminalId::new(1))
+            .unwrap();
+
+        // threshold = 2
+        // hysteresis = 2
+        // lower = 1
+        // upper = 3
+        // G_max = 4
+        // G_min = 1
+        for (index, value) in [2.0, 2.0, 4.0, 1.0].into_iter().enumerate() {
+            network
+                .set_device_parameter(&definitions, switch, ParameterId::new(index as u32), value)
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 0.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, current_source, ParameterId::new(0), 8.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+        let island =
+            topology.component_island(DeviceComponent::new(switch, DevicePartitionId::new(0)));
+
+        let output_node = IslandNode::net(topology.wire_net(output));
+        let common_node = IslandNode::net(topology.wire_net(common));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        (
+            definitions,
+            network,
+            compiled,
+            output_node,
+            common_node,
+            switch,
+            control_source,
+        )
+    }
+
+    #[test]
+    fn voltage_controlled_switch_applies_hysteresis() {
+        let (definitions, mut network, compiled, output_node, common_node, switch, control_source) =
+            voltage_controlled_switch_island();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        let state = DeviceState::new(switch, DefinitionStateId::new(0));
+
+        let mut mode = 0.0;
+
+        // Below lower threshold: remain OFF.
+        let writes = runtime
+            .solve_tick(&network, 1.0, |candidate| {
+                (candidate == state).then_some(mode)
+            })
+            .unwrap();
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].state(), state);
+        assert_eq!(writes[0].value(), 0.0);
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        // 8 A / G_min(1 S)
+        assert!((voltage - 8.0).abs() < 1.0e-9);
+
+        mode = writes[0].value();
+
+        // Above upper threshold: turn ON.
+        network
+            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 4.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        let writes = runtime
+            .solve_tick(&network, 1.0, |candidate| {
+                (candidate == state).then_some(mode)
+            })
+            .unwrap();
+
+        assert_eq!(writes[0].value(), 1.0);
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        // 8 A / G_max(4 S)
+        assert!((voltage - 2.0).abs() < 1.0e-9);
+
+        mode = writes[0].value();
+
+        // Inside deadband: retain ON.
+        network
+            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        let writes = runtime
+            .solve_tick(&network, 1.0, |candidate| {
+                (candidate == state).then_some(mode)
+            })
+            .unwrap();
+
+        assert_eq!(writes[0].value(), 1.0);
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        assert!((voltage - 2.0).abs() < 1.0e-9);
+
+        mode = writes[0].value();
+
+        // Below lower threshold: turn OFF.
+        network
+            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 0.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        let writes = runtime
+            .solve_tick(&network, 1.0, |candidate| {
+                (candidate == state).then_some(mode)
+            })
+            .unwrap();
+
+        assert_eq!(writes[0].value(), 0.0);
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        assert!((voltage - 8.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn finite_value_check_rejects_non_finite_values() {
+        assert!(all_finite(&[]));
+        assert!(all_finite(&[0.0, -1.0, f64::MAX]));
+
+        assert!(!all_finite(&[f64::NAN]));
+        assert!(!all_finite(&[f64::INFINITY]));
+        assert!(!all_finite(&[f64::NEG_INFINITY]));
     }
 }

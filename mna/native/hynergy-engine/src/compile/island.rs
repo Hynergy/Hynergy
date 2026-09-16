@@ -1,10 +1,11 @@
-use crate::compile::CompiledDefinitionTemplate;
 use crate::compile::definition::{
     CompiledDefinition, CompiledPartitionTemplate, DefinitionCompileError, DefinitionStateId,
 };
 use crate::compile::island_ir::{CompiledIslandIr, IslandIrBuildError, IslandIrBuilder};
 use crate::compile::state::{BoundStateSlots, StateAllocationError};
-use crate::compile::template::{BoundDefinitionInputs, BoundUnknowns, DefinitionLinkError};
+use crate::compile::template::{
+    BoundDefinitionInputs, BoundUnknowns, CompiledDefinitionTemplate, DefinitionLinkError,
+};
 use crate::compile::unknown::{UnknownAllocationError, UnknownAllocator};
 use crate::topology::{DerivedTopology, IslandId, NetId};
 use hynergy_ir::StateSlot;
