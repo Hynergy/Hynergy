@@ -1,26 +1,14 @@
 use crate::compile::UnknownRange;
 use crate::compile::island_ir::IslandIrBuilder;
 use crate::compile::state::StateRange;
+use hynergy_ids::{define_id, define_non_zero_id};
 use hynergy_ir::{InputSlot, ValueBuildError, ValueSlot};
 use hynergy_mna::pattern::{PatternBuilder, PatternError, UnknownIndex};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct LocalStateId(u32);
-
-impl LocalStateId {
-    #[inline]
-    const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id!(LocalStateId: u32, LocalUnknownId: u32, LocalParameterId: u32, LocalMatrixSlot: u32,);
+define_non_zero_id!(LocalValueId: u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalState {
@@ -44,70 +32,6 @@ impl BoundUnknowns {
     #[inline]
     pub(crate) fn get(&self, local: LocalUnknownId) -> Option<UnknownIndex> {
         self.values[local.index()]
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct LocalUnknownId(u32);
-
-impl LocalUnknownId {
-    #[inline]
-    const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct LocalValueId(u32);
-
-impl LocalValueId {
-    #[inline]
-    const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct LocalParameterId(u32);
-
-impl LocalParameterId {
-    #[inline]
-    const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct LocalMatrixSlot(u32);
-
-impl LocalMatrixSlot {
-    #[inline]
-    const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    const fn index(self) -> usize {
-        self.0 as usize
     }
 }
 
@@ -237,6 +161,7 @@ pub(crate) struct DefinitionTemplateBuilder {
     timestep_value: Option<LocalValueId>,
 
     state_writes: Vec<Option<LocalValueId>>,
+    state_requires_write: SmallVec<[u64; 2]>,
 
     matrix_terms: Vec<PendingMatrixTerm>,
     rhs_terms: Vec<LocalRhsTerm>,
@@ -287,8 +212,20 @@ impl DefinitionTemplateBuilder {
     }
 
     pub(crate) fn state(&mut self) -> Result<LocalState, DefinitionTemplateBuildError> {
-        let raw = u32::try_from(self.state_writes.len())
-            .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+        self.allocate_state(true)
+    }
+
+    pub(crate) fn read_state(&mut self) -> Result<LocalState, DefinitionTemplateBuildError> {
+        self.allocate_state(false)
+    }
+
+    fn allocate_state(
+        &mut self,
+        requires_write: bool,
+    ) -> Result<LocalState, DefinitionTemplateBuildError> {
+        let index = self.state_writes.len();
+
+        let raw = u32::try_from(index).map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
 
         let id = LocalStateId::new(raw);
 
@@ -298,6 +235,7 @@ impl DefinitionTemplateBuilder {
         })?;
 
         self.state_writes.push(None);
+        self.set_state_requires_write(index, requires_write);
 
         Ok(LocalState { id, value })
     }
@@ -471,13 +409,28 @@ impl DefinitionTemplateBuilder {
         canonicalize_pending_matrix_terms(&mut self.matrix_terms);
         canonicalize_rhs_terms(&mut self.rhs_terms);
 
-        let state_writes = std::mem::take(&mut self.state_writes)
-            .into_iter()
-            .enumerate()
-            .map(|(state, source)| {
-                source.ok_or(DefinitionTemplateBuildError::MissingStateProducer { state })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let pending_state_writes = std::mem::take(&mut self.state_writes);
+
+        let state_count = pending_state_writes.len();
+        let mut state_writes = Vec::new();
+
+        for (state, source) in pending_state_writes.into_iter().enumerate() {
+            match source {
+                Some(source) => {
+                    let state_id = LocalStateId::new(
+                        u32::try_from(state).expect("state index must fit LocalStateId"),
+                    );
+
+                    state_writes.push((state_id, source));
+                }
+
+                None if self.state_requires_write(state) => {
+                    return Err(DefinitionTemplateBuildError::MissingStateProducer { state });
+                }
+
+                None => {}
+            }
+        }
 
         let mut coordinates = self
             .matrix_terms
@@ -522,6 +475,7 @@ impl DefinitionTemplateBuilder {
             rhs_terms: self.rhs_terms.into_boxed_slice(),
 
             state_writes: state_writes.into_boxed_slice(),
+            state_count,
 
             parameter_count: self.parameter_count,
             terminal_count: self.terminal_count,
@@ -546,12 +500,17 @@ impl DefinitionTemplateBuilder {
         &mut self,
         info: LocalValueInfo,
     ) -> Result<LocalValueId, DefinitionTemplateBuildError> {
-        let index = u32::try_from(self.values.len())
-            .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+        let raw = u32::try_from(self.values.len())
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or(DefinitionTemplateBuildError::IdExhausted)?;
+
+        let id =
+            LocalValueId::try_from(raw).map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
 
         self.values.push(info);
 
-        Ok(LocalValueId::new(index))
+        Ok(id)
     }
 
     fn binary(
@@ -586,6 +545,46 @@ impl DefinitionTemplateBuilder {
             constant: None,
         })
     }
+
+    #[inline]
+    fn push_state_requires_write(&mut self, requires_write: bool) {
+        let index = self.state_writes.len();
+        let word = index / 64;
+        let bit = index % 64;
+
+        if word == self.state_requires_write.len() {
+            self.state_requires_write.push(0);
+        }
+
+        if requires_write {
+            self.state_requires_write[word] |= 1 << bit;
+        }
+    }
+
+    fn set_state_requires_write(&mut self, index: usize, requires_write: bool) {
+        if !requires_write {
+            return;
+        }
+
+        let word = index / 64;
+        let bit = index % 64;
+
+        while self.state_requires_write.len() <= word {
+            self.state_requires_write.push(0);
+        }
+
+        self.state_requires_write[word] |= 1u64 << bit;
+    }
+
+    #[inline]
+    fn state_requires_write(&self, index: usize) -> bool {
+        let word = index / 64;
+        let bit = index % 64;
+
+        self.state_requires_write
+            .get(word)
+            .is_some_and(|word| word & (1u64 << bit) != 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -605,7 +604,8 @@ pub(crate) struct CompiledDefinitionTemplate {
     matrix_terms: Box<[LocalMatrixTerm]>,
     rhs_terms: Box<[LocalRhsTerm]>,
 
-    state_writes: Box<[LocalValueId]>,
+    state_writes: Box<[(LocalStateId, LocalValueId)]>,
+    state_count: usize,
 
     parameter_count: usize,
     terminal_count: usize,
@@ -675,8 +675,10 @@ impl CompiledDefinitionTemplate {
             ir.add_rhs(destination, values[term.source.index()], term.scale);
         }
 
-        for (index, &source) in self.state_writes.iter().enumerate() {
-            let destination = states.get(index).expect("state range length was validated");
+        for &(state, source) in &self.state_writes {
+            let destination = states
+                .get(state.index())
+                .expect("state range length was validated");
 
             ir.write_state(destination, values[source.index()]);
         }
@@ -813,8 +815,8 @@ impl CompiledDefinitionTemplate {
     }
 
     #[inline]
-    pub(crate) fn state_count(&self) -> usize {
-        self.state_writes.len()
+    pub(crate) const fn state_count(&self) -> usize {
+        self.state_count
     }
 }
 

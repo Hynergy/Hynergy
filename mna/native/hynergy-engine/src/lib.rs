@@ -397,6 +397,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "live wire is missing from derived nets")]
+    fn successful_world_command_checks_derived_topology() {
+        let mut engine = Engine::new();
+        let world_id = engine.new_world().unwrap();
+
+        let untracked = wire(1);
+        let added = wire(2);
+
+        engine
+            .world_mut(world_id)
+            .unwrap()
+            .network
+            .add_wire(untracked)
+            .unwrap();
+
+        engine
+            .apply_world_command(world_id, WorldCommand::AddWire { wire: added })
+            .unwrap();
+    }
+    #[test]
     fn world_updates_network_and_topology_consistently() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::default();
@@ -628,5 +649,77 @@ mod tests {
                 NetworkModelError::IdAlreadyAssigned { id: wire.id() }
             ))
         );
+    }
+
+    #[test]
+    fn parameter_change_invalidates_all_component_islands() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::default();
+        let delay = device(1);
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        let input_component = DeviceComponent::new(delay, DevicePartitionId::new(0));
+        let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
+
+        let input_island = world.derived_topology.component_island(input_component);
+        let output_island = world.derived_topology.component_island(output_component);
+
+        assert_ne!(input_island, output_island);
+
+        let input_revision = world
+            .derived_topology
+            .island(input_island)
+            .unwrap()
+            .revision();
+
+        let output_revision = world
+            .derived_topology
+            .island(output_island)
+            .unwrap()
+            .revision();
+
+        world.derived_topology.clear_invalidation();
+
+        world
+            .set_device_parameter(&definitions, delay, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        assert_eq!(
+            world
+                .derived_topology
+                .island(input_island)
+                .unwrap()
+                .revision(),
+            input_revision,
+        );
+
+        assert_eq!(
+            world
+                .derived_topology
+                .island(output_island)
+                .unwrap()
+                .revision(),
+            output_revision,
+        );
+
+        assert!(
+            world
+                .derived_topology
+                .invalidation()
+                .topology_dirty_islands()
+                .is_empty()
+        );
+
+        let dirty = world
+            .derived_topology
+            .invalidation()
+            .numerical_dirty_islands();
+
+        assert_eq!(dirty.len(), 2);
+        assert!(dirty.contains(&input_island));
+        assert!(dirty.contains(&output_island));
     }
 }

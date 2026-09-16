@@ -2,9 +2,215 @@ use super::{
     CompiledDefinitionTemplate, DefinitionTemplateBuildError, DefinitionTemplateBuilder,
     LocalUnknownId, LocalValueId,
 };
+use hynergy_ids::define_id;
+use hynergy_model::device::definition::{
+    DeviceBody, DeviceDefinition, DevicePartitionId, PrimitiveElementKind, TerminalId,
+};
+use smallvec::SmallVec;
 use thiserror::Error;
 
-use hynergy_model::device::definition::{DeviceBody, DeviceDefinition, PrimitiveElementKind};
+define_id!(DefinitionStateId: u32);
+
+#[derive(Debug)]
+pub(crate) struct CompiledDefinition {
+    partitions: Box<[CompiledPartitionTemplate]>,
+    state_count: usize,
+}
+
+impl CompiledDefinition {
+    pub(crate) fn compile(definition: &DeviceDefinition) -> Result<Self, DefinitionCompileError> {
+        let partitions = match definition.body() {
+            DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
+                compile_tick_delay_partitions(definition)?
+            }
+
+            _ => {
+                let template = CompiledDefinitionTemplate::compile(definition)?;
+
+                debug_assert_eq!(
+                    definition.partition_count(),
+                    1,
+                    "supported definition must have one partition",
+                );
+
+                let partition = DevicePartitionId::new(0);
+                let definition_states = definition_states(definition);
+
+                vec![CompiledPartitionTemplate {
+                    definition_terminals: definition_terminals_for_partition(definition, partition),
+                    definition_state_reads: definition_states.clone(),
+                    definition_state_writes: definition_states.clone(),
+                    definition_states,
+                    template,
+                }]
+                .into_boxed_slice()
+            }
+        };
+
+        debug_assert_eq!(
+            partitions.len(),
+            definition.partition_count(),
+            "compiled partition count must match definition",
+        );
+
+        Ok(Self {
+            partitions,
+            state_count: definition.state_count(),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
+    #[inline]
+    pub(crate) const fn state_count(&self) -> usize {
+        self.state_count
+    }
+
+    #[inline]
+    pub(crate) fn partition(
+        &self,
+        partition: DevicePartitionId,
+    ) -> Option<&CompiledPartitionTemplate> {
+        self.partitions.get(partition.index())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CompiledPartitionTemplate {
+    definition_terminals: SmallVec<[TerminalId; 8]>,
+    definition_states: SmallVec<[DefinitionStateId; 4]>,
+    definition_state_reads: SmallVec<[DefinitionStateId; 4]>,
+    definition_state_writes: SmallVec<[DefinitionStateId; 4]>,
+    template: CompiledDefinitionTemplate,
+}
+
+impl CompiledPartitionTemplate {
+    #[inline]
+    pub(crate) fn definition_terminals(&self) -> &[TerminalId] {
+        &self.definition_terminals
+    }
+
+    #[inline]
+    pub(crate) fn definition_states(&self) -> &[DefinitionStateId] {
+        &self.definition_states
+    }
+
+    #[inline]
+    pub(crate) fn definition_state_reads(&self) -> &[DefinitionStateId] {
+        &self.definition_state_reads
+    }
+
+    #[inline]
+    pub(crate) fn definition_state_writes(&self) -> &[DefinitionStateId] {
+        &self.definition_state_writes
+    }
+
+    #[inline]
+    pub(crate) const fn template(&self) -> &CompiledDefinitionTemplate {
+        &self.template
+    }
+}
+
+fn definition_states(definition: &DeviceDefinition) -> SmallVec<[DefinitionStateId; 4]> {
+    (0..definition.state_count())
+        .map(|index| {
+            DefinitionStateId::new(
+                u32::try_from(index).expect("state index must fit DefinitionStateId"),
+            )
+        })
+        .collect()
+}
+
+fn compile_tick_delay_partitions(
+    definition: &DeviceDefinition,
+) -> Result<Box<[CompiledPartitionTemplate]>, DefinitionCompileError> {
+    debug_assert_eq!(definition.partition_count(), 2);
+    debug_assert_eq!(definition.state_count(), 1);
+
+    let state = DefinitionStateId::new(0);
+
+    let mut partitions = Vec::with_capacity(definition.partition_count());
+
+    for partition_index in 0..definition.partition_count() {
+        let partition = DevicePartitionId::new(
+            u16::try_from(partition_index).expect("partition index must fit DevicePartitionId"),
+        );
+
+        let definition_terminals = definition_terminals_for_partition(definition, partition);
+
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        match partition_index {
+            0 => {
+                for _ in &definition_terminals {
+                    builder.terminal_voltage()?;
+                }
+            }
+
+            1 => {
+                debug_assert_eq!(definition_terminals.len(), 2);
+
+                let positive = builder.terminal_voltage()?;
+                let negative = builder.terminal_voltage()?;
+
+                let branch_current = builder.branch_current_unknown()?;
+
+                let previous = builder.read_state()?;
+
+                stamp_voltage_source(
+                    &mut builder,
+                    positive,
+                    negative,
+                    branch_current,
+                    previous.value(),
+                )?;
+            }
+
+            _ => unreachable!("TickDelay must have exactly two partitions"),
+        }
+
+        let (definition_state_reads, definition_state_writes) = match partition_index {
+            0 => (SmallVec::new(), SmallVec::from_slice(&[state])),
+
+            1 => (SmallVec::from_slice(&[state]), SmallVec::new()),
+
+            _ => unreachable!("TickDelay must have exactly two partitions"),
+        };
+
+        partitions.push(CompiledPartitionTemplate {
+            definition_terminals,
+            definition_states: SmallVec::from_slice(&[state]),
+            definition_state_reads,
+            definition_state_writes,
+            template: builder.finish()?,
+        });
+    }
+
+    Ok(partitions.into_boxed_slice())
+}
+
+fn definition_terminals_for_partition(
+    definition: &DeviceDefinition,
+    partition: DevicePartitionId,
+) -> SmallVec<[TerminalId; 8]> {
+    definition
+        .terminal_partitions()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &terminal_partition)| {
+            if terminal_partition != partition {
+                return None;
+            }
+
+            Some(TerminalId::new(
+                u32::try_from(index).expect("terminal index must fit TerminalId"),
+            ))
+        })
+        .collect()
+}
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionCompileError {
@@ -925,5 +1131,125 @@ mod tests {
             .execute(&mut next_state, workspace.values());
 
         assert!((next_state[inductor_state.index()] - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn conductance_compiles_one_device_partition() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::Conductance))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        assert_eq!(compiled.partition_count(), 1);
+        assert_eq!(compiled.state_count(), 0);
+
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        assert_eq!(
+            partition.definition_terminals(),
+            &[TerminalId::new(0), TerminalId::new(1)],
+        );
+
+        assert_eq!(partition.template().terminal_count(), 2);
+    }
+
+    #[test]
+    fn tick_delay_compiles_two_device_partitions() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        assert_eq!(compiled.partition_count(), 2);
+        assert_eq!(compiled.state_count(), 1);
+
+        let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        let output = compiled.partition(DevicePartitionId::new(1)).unwrap();
+
+        assert_eq!(
+            input.definition_terminals(),
+            &[TerminalId::new(0), TerminalId::new(1)],
+        );
+
+        assert_eq!(
+            output.definition_terminals(),
+            &[TerminalId::new(2), TerminalId::new(3)],
+        );
+
+        assert_eq!(input.template().terminal_count(), 2);
+        assert_eq!(output.template().terminal_count(), 2);
+    }
+
+    #[test]
+    fn tick_delay_partitions_share_one_definition_state() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        let output = compiled.partition(DevicePartitionId::new(1)).unwrap();
+
+        assert_eq!(input.definition_states(), &[DefinitionStateId::new(0)],);
+        assert_eq!(output.definition_states(), &[DefinitionStateId::new(0)],);
+    }
+
+    #[test]
+    fn tick_delay_partitions_split_state_read_and_write() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        let output = compiled.partition(DevicePartitionId::new(1)).unwrap();
+
+        assert_eq!(input.definition_state_reads(), &[]);
+        assert_eq!(
+            input.definition_state_writes(),
+            &[DefinitionStateId::new(0)],
+        );
+
+        assert_eq!(
+            output.definition_state_reads(),
+            &[DefinitionStateId::new(0)],
+        );
+        assert_eq!(output.definition_state_writes(), &[]);
+    }
+
+    #[test]
+    fn tick_delay_output_template_reads_shared_state() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        let output = compiled.partition(DevicePartitionId::new(1)).unwrap();
+
+        assert_eq!(
+            output.definition_state_reads(),
+            &[DefinitionStateId::new(0)],
+        );
+
+        assert_eq!(output.template().state_count(), 1);
+        assert_eq!(output.template().allocated_unknown_count(), 1);
     }
 }
