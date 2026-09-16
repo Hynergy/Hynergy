@@ -1,6 +1,7 @@
 use crate::compile::UnknownRange;
 use crate::compile::island_ir::IslandIrBuilder;
-use crate::compile::state::StateRange;
+use crate::compile::state::BoundStateSlots;
+use crate::compile::unknown::UnknownAllocationError;
 use hynergy_ids::{define_id, define_non_zero_id};
 use hynergy_ir::{InputSlot, ValueBuildError, ValueSlot};
 use hynergy_mna::pattern::{PatternBuilder, PatternError, UnknownIndex};
@@ -148,6 +149,9 @@ pub(crate) enum DefinitionLinkError {
         row: UnknownIndex,
         column: UnknownIndex,
     },
+
+    #[error(transparent)]
+    UnknownAllocation(#[from] UnknownAllocationError),
 }
 
 #[derive(Debug, Default)]
@@ -659,7 +663,7 @@ impl CompiledDefinitionTemplate {
     pub(crate) fn bind(
         &self,
         unknowns: &BoundUnknowns,
-        states: StateRange,
+        states: &BoundStateSlots,
         ir: &mut IslandIrBuilder<'_>,
     ) -> Result<BoundDefinitionInputs, DefinitionLinkError> {
         if states.len() != self.state_count() {
@@ -701,7 +705,7 @@ impl CompiledDefinitionTemplate {
         for &(state, source) in &self.state_writes {
             let destination = states
                 .get(state.index())
-                .expect("state range length was validated");
+                .expect("state binding count was validated");
 
             ir.write_state(destination, values[source.index()]);
         }
@@ -712,7 +716,7 @@ impl CompiledDefinitionTemplate {
     fn bind_values(
         &self,
         unknowns: &BoundUnknowns,
-        states: StateRange,
+        states: &BoundStateSlots,
         ir: &mut IslandIrBuilder<'_>,
     ) -> Result<(Vec<ValueSlot>, Box<[InputSlot]>), DefinitionLinkError> {
         let mut values = Vec::with_capacity(self.values.len());
@@ -736,7 +740,7 @@ impl CompiledDefinitionTemplate {
                 LocalValueNode::State(state) => {
                     let state = states
                         .get(state.index())
-                        .expect("state range length was validated");
+                        .expect("state binding count was validated");
 
                     ir.state_value(state)?
                 }
@@ -922,7 +926,9 @@ fn canonicalize_rhs_terms(terms: &mut Vec<LocalRhsTerm>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile::state::BoundStateSlots;
     use crate::compile::unknown::UnknownAllocator;
+    use hynergy_ir::StateSlot;
 
     #[test]
     fn folds_constant_local_expressions_once() {
@@ -1042,12 +1048,15 @@ mod tests {
 
         let mut state_allocator = StateAllocator::new();
 
-        let states = state_allocator.allocate(template.state_count()).unwrap();
+        let states = state_allocator
+            .allocate(template.state_count())
+            .unwrap()
+            .into();
         let pattern = PatternBuilder::new(1).unwrap().finish().unwrap();
 
         let mut ir_builder = IslandIrBuilder::new(&pattern);
 
-        template.bind(&unknowns, states, &mut ir_builder).unwrap();
+        template.bind(&unknowns, &states, &mut ir_builder).unwrap();
 
         let ir = ir_builder.finish().unwrap();
 
@@ -1077,5 +1086,49 @@ mod tests {
             .execute(&mut next_state, workspace.values());
 
         assert_eq!(next_state, [5.5]);
+    }
+
+    #[test]
+    fn state_binding_can_use_non_contiguous_island_slot() {
+        let mut builder = DefinitionTemplateBuilder::new();
+
+        let state = builder.state().unwrap();
+
+        builder.write_state(state, state.value()).unwrap();
+
+        let template = builder.finish().unwrap();
+
+        let mut unknown_allocator = UnknownAllocator::new(0).unwrap();
+        let allocated = unknown_allocator.allocate(0).unwrap();
+
+        let unknowns = template.bind_unknowns(&[], allocated).unwrap();
+
+        let pattern = PatternBuilder::new(0).unwrap().finish().unwrap();
+
+        let states = BoundStateSlots::new(SmallVec::from_slice(&[StateSlot::new(7)]));
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+
+        let ir = ir_builder.finish().unwrap();
+
+        assert_eq!(ir.state_inputs().len(), 1);
+        assert_eq!(ir.state_inputs()[0].0, StateSlot::new(7),);
+
+        let state_input = ir.state_inputs()[0].1;
+
+        let mut workspace = ir.value_program().new_workspace();
+
+        workspace.set_input(state_input, 3.0);
+
+        ir.value_program().execute_tick(&mut workspace);
+
+        let mut next_state = [0.0; 8];
+
+        ir.state_transition()
+            .execute(&mut next_state, workspace.values());
+
+        assert_eq!(next_state[7], 3.0);
     }
 }

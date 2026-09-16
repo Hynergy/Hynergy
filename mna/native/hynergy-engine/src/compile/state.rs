@@ -1,4 +1,5 @@
 use hynergy_ir::StateSlot;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,50 @@ impl StateRange {
         }
 
         Some(StateSlot::new(self.start + index as u32))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundStateSlots {
+    slots: SmallVec<[StateSlot; 4]>,
+}
+
+impl From<StateRange> for BoundStateSlots {
+    fn from(range: StateRange) -> Self {
+        let mut slots = SmallVec::<[StateSlot; 4]>::with_capacity(range.len());
+
+        for index in 0..range.len() {
+            slots.push(range.get(index).expect("index is inside state range"));
+        }
+
+        Self::new(slots)
+    }
+}
+
+impl BoundStateSlots {
+    #[inline]
+    pub(crate) fn new(slots: SmallVec<[StateSlot; 4]>) -> Self {
+        Self { slots }
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[StateSlot] {
+        &self.slots
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, index: usize) -> Option<StateSlot> {
+        self.slots.get(index).copied()
     }
 }
 
