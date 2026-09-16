@@ -11,4 +11,5 @@ pub(crate) use template::{
     LocalUnknownId, LocalValueId,
 };
 
+pub(crate) use island_ir::CompiledIslandIr;
 pub(crate) use unknown::UnknownRange;

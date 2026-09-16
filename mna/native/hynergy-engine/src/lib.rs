@@ -1,10 +1,9 @@
 mod compile;
+mod runtime;
 mod topology;
 
-use crate::compile::island::{
-    DeviceState, IslandCompileError, IslandRuntime, IslandRuntimeError, StagedStateWrite,
-    compile_topology_island,
-};
+use crate::compile::island::{DeviceState, IslandCompileError, compile_topology_island};
+use crate::runtime::island::{IslandRuntime, IslandRuntimeError, StagedStateWrite};
 use crate::topology::{DerivedTopology, TraversalScratch};
 use hynergy_model::device::definition::{
     DefinitionId, DeviceBody, DeviceDefinition, DeviceId, PrimitiveElementKind, TerminalId,
@@ -681,6 +680,7 @@ mod tests {
     use super::*;
     use crate::compile::definition::DefinitionStateId;
     use crate::compile::island::IslandNode;
+    use crate::runtime::island::StagedStateWrite;
     use crate::topology::DeviceComponent;
     use hynergy_model::device::definition::{DevicePartitionId, PrimitiveElementKind};
     use hynergy_model::device::registry::DefinitionRegistry;
