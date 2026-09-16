@@ -1685,15 +1685,7 @@ mod tests {
 
         parent.output(outputs[0]).unwrap();
 
-        let parent = parent.finish().unwrap();
-
-        // Bind as your existing instantiation test already does.
-        //
-        // Set:
-        // positive = 7.0
-        // negative = 2.0
-        //
-        // Assert parent output == 5.0.
+        let _parent = parent.finish().unwrap();
     }
 
     #[test]
