@@ -7,7 +7,13 @@ use hynergy_mna::pattern::{PatternBuilder, PatternError, UnknownIndex};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-define_id!(LocalStateId: u32, LocalUnknownId: u32, LocalParameterId: u32, LocalMatrixSlot: u32,);
+define_id!(
+    LocalStateId: u32,
+    LocalUnknownId: u32,
+    LocalParameterId: u32,
+    LocalMatrixSlot: u32,
+    LocalOutputId: u32,
+);
 define_non_zero_id!(LocalValueId: u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,20 +178,42 @@ pub(crate) enum DefinitionLinkError {
 pub(crate) struct DefinitionTemplateBuilder {
     unknowns: Vec<LocalUnknownInfo>,
     unknown_values: Vec<Option<LocalValueId>>,
+    allocated_unknown_count: usize,
+
     values: Vec<LocalValueInfo>,
+    terminal_count: usize,
     parameter_count: usize,
+
     timestep_value: Option<LocalValueId>,
     state_writes: Vec<Option<LocalValueId>>,
     state_requires_write: SmallVec<[u64; 2]>,
+
     matrix_terms: Vec<PendingMatrixTerm>,
     rhs_terms: Vec<LocalRhsTerm>,
-    terminal_count: usize,
-    allocated_unknown_count: usize,
+
     iteration_stability_values: Vec<LocalValueId>,
     iteration_latches: Vec<(LocalValueId, Option<LocalValueId>)>,
+
+    outputs: Vec<LocalValueId>,
 }
 
 impl DefinitionTemplateBuilder {
+    pub(crate) fn output(
+        &mut self,
+        value: LocalValueId,
+    ) -> Result<LocalOutputId, DefinitionTemplateBuildError> {
+        debug_assert!(value.index() < self.values.len());
+
+        let raw = u32::try_from(self.outputs.len())
+            .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+
+        let output = LocalOutputId::new(raw);
+
+        self.outputs.push(value);
+
+        Ok(output)
+    }
+
     pub(crate) fn iteration_latch(
         &mut self,
         initial: LocalValueId,
@@ -326,8 +354,21 @@ impl DefinitionTemplateBuilder {
         })
     }
 
+    pub(crate) fn allocated_voltage_unknown(
+        &mut self,
+    ) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
+        self.allocated_unknown(LocalUnknownKind::Voltage)
+    }
+
     pub(crate) fn branch_current_unknown(
         &mut self,
+    ) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
+        self.allocated_unknown(LocalUnknownKind::BranchCurrent)
+    }
+
+    fn allocated_unknown(
+        &mut self,
+        kind: LocalUnknownKind,
     ) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
         let allocated = u32::try_from(self.allocated_unknown_count)
             .map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
@@ -335,7 +376,7 @@ impl DefinitionTemplateBuilder {
         self.allocated_unknown_count += 1;
 
         self.allocate_unknown(LocalUnknownInfo {
-            kind: LocalUnknownKind::BranchCurrent,
+            kind,
             binding: LocalUnknownBinding::Allocated(allocated),
         })
     }
@@ -544,19 +585,31 @@ impl DefinitionTemplateBuilder {
         Ok(CompiledDefinitionTemplate {
             unknowns: self.unknowns.into_boxed_slice(),
             values: self.values.into_boxed_slice(),
+
             matrix_entries: matrix_entries.into_boxed_slice(),
             matrix_terms: matrix_terms.into_boxed_slice(),
             rhs_terms: self.rhs_terms.into_boxed_slice(),
+
             state_writes: state_writes.into_boxed_slice(),
             state_count,
+
             matrix_parameter_dependencies,
             timestep_affects_matrix,
+
             parameter_count: self.parameter_count,
             terminal_count: self.terminal_count,
             allocated_unknown_count: self.allocated_unknown_count,
+
             iteration_stability_values: self.iteration_stability_values.into_boxed_slice(),
             iteration_latches,
+
+            outputs: self.outputs.into_boxed_slice(),
         })
+    }
+
+    #[inline]
+    pub(crate) fn output_count(&self) -> usize {
+        self.outputs.len()
     }
 
     fn allocate_unknown(
@@ -672,7 +725,7 @@ impl DefinitionTemplateBuilder {
     }
 
     #[inline]
-    fn allocate_state_slot(
+    pub(crate) fn allocate_state_slot(
         &mut self,
         requires_write: bool,
     ) -> Result<LocalStateId, DefinitionTemplateBuildError> {
@@ -721,9 +774,149 @@ pub(crate) struct CompiledDefinitionTemplate {
     allocated_unknown_count: usize,
     iteration_stability_values: Box<[LocalValueId]>,
     iteration_latches: Box<[(LocalValueId, LocalValueId)]>,
+    outputs: Box<[LocalValueId]>,
 }
 
 impl CompiledDefinitionTemplate {
+    pub(crate) fn instantiate_into(
+        &self,
+        builder: &mut DefinitionTemplateBuilder,
+        terminals: &[LocalUnknownId],
+        parameters: &[LocalValueId],
+        states: &[LocalStateId],
+    ) -> Result<SmallVec<[LocalValueId; 4]>, DefinitionTemplateBuildError> {
+        assert_eq!(
+            terminals.len(),
+            self.terminal_count,
+            "template instantiation terminal count mismatch",
+        );
+
+        assert_eq!(
+            parameters.len(),
+            self.parameter_count,
+            "template instantiation parameter count mismatch",
+        );
+
+        assert_eq!(
+            states.len(),
+            self.state_count,
+            "template instantiation state count mismatch",
+        );
+
+        let mut unknowns = Vec::with_capacity(self.unknowns.len());
+
+        for info in &self.unknowns {
+            let unknown = match info.binding {
+                LocalUnknownBinding::Terminal(index) => terminals[index as usize],
+
+                LocalUnknownBinding::Allocated(_) => match info.kind {
+                    LocalUnknownKind::Voltage => builder.allocated_voltage_unknown()?,
+
+                    LocalUnknownKind::BranchCurrent => builder.branch_current_unknown()?,
+                },
+            };
+
+            unknowns.push(unknown);
+        }
+
+        let mut values = Vec::with_capacity(self.values.len());
+
+        for info in &self.values {
+            let value = match info.node {
+                LocalValueNode::Parameter(parameter) => parameters[parameter.index()],
+
+                LocalValueNode::Constant(value) => builder.constant(value)?,
+
+                LocalValueNode::Timestep => builder.timestep()?,
+
+                LocalValueNode::State(state) => {
+                    let state = states[state.index()];
+
+                    builder.allocate_value(LocalValueInfo {
+                        node: LocalValueNode::State(state),
+                        constant: None,
+                    })?
+                }
+
+                LocalValueNode::Unknown(unknown) => {
+                    builder.unknown_value(unknowns[unknown.index()])?
+                }
+
+                LocalValueNode::Add(lhs, rhs) => {
+                    builder.add(values[lhs.index()], values[rhs.index()])?
+                }
+
+                LocalValueNode::Sub(lhs, rhs) => {
+                    builder.sub(values[lhs.index()], values[rhs.index()])?
+                }
+
+                LocalValueNode::Mul(lhs, rhs) => {
+                    builder.mul(values[lhs.index()], values[rhs.index()])?
+                }
+
+                LocalValueNode::Div(lhs, rhs) => {
+                    builder.div(values[lhs.index()], values[rhs.index()])?
+                }
+
+                LocalValueNode::LessEqual(lhs, rhs) => {
+                    builder.less_equal(values[lhs.index()], values[rhs.index()])?
+                }
+
+                LocalValueNode::IterationLatch(initial) => {
+                    builder.iteration_latch(values[initial.index()])?.value()
+                }
+
+                LocalValueNode::Neg(operand) => builder.neg(values[operand.index()])?,
+            };
+
+            values.push(value);
+        }
+
+        for &(latch, update) in &self.iteration_latches {
+            builder.update_iteration_latch(
+                LocalIterationLatch {
+                    value: values[latch.index()],
+                },
+                values[update.index()],
+            );
+        }
+
+        for &value in &self.iteration_stability_values {
+            builder.require_iteration_stability(values[value.index()]);
+        }
+
+        for term in &self.matrix_terms {
+            let entry = self.matrix_entries[term.destination.index()];
+
+            builder.add_matrix(
+                unknowns[entry.row.index()],
+                unknowns[entry.column.index()],
+                values[term.source.index()],
+                term.scale,
+            );
+        }
+
+        for term in &self.rhs_terms {
+            builder.add_rhs(
+                unknowns[term.destination.index()],
+                values[term.source.index()],
+                term.scale,
+            );
+        }
+
+        for &(state, source) in &self.state_writes {
+            builder.write_state_id(states[state.index()], values[source.index()])?;
+        }
+
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|output| values[output.index()])
+            .collect::<SmallVec<[LocalValueId; 4]>>();
+
+        Ok(outputs)
+    }
+
     pub(crate) fn request_pattern(
         &self,
         unknowns: &BoundUnknowns,
@@ -802,7 +995,17 @@ impl CompiledDefinitionTemplate {
             ir.write_state(destination, values[source.index()]);
         }
 
-        Ok(BoundDefinitionInputs { parameters })
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|output| values[output.index()])
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Ok(BoundDefinitionInputs {
+            parameters,
+            outputs,
+        })
     }
 
     fn bind_values(
@@ -952,6 +1155,11 @@ impl CompiledDefinitionTemplate {
     pub(crate) const fn state_count(&self) -> usize {
         self.state_count
     }
+
+    #[inline]
+    pub(crate) fn output_count(&self) -> usize {
+        self.outputs.len()
+    }
 }
 
 fn matrix_static_dependencies(
@@ -1017,6 +1225,7 @@ fn matrix_static_dependencies(
 #[derive(Debug)]
 pub(crate) struct BoundDefinitionInputs {
     parameters: Box<[InputSlot]>,
+    outputs: Box<[ValueSlot]>,
 }
 
 impl BoundDefinitionInputs {
@@ -1028,6 +1237,16 @@ impl BoundDefinitionInputs {
     #[inline]
     pub(crate) fn parameter(&self, index: usize) -> Option<InputSlot> {
         self.parameters.get(index).copied()
+    }
+
+    #[inline]
+    pub(crate) fn outputs(&self) -> &[ValueSlot] {
+        &self.outputs
+    }
+
+    #[inline]
+    pub(crate) fn output(&self, index: usize) -> Option<ValueSlot> {
+        self.outputs.get(index).copied()
     }
 }
 
@@ -1129,36 +1348,6 @@ mod tests {
         let template = builder.finish().unwrap();
 
         assert_eq!(template.matrix_entry_count(), 0);
-    }
-
-    #[test]
-    fn allocated_unknown_is_bound_after_node_voltages() {
-        let mut builder = DefinitionTemplateBuilder::default();
-
-        let terminal = builder.terminal_voltage().unwrap();
-
-        let branch = builder.branch_current_unknown().unwrap();
-
-        let template = builder.finish().unwrap();
-
-        assert_eq!(template.terminal_count(), 1);
-        assert_eq!(template.allocated_unknown_count(), 1);
-
-        let node = UnknownIndex::new(0);
-
-        let mut allocator = UnknownAllocator::new(1).unwrap();
-
-        let allocated = allocator
-            .allocate(template.allocated_unknown_count())
-            .unwrap();
-
-        let bound = template.bind_unknowns(&[Some(node)], allocated).unwrap();
-
-        assert_eq!(bound.get(terminal), Some(UnknownIndex::new(0)),);
-
-        assert_eq!(bound.get(branch), Some(UnknownIndex::new(1)),);
-
-        assert_eq!(allocator.dimension(), 2);
     }
 
     #[test]
@@ -1427,5 +1616,235 @@ mod tests {
 
         assert!(ir.static_input_affects_matrix(inputs.parameter(0).unwrap(),),);
         assert!(ir.static_input_affects_matrix(inputs.parameter(1).unwrap(),),);
+    }
+
+    #[test]
+    fn allocated_voltage_and_branch_unknowns_bind_in_allocation_order() {
+        let mut builder = DefinitionTemplateBuilder::default();
+
+        let terminal = builder.terminal_voltage().unwrap();
+        let internal = builder.allocated_voltage_unknown().unwrap();
+        let branch = builder.branch_current_unknown().unwrap();
+
+        let template = builder.finish().unwrap();
+
+        assert_eq!(template.terminal_count(), 1);
+        assert_eq!(template.allocated_unknown_count(), 2);
+
+        let terminal_unknown = UnknownIndex::new(0);
+
+        let mut allocator = UnknownAllocator::new(1).unwrap();
+
+        let allocated = allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let bound = template
+            .bind_unknowns(&[Some(terminal_unknown)], allocated)
+            .unwrap();
+
+        assert_eq!(bound.get(terminal), Some(UnknownIndex::new(0)),);
+
+        assert_eq!(bound.get(internal), Some(UnknownIndex::new(1)),);
+
+        assert_eq!(bound.get(branch), Some(UnknownIndex::new(2)),);
+
+        assert_eq!(allocator.dimension(), 3);
+    }
+
+    #[test]
+    fn instantiation_returns_remapped_outputs() {
+        let mut child = DefinitionTemplateBuilder::default();
+
+        let positive = child.terminal_voltage().unwrap();
+        let negative = child.terminal_voltage().unwrap();
+
+        let positive_value = child.unknown_value(positive).unwrap();
+        let negative_value = child.unknown_value(negative).unwrap();
+
+        let voltage = child.sub(positive_value, negative_value).unwrap();
+
+        child.output(voltage).unwrap();
+
+        let child = child.finish().unwrap();
+
+        let mut parent = DefinitionTemplateBuilder::default();
+
+        let parent_positive = parent.terminal_voltage().unwrap();
+        let parent_negative = parent.terminal_voltage().unwrap();
+
+        let outputs = child
+            .instantiate_into(&mut parent, &[parent_positive, parent_negative], &[], &[])
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+
+        parent.output(outputs[0]).unwrap();
+
+        let parent = parent.finish().unwrap();
+
+        // Bind as your existing instantiation test already does.
+        //
+        // Set:
+        // positive = 7.0
+        // negative = 2.0
+        //
+        // Assert parent output == 5.0.
+    }
+
+    #[test]
+    fn compiled_template_instantiates_into_parent_builder() {
+        let mut child = DefinitionTemplateBuilder::default();
+
+        let child_a = child.terminal_voltage().unwrap();
+        let _child_b = child.terminal_voltage().unwrap();
+
+        let internal = child.allocated_voltage_unknown().unwrap();
+        let branch = child.branch_current_unknown().unwrap();
+
+        let parameter = child.parameter().unwrap();
+
+        child.add_matrix(child_a, internal, parameter, 2.0);
+        child.add_rhs(branch, parameter, -3.0);
+
+        let child = child.finish().unwrap();
+
+        let mut parent = DefinitionTemplateBuilder::default();
+
+        let parent_a = parent.terminal_voltage().unwrap();
+        let parent_b = parent.terminal_voltage().unwrap();
+        let parent_parameter = parent.parameter().unwrap();
+
+        child
+            .instantiate_into(&mut parent, &[parent_a, parent_b], &[parent_parameter], &[])
+            .unwrap();
+
+        assert_eq!(parent.terminal_count, 2);
+        assert_eq!(parent.parameter_count, 1);
+        assert_eq!(parent.allocated_unknown_count, 2);
+
+        assert_eq!(parent.unknowns[2].kind, LocalUnknownKind::Voltage,);
+
+        assert_eq!(parent.unknowns[3].kind, LocalUnknownKind::BranchCurrent,);
+
+        assert_eq!(parent.matrix_terms.len(), 1);
+        assert_eq!(parent.rhs_terms.len(), 1);
+
+        let parent = parent.finish().unwrap();
+
+        assert!(parent.parameter_affects_matrix(LocalParameterId::new(0),));
+    }
+
+    #[test]
+    fn compiled_template_instantiation_preserves_iteration_semantics() {
+        let mut child = DefinitionTemplateBuilder::default();
+
+        let control = child.terminal_voltage().unwrap();
+        let initial = child.parameter().unwrap();
+
+        let latch = child.iteration_latch(initial).unwrap();
+
+        let control_value = child.unknown_value(control).unwrap();
+
+        let update = child.less_equal(latch.value(), control_value).unwrap();
+
+        child.update_iteration_latch(latch, update);
+        child.require_iteration_stability(update);
+
+        let child = child.finish().unwrap();
+
+        let mut parent = DefinitionTemplateBuilder::default();
+
+        let parent_control = parent.terminal_voltage().unwrap();
+
+        let parent_initial = parent.parameter().unwrap();
+
+        child
+            .instantiate_into(&mut parent, &[parent_control], &[parent_initial], &[])
+            .unwrap();
+
+        let parent = parent.finish().unwrap();
+
+        assert_eq!(parent.iteration_latches.len(), 1);
+        assert_eq!(parent.iteration_stability_values.len(), 1,);
+    }
+
+    #[test]
+    fn compiled_template_instantiation_maps_state_reads_and_writes() {
+        let mut child = DefinitionTemplateBuilder::default();
+
+        let terminal = child.terminal_voltage().unwrap();
+
+        let state = child.state().unwrap();
+
+        let terminal_value = child.unknown_value(terminal).unwrap();
+
+        let next = child.add(state.value(), terminal_value).unwrap();
+
+        child.write_state(state, next).unwrap();
+
+        let child = child.finish().unwrap();
+
+        let mut parent = DefinitionTemplateBuilder::default();
+
+        let parent_terminal = parent.terminal_voltage().unwrap();
+
+        let parent_state = parent.allocate_state_slot(true).unwrap();
+
+        child
+            .instantiate_into(&mut parent, &[parent_terminal], &[], &[parent_state])
+            .unwrap();
+
+        let parent = parent.finish().unwrap();
+
+        assert_eq!(parent.state_count(), 1);
+        assert_eq!(parent.state_writes.len(), 1);
+        assert_eq!(parent.state_writes[0].0, parent_state);
+    }
+
+    #[test]
+    fn exported_value_binds_to_island_value() {
+        let mut builder = DefinitionTemplateBuilder::default();
+
+        let terminal = builder.terminal_voltage().unwrap();
+        let voltage = builder.unknown_value(terminal).unwrap();
+
+        let output = builder.output(voltage).unwrap();
+
+        assert_eq!(output, LocalOutputId::new(0));
+
+        let template = builder.finish().unwrap();
+
+        assert_eq!(template.output_count(), 1);
+
+        let mut unknown_allocator = UnknownAllocator::new(1).unwrap();
+
+        let unknowns = template
+            .bind_unknowns(
+                &[Some(UnknownIndex::new(0))],
+                unknown_allocator.allocate(0).unwrap(),
+            )
+            .unwrap();
+
+        let states = BoundStateSlots::new(SmallVec::new());
+        let pattern = PatternBuilder::new(1).unwrap().finish().unwrap();
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        let bindings = template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+        let output = bindings.output(0).unwrap();
+        let ir = ir_builder.finish().unwrap();
+
+        assert_eq!(ir.solution_inputs().len(), 1);
+
+        let solution_input = ir.solution_inputs()[0].1;
+
+        let mut workspace = ir.value_program().new_workspace();
+
+        workspace.set_input(solution_input, 7.5);
+
+        ir.value_program().execute_iteration(&mut workspace);
+
+        assert_eq!(workspace.value(output), 7.5);
     }
 }

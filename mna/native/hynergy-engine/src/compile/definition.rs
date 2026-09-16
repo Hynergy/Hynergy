@@ -1,11 +1,13 @@
 use crate::compile::template::{
     CompiledDefinitionTemplate, DefinitionTemplateBuildError, DefinitionTemplateBuilder,
-    LocalUnknownId, LocalValueId,
+    LocalStateId, LocalUnknownId, LocalValueId,
 };
 use hynergy_ids::define_id;
+use hynergy_model::circuit::{Circuit, NodeId, ValueRef};
 use hynergy_model::device::definition::{
     DeviceBody, DeviceDefinition, DevicePartitionId, PrimitiveElementKind, TerminalId,
 };
+use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::parameter::ParameterId;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -19,34 +21,48 @@ pub(crate) struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
-    pub(crate) fn compile(definition: &DeviceDefinition) -> Result<Self, DefinitionCompileError> {
+    pub(crate) fn compile(
+        registry: &DefinitionRegistry,
+        definition: &DeviceDefinition,
+    ) -> Result<Self, DefinitionCompileError> {
         let partitions = match definition.body() {
             DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
                 compile_tick_delay_partitions(definition)?
             }
 
-            _ => {
+            DeviceBody::Primitive(_) => {
                 let template = CompiledDefinitionTemplate::compile(definition)?;
 
                 debug_assert_eq!(
                     definition.partition_count(),
                     1,
-                    "supported definition must have one partition",
+                    "supported primitive must have one partition",
                 );
 
                 let partition = DevicePartitionId::new(0);
+
                 let definition_parameters = definition_parameters(definition);
+
                 let definition_states = definition_states(definition);
 
                 vec![CompiledPartitionTemplate {
                     definition_terminals: definition_terminals_for_partition(definition, partition),
+
                     definition_parameters,
+
                     definition_state_reads: definition_states.clone(),
+
                     definition_state_writes: definition_states.clone(),
+
                     definition_states,
+
                     template,
                 }]
                 .into_boxed_slice()
+            }
+
+            DeviceBody::Composite(circuit) => {
+                compile_composite_partitions(registry, definition, circuit)?
             }
         };
 
@@ -456,6 +472,302 @@ fn compile_primitive(
     Ok(builder.finish()?)
 }
 
+fn compile_composite_partitions(
+    registry: &DefinitionRegistry,
+    definition: &DeviceDefinition,
+    circuit: &Circuit,
+) -> Result<Box<[CompiledPartitionTemplate]>, DefinitionCompileError> {
+    let mut compiled_children = Vec::with_capacity(circuit.elements().len());
+
+    for element in circuit.elements() {
+        let child_definition = registry
+            .get(element.definition())
+            .expect("registered composite child definition must exist");
+
+        compiled_children.push(CompiledDefinition::compile(registry, child_definition)?);
+    }
+
+    let mut element_state_offsets = Vec::with_capacity(compiled_children.len());
+
+    let mut next_state = 0usize;
+
+    for child in &compiled_children {
+        element_state_offsets.push(next_state);
+
+        next_state = next_state
+            .checked_add(child.state_count())
+            .expect("validated composite state count must not overflow");
+    }
+
+    debug_assert_eq!(
+        next_state,
+        definition.state_count(),
+        "compiled child states must cover composite state space",
+    );
+
+    let mut partitions = Vec::with_capacity(definition.partition_count());
+
+    for parent_partition_index in 0..definition.partition_count() {
+        let parent_partition =
+            DevicePartitionId::new(u16::try_from(parent_partition_index).expect(
+                "definition partition index must fit \
+                         DevicePartitionId",
+            ));
+
+        partitions.push(compile_composite_partition(
+            definition,
+            circuit,
+            parent_partition,
+            &compiled_children,
+            &element_state_offsets,
+        )?);
+    }
+
+    Ok(partitions.into_boxed_slice())
+}
+
+fn compile_composite_partition(
+    definition: &DeviceDefinition,
+    circuit: &Circuit,
+    parent_partition: DevicePartitionId,
+    compiled_children: &[CompiledDefinition],
+    element_state_offsets: &[usize],
+) -> Result<CompiledPartitionTemplate, DefinitionCompileError> {
+    debug_assert_eq!(circuit.elements().len(), compiled_children.len());
+    debug_assert_eq!(compiled_children.len(), element_state_offsets.len());
+
+    let definition_terminals = definition_terminals_for_partition(definition, parent_partition);
+
+    let mut builder = DefinitionTemplateBuilder::default();
+    let mut node_unknowns = vec![None; circuit.node_count() as usize];
+
+    for &terminal in &definition_terminals {
+        let node = definition.terminals()[terminal.index()];
+        let unknown = builder.terminal_voltage()?;
+
+        debug_assert!(
+            node_unknowns[node.index()].replace(unknown).is_none(),
+            "composite terminal nodes must be unique",
+        );
+    }
+
+    let mut parameter_values = vec![None; definition.parameters().len()];
+    let mut definition_parameters = SmallVec::<[ParameterId; 1]>::new();
+
+    let state_count = definition.state_count();
+
+    let mut state_used = vec![false; state_count];
+    let mut state_reads = vec![false; state_count];
+    let mut state_writes = vec![false; state_count];
+
+    let element_partitions = definition.element_partitions();
+
+    let mut child_partition_offset = 0usize;
+
+    for (element_index, child) in compiled_children.iter().enumerate() {
+        let state_offset = element_state_offsets[element_index];
+
+        for child_partition_index in 0..child.partition_count() {
+            let mapped_parent = element_partitions[child_partition_offset + child_partition_index];
+
+            if mapped_parent != parent_partition {
+                continue;
+            }
+
+            let child_partition = child
+                .partition(DevicePartitionId::new(
+                    u16::try_from(child_partition_index)
+                        .expect("child partition index must fit DevicePartitionId"),
+                ))
+                .expect("compiled child partition must exist");
+
+            for &state in child_partition.definition_states() {
+                let index = state_offset + state.index();
+                state_used[index] = true;
+            }
+
+            for &state in child_partition.definition_state_reads() {
+                let index = state_offset + state.index();
+
+                debug_assert!(state_used[index]);
+
+                state_reads[index] = true;
+            }
+
+            for &state in child_partition.definition_state_writes() {
+                let index = state_offset + state.index();
+
+                debug_assert!(state_used[index]);
+
+                state_writes[index] = true;
+            }
+        }
+
+        child_partition_offset += child.partition_count();
+    }
+
+    debug_assert_eq!(
+        child_partition_offset,
+        element_partitions.len(),
+        "element partition layout must cover every child partition",
+    );
+
+    let mut local_states = vec![None; state_count];
+
+    let mut definition_states = SmallVec::<[DefinitionStateId; 4]>::new();
+    let mut definition_state_reads = SmallVec::<[DefinitionStateId; 4]>::new();
+    let mut definition_state_writes = SmallVec::<[DefinitionStateId; 4]>::new();
+
+    for index in 0..state_count {
+        if !state_used[index] {
+            continue;
+        }
+
+        let state = DefinitionStateId::new(
+            u32::try_from(index)
+                .expect("validated composite state index must fit DefinitionStateId"),
+        );
+
+        let local = builder.allocate_state_slot(state_writes[index])?;
+
+        local_states[index] = Some(local);
+        definition_states.push(state);
+
+        if state_reads[index] {
+            definition_state_reads.push(state);
+        }
+
+        if state_writes[index] {
+            definition_state_writes.push(state);
+        }
+    }
+
+    child_partition_offset = 0;
+
+    for (element_index, element) in circuit.elements().iter().enumerate() {
+        let child = &compiled_children[element_index];
+        let state_offset = element_state_offsets[element_index];
+
+        for child_partition_index in 0..child.partition_count() {
+            let mapped_parent = element_partitions[child_partition_offset + child_partition_index];
+
+            if mapped_parent != parent_partition {
+                continue;
+            }
+
+            let child_partition_id = DevicePartitionId::new(
+                u16::try_from(child_partition_index)
+                    .expect("child partition index must fit DevicePartitionId"),
+            );
+
+            let child_partition = child
+                .partition(child_partition_id)
+                .expect("compiled child partition must exist");
+
+            let mut terminals = SmallVec::<[LocalUnknownId; 8]>::new();
+
+            for &terminal in child_partition.definition_terminals() {
+                let node = element.terminals()[terminal.index()];
+
+                terminals.push(composite_node_unknown(
+                    &mut builder,
+                    &mut node_unknowns,
+                    node,
+                )?);
+            }
+
+            let mut parameters = SmallVec::<[LocalValueId; 4]>::new();
+
+            for &parameter in child_partition.definition_parameters() {
+                let value = element.parameters()[parameter.index()];
+
+                parameters.push(composite_parameter_value(
+                    &mut builder,
+                    &mut parameter_values,
+                    &mut definition_parameters,
+                    value,
+                )?);
+            }
+
+            let mut states = SmallVec::<[LocalStateId; 4]>::new();
+
+            for &child_state in child_partition.definition_states() {
+                let global_index = state_offset + child_state.index();
+
+                states.push(
+                    local_states[global_index]
+                        .expect("used child state must have a parent partition state slot"),
+                );
+            }
+
+            child_partition.template().instantiate_into(
+                &mut builder,
+                &terminals,
+                &parameters,
+                &states,
+            )?;
+        }
+
+        child_partition_offset += child.partition_count();
+    }
+
+    debug_assert_eq!(
+        child_partition_offset,
+        element_partitions.len(),
+        "element partition layout must cover every child partition",
+    );
+
+    Ok(CompiledPartitionTemplate {
+        definition_terminals,
+        definition_parameters,
+        definition_states,
+        definition_state_reads,
+        definition_state_writes,
+        template: builder.finish()?,
+    })
+}
+
+fn composite_node_unknown(
+    builder: &mut DefinitionTemplateBuilder,
+    node_unknowns: &mut [Option<LocalUnknownId>],
+    node: NodeId,
+) -> Result<LocalUnknownId, DefinitionTemplateBuildError> {
+    if let Some(unknown) = node_unknowns[node.index()] {
+        return Ok(unknown);
+    }
+
+    let unknown = builder.allocated_voltage_unknown()?;
+
+    node_unknowns[node.index()] = Some(unknown);
+
+    Ok(unknown)
+}
+
+fn composite_parameter_value(
+    builder: &mut DefinitionTemplateBuilder,
+    parameter_values: &mut [Option<LocalValueId>],
+    definition_parameters: &mut SmallVec<[ParameterId; 1]>,
+    value: ValueRef,
+) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+    match value {
+        ValueRef::Literal(value) => builder.constant(value),
+
+        ValueRef::Parameter(parameter) => {
+            if let Some(value) = parameter_values[parameter.index()] {
+                return Ok(value);
+            }
+
+            let value = builder.parameter()?;
+
+            parameter_values[parameter.index()] = Some(value);
+
+            definition_parameters.push(parameter);
+
+            Ok(value)
+        }
+    }
+}
+
 #[inline]
 fn stamp_conductance(
     builder: &mut DefinitionTemplateBuilder,
@@ -690,13 +1002,14 @@ mod tests {
 
     use crate::compile::{island_ir::IslandIrBuilder, unknown::UnknownAllocator};
 
+    use crate::compile::state::BoundStateSlots;
+    use crate::compile::template::CompiledDefinitionTemplate;
     use hynergy_mna::{
         pattern::{PatternBuilder, UnknownIndex},
         system::MnaSystem,
     };
-
-    use crate::compile::state::BoundStateSlots;
-    use crate::compile::template::CompiledDefinitionTemplate;
+    use hynergy_model::circuit::Element;
+    use hynergy_model::device::builder::DeviceDefinitionBuilder;
     use hynergy_model::device::{
         definition::{DefinitionId, PrimitiveElementKind},
         registry::DefinitionRegistry,
@@ -1343,7 +1656,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         assert_eq!(compiled.partition_count(), 1);
         assert_eq!(compiled.state_count(), 0);
@@ -1366,7 +1679,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         assert_eq!(compiled.partition_count(), 2);
         assert_eq!(compiled.state_count(), 1);
@@ -1397,7 +1710,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
 
@@ -1415,7 +1728,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
 
@@ -1442,7 +1755,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let output = compiled.partition(DevicePartitionId::new(1)).unwrap();
 
@@ -1463,7 +1776,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
 
@@ -1537,7 +1850,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
 
@@ -1552,7 +1865,7 @@ mod tests {
             .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         assert_eq!(compiled.state_count(), 1);
 
@@ -1571,5 +1884,266 @@ mod tests {
                 .definition_parameters()
                 .is_empty()
         );
+    }
+    #[test]
+    fn stateless_composite_inlines_child_templates() {
+        let mut registry = DefinitionRegistry::new();
+
+        let resistance = DefinitionId::from(PrimitiveElementKind::Resistance);
+
+        let resistance_constraint = registry.get(resistance).unwrap().parameters()[0];
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let a = builder.add_terminal().unwrap();
+            let b = builder.add_terminal().unwrap();
+            let middle = builder.add_node().unwrap();
+
+            let r2 = builder.add_parameter(resistance_constraint).unwrap();
+
+            // R1 = 2 ohm literal.
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![a, middle],
+                    vec![ValueRef::Literal(2.0)],
+                ))
+                .unwrap();
+
+            // R2 = parent parameter.
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![middle, b],
+                    vec![ValueRef::Parameter(r2)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let definition_id = registry.register(definition).unwrap();
+
+        let definition = registry.get(definition_id).unwrap();
+
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
+
+        assert_eq!(compiled.partition_count(), 1);
+        assert_eq!(compiled.state_count(), 0);
+
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        assert_eq!(
+            partition.definition_terminals(),
+            &[TerminalId::new(0), TerminalId::new(1)],
+        );
+
+        assert_eq!(partition.definition_parameters(), &[ParameterId::new(0)],);
+
+        let template = partition.template();
+
+        // The internal series node becomes one allocated voltage unknown.
+        assert_eq!(template.terminal_count(), 2);
+        assert_eq!(template.allocated_unknown_count(), 1);
+        assert_eq!(template.parameter_count(), 1);
+        assert_eq!(template.state_count(), 0);
+
+        let a_unknown = UnknownIndex::new(0);
+
+        let mut unknown_allocator = UnknownAllocator::new(1).unwrap();
+
+        let allocated = unknown_allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let middle_unknown = allocated.get(0).unwrap();
+
+        let unknowns = template
+            .bind_unknowns(&[Some(a_unknown), None], allocated)
+            .unwrap();
+
+        let mut pattern_builder = PatternBuilder::new(unknown_allocator.dimension()).unwrap();
+
+        template
+            .request_pattern(&unknowns, &mut pattern_builder)
+            .unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+
+        let aa = pattern.slot(a_unknown, a_unknown).unwrap();
+
+        let am = pattern.slot(a_unknown, middle_unknown).unwrap();
+
+        let ma = pattern.slot(middle_unknown, a_unknown).unwrap();
+
+        let mm = pattern.slot(middle_unknown, middle_unknown).unwrap();
+
+        let states = state_slots(&[]);
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        let inputs = template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+
+        let ir = ir_builder.finish().unwrap();
+
+        let mut workspace = ir.value_program().new_workspace();
+
+        // R2 = 3 ohm.
+        workspace.set_input(inputs.parameter(0).unwrap(), 3.0);
+
+        ir.value_program().execute_static(&mut workspace);
+
+        let mut system = MnaSystem::new(pattern).unwrap();
+
+        {
+            let mut matrix = system.values_mut();
+
+            ir.matrix_program().execute(&mut matrix, workspace.values());
+        }
+
+        let values = system.values();
+
+        let g1 = 1.0 / 2.0;
+        let g2 = 1.0 / 3.0;
+
+        assert!((values[aa.index()] - g1).abs() < 1.0e-12);
+        assert!((values[am.index()] + g1).abs() < 1.0e-12);
+        assert!((values[ma.index()] + g1).abs() < 1.0e-12);
+
+        assert!((values[mm.index()] - (g1 + g2)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn composite_flattens_child_states_in_element_order() {
+        let mut registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let a = builder.add_terminal().unwrap();
+            let b = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Resistance.into(),
+                    vec![a, b],
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Capacitor.into(),
+                    vec![a, b],
+                    vec![ValueRef::Literal(2.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Inductor.into(),
+                    vec![a, b],
+                    vec![ValueRef::Literal(3.0)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.state_count(), 2);
+
+        let id = registry.register(definition).unwrap();
+
+        let compiled = CompiledDefinition::compile(&registry, registry.get(id).unwrap()).unwrap();
+
+        assert_eq!(compiled.state_count(), 2);
+        assert_eq!(compiled.partition_count(), 1);
+
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        assert_eq!(
+            partition.definition_states(),
+            &[DefinitionStateId::new(0), DefinitionStateId::new(1),],
+        );
+
+        assert_eq!(
+            partition.definition_state_reads(),
+            &[DefinitionStateId::new(0), DefinitionStateId::new(1),],
+        );
+
+        assert_eq!(
+            partition.definition_state_writes(),
+            &[DefinitionStateId::new(0), DefinitionStateId::new(1),],
+        );
+
+        assert_eq!(partition.template().state_count(), 2);
+    }
+
+    #[test]
+    fn composite_preserves_split_state_access_across_partitions() {
+        let mut registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let input_positive = builder.add_terminal().unwrap();
+
+            let input_negative = builder.add_terminal().unwrap();
+
+            let output_positive = builder.add_terminal().unwrap();
+
+            let output_negative = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::TickDelay.into(),
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Literal(1.25)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.state_count(), 1);
+        assert_eq!(definition.partition_count(), 2);
+
+        let id = registry.register(definition).unwrap();
+
+        let compiled = CompiledDefinition::compile(&registry, registry.get(id).unwrap()).unwrap();
+
+        assert_eq!(compiled.state_count(), 1);
+        assert_eq!(compiled.partition_count(), 2);
+
+        let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        let output = compiled.partition(DevicePartitionId::new(1)).unwrap();
+
+        assert_eq!(input.definition_states(), &[DefinitionStateId::new(0)],);
+
+        assert!(input.definition_state_reads().is_empty());
+
+        assert_eq!(
+            input.definition_state_writes(),
+            &[DefinitionStateId::new(0)],
+        );
+
+        assert_eq!(output.definition_states(), &[DefinitionStateId::new(0)],);
+
+        assert_eq!(
+            output.definition_state_reads(),
+            &[DefinitionStateId::new(0)],
+        );
+
+        assert!(output.definition_state_writes().is_empty());
+
+        assert_eq!(input.template().state_count(), 1);
+        assert_eq!(output.template().state_count(), 1);
     }
 }

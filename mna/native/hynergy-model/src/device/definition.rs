@@ -1,13 +1,67 @@
-use crate::circuit::{Circuit, NodeId};
-use crate::parameter::ParameterConstraints;
+use crate::circuit::{Circuit, ElementId, NodeId};
+use crate::parameter::{Bound, ParameterConstraintError, ParameterConstraints};
 use hynergy_ids::{define_id, define_non_zero_id};
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 
-define_id!(TerminalId, DevicePartitionId: u16);
+define_id!(TerminalId, DefinitionObserverId, DevicePartitionId: u16);
 define_non_zero_id!(DefinitionId, DeviceId);
 
-use crate::parameter::{Bound, ParameterConstraintError};
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObserverQuantity {
+    Voltage,
+    Current,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionObserverSource {
+    Voltage {
+        positive: NodeId,
+        negative: NodeId,
+    },
+
+    Child {
+        element: ElementId,
+        observer: DefinitionObserverId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefinitionObserver {
+    quantity: ObserverQuantity,
+    partition: DevicePartitionId,
+    source: DefinitionObserverSource,
+}
+
+impl DefinitionObserver {
+    #[inline]
+    pub(crate) const fn new(
+        quantity: ObserverQuantity,
+        partition: DevicePartitionId,
+        source: DefinitionObserverSource,
+    ) -> Self {
+        Self {
+            quantity,
+            partition,
+            source,
+        }
+    }
+
+    #[inline]
+    pub const fn quantity(&self) -> ObserverQuantity {
+        self.quantity
+    }
+
+    #[inline]
+    pub const fn partition(&self) -> DevicePartitionId {
+        self.partition
+    }
+
+    #[inline]
+    pub const fn source(&self) -> DefinitionObserverSource {
+        self.source
+    }
+}
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,6 +254,7 @@ impl PrimitiveElementKind {
             terminals,
             param_constraints,
             terminal_partition_layout,
+            Vec::new(),
         )
     }
 
@@ -298,6 +353,7 @@ pub struct DeviceDefinition {
     param_constraints: SmallVec<[ParameterConstraints; 1]>,
     partition_layout: DevicePartitionLayout,
     state_count: usize,
+    observers: Vec<DefinitionObserver>,
 }
 
 impl DeviceDefinition {
@@ -306,6 +362,7 @@ impl DeviceDefinition {
         terminals: impl Into<SmallVec<[NodeId; 4]>>,
         param_constraints: impl Into<SmallVec<[ParameterConstraints; 1]>>,
         partition_layout: DevicePartitionLayout,
+        observers: Vec<DefinitionObserver>,
     ) -> Self {
         Self {
             body: DeviceBody::Primitive(kind),
@@ -313,6 +370,7 @@ impl DeviceDefinition {
             param_constraints: param_constraints.into(),
             partition_layout,
             state_count: kind.state_count(),
+            observers,
         }
     }
 
@@ -322,6 +380,7 @@ impl DeviceDefinition {
         param_constraints: impl Into<SmallVec<[ParameterConstraints; 1]>>,
         partition_layout: DevicePartitionLayout,
         state_count: usize,
+        observers: Vec<DefinitionObserver>,
     ) -> Self {
         Self {
             body: DeviceBody::Composite(circuit),
@@ -329,6 +388,7 @@ impl DeviceDefinition {
             param_constraints: param_constraints.into(),
             partition_layout,
             state_count,
+            observers,
         }
     }
 
@@ -369,6 +429,16 @@ impl DeviceDefinition {
     #[inline]
     pub(crate) fn exposed_partition_count(&self) -> usize {
         self.partition_layout.exposed_partition_count()
+    }
+
+    #[inline]
+    pub fn observers(&self) -> &[DefinitionObserver] {
+        &self.observers
+    }
+
+    #[inline]
+    pub fn observer(&self, observer: DefinitionObserverId) -> Option<&DefinitionObserver> {
+        self.observers.get(observer.index())
     }
 }
 
@@ -486,6 +556,7 @@ impl DevicePartitionLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter::ParameterConstraintError;
 
     fn invalid(
         index: usize,

@@ -5,23 +5,97 @@ mod topology;
 use crate::compile::island::{DeviceState, IslandCompileError, compile_topology_island};
 use crate::runtime::island::{IslandRuntime, IslandRuntimeError, StagedStateWrite};
 use crate::topology::{DerivedTopology, TraversalScratch};
+use hynergy_mna::system::MnaError;
+use hynergy_model::circuit::ValueRef;
 use hynergy_model::device::definition::{
     DefinitionId, DeviceBody, DeviceDefinition, DeviceId, PrimitiveElementKind, TerminalId,
 };
 use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
 use hynergy_model::network::{Network, NetworkModelError, WireId};
 use hynergy_model::parameter::ParameterId;
+use std::num::NonZeroU32;
 use thiserror::Error;
 
-pub struct Engine {
-    definition_registry: DefinitionRegistry,
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum EngineTickError {
+    #[error("world does not exist")]
+    UnknownWorld,
 
-    universe: Vec<Option<World>>,
+    #[error("device {device:?} parameter {parameter:?} is not assigned")]
+    MissingParameter {
+        device: DeviceId,
+        parameter: ParameterId,
+    },
+
+    #[error("island matrix is singular")]
+    Singular,
+
+    #[error("nonlinear island did not converge after {iterations} iterations")]
+    NonlinearDidNotConverge { iterations: usize },
+
+    #[error("island matrix contains a non-finite value")]
+    NonFiniteMatrix,
+
+    #[error("island solution contains a non-finite value")]
+    NonFiniteSolution,
+
+    #[error("simulation resource limit was exceeded")]
+    ResourceExhausted,
+
+    #[error("MNA backend failed")]
+    BackendFailure,
+
+    #[error("island compilation failed")]
+    CompilationFailed,
+
+    #[error("simulation internal invariant failed")]
+    InternalInvariant,
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
+impl From<WorldTickError> for EngineTickError {
+    fn from(error: WorldTickError) -> Self {
+        match error {
+            WorldTickError::Compile(_) => Self::CompilationFailed,
+
+            WorldTickError::Runtime(error) => match error {
+                IslandRuntimeError::MissingParameter { device, parameter } => {
+                    Self::MissingParameter { device, parameter }
+                }
+
+                IslandRuntimeError::NonlinearDidNotConverge { iterations } => {
+                    Self::NonlinearDidNotConverge { iterations }
+                }
+
+                IslandRuntimeError::NonFiniteMatrix => Self::NonFiniteMatrix,
+
+                IslandRuntimeError::NonFiniteSolution => Self::NonFiniteSolution,
+
+                IslandRuntimeError::Mna(error) => match error {
+                    MnaError::Singular { .. } => Self::Singular,
+
+                    MnaError::IndexOverflow | MnaError::OutOfMemory => Self::ResourceExhausted,
+
+                    MnaError::BackendFailure => Self::BackendFailure,
+
+                    MnaError::NotFactorized | MnaError::RhsLengthMismatch { .. } => {
+                        Self::InternalInvariant
+                    }
+                },
+
+                IslandRuntimeError::InvalidTimestep
+                | IslandRuntimeError::MissingDevice { .. }
+                | IslandRuntimeError::MissingState { .. } => Self::InternalInvariant,
+            },
+
+            WorldTickError::State(error) => match error {
+                PhysicalStateError::MissingInitialParameter { device, parameter } => {
+                    Self::MissingParameter { device, parameter }
+                }
+
+                PhysicalStateError::StateNotInitialized { .. }
+                | PhysicalStateError::DuplicateWrite { .. } => Self::InternalInvariant,
+            },
+        }
     }
 }
 
@@ -84,6 +158,18 @@ pub enum WorldCommand {
     },
 }
 
+pub struct Engine {
+    definition_registry: DefinitionRegistry,
+
+    universe: Vec<Option<World>>,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Engine {
     pub const COMPOSITE_DEFINITION_ID_BASE: u32 = DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE;
 
@@ -92,6 +178,18 @@ impl Engine {
             definition_registry: DefinitionRegistry::new(),
             universe: Vec::new(),
         }
+    }
+
+    pub fn tick_world(&mut self, world_id: u32) -> Result<(), EngineTickError> {
+        let definitions = &self.definition_registry;
+
+        let world = self
+            .universe
+            .get_mut(world_id as usize)
+            .and_then(Option::as_mut)
+            .ok_or(EngineTickError::UnknownWorld)?;
+
+        world.tick(definitions).map_err(EngineTickError::from)
     }
 
     #[inline]
@@ -107,11 +205,12 @@ impl Engine {
         self.definition_registry.register(definition)
     }
 
-    pub fn new_world(&mut self) -> Result<u32, WorldManagementError> {
+    pub fn new_world(&mut self, config: WorldConfig) -> Result<u32, WorldManagementError> {
         let id = u32::try_from(self.universe.len())
             .map_err(|_| WorldManagementError::WorldIdExhausted)?;
 
-        self.universe.push(Some(World::default()));
+        self.universe.push(Some(World::new(config)));
+
         Ok(id)
     }
 
@@ -208,8 +307,35 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldConfig {
+    tick_frequency_hz: NonZeroU32,
+    timestep: f64,
+}
+
+impl WorldConfig {
+    #[inline]
+    pub fn new(tick_frequency_hz: NonZeroU32) -> Self {
+        Self {
+            tick_frequency_hz,
+            timestep: 1.0 / f64::from(tick_frequency_hz.get()),
+        }
+    }
+
+    #[inline]
+    pub const fn tick_frequency_hz(self) -> NonZeroU32 {
+        self.tick_frequency_hz
+    }
+
+    #[inline]
+    pub(crate) const fn timestep(self) -> f64 {
+        self.timestep
+    }
+}
+
+#[derive(Debug)]
 pub struct World {
+    config: WorldConfig,
     network: Network,
     derived_topology: DerivedTopology,
     topology_scratch: TraversalScratch,
@@ -220,31 +346,32 @@ pub struct World {
 impl Clone for World {
     fn clone(&self) -> Self {
         Self {
+            config: self.config,
             network: self.network.clone(),
-
             derived_topology: self.derived_topology.clone(),
-
             topology_scratch: TraversalScratch::default(),
-
             physical_state: self.physical_state.clone(),
-
             island_runtimes: Vec::new(),
         }
     }
 }
 
 impl World {
-    pub(crate) fn tick(
-        &mut self,
-        definitions: &DefinitionRegistry,
-        timestep: f64,
-    ) -> Result<(), WorldTickError> {
-        if !timestep.is_finite() || timestep <= 0.0 {
-            return Err(WorldTickError::InvalidTimestep);
+    fn new(config: WorldConfig) -> Self {
+        Self {
+            config,
+            network: Network::new(),
+            derived_topology: DerivedTopology::default(),
+            topology_scratch: TraversalScratch::default(),
+            physical_state: PhysicalStateStore::new(),
+            island_runtimes: Vec::new(),
         }
+    }
+
+    pub(crate) fn tick(&mut self, definitions: &DefinitionRegistry) -> Result<(), WorldTickError> {
+        let timestep = self.config.timestep();
 
         self.sync_island_runtimes(definitions)?;
-
         self.initialize_physical_state(definitions)?;
 
         let live_islands = self
@@ -254,9 +381,7 @@ impl World {
             .collect::<Vec<_>>();
 
         let network = &self.network;
-
         let old_state = &self.physical_state;
-
         let runtimes = &mut self.island_runtimes;
 
         let mut staged = Vec::<StagedStateWrite>::new();
@@ -277,6 +402,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn add_wire(&mut self, wire: WireId) -> Result<(), NetworkModelError> {
         self.network.add_wire(wire)?;
         self.derived_topology.add_wire(wire);
@@ -284,6 +410,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn remove_wire(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -300,6 +427,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn connect_wires(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -313,6 +441,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn disconnect_wires(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -331,6 +460,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn add_device(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -348,6 +478,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn remove_device(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -370,6 +501,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn attach_terminal(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -385,6 +517,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     pub fn detach_terminal(
         &mut self,
 
@@ -422,6 +555,7 @@ impl World {
         Ok(())
     }
 
+    #[inline]
     fn initialize_physical_state(
         &mut self,
         definitions: &DefinitionRegistry,
@@ -528,6 +662,17 @@ impl World {
     pub fn network(&self) -> &Network {
         &self.network
     }
+
+    #[inline]
+    pub const fn config(&self) -> WorldConfig {
+        self.config
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InitialParameterValue {
+    Value(f64),
+    Unassigned(ParameterId),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -537,9 +682,6 @@ pub(crate) enum PhysicalStateError {
         device: DeviceId,
         parameter: ParameterId,
     },
-
-    #[error("composite device state initialization is not implemented")]
-    CompositeNotYetSupported,
 
     #[error("state {state:?} is not initialized")]
     StateNotInitialized { state: DeviceState },
@@ -585,48 +727,39 @@ impl PhysicalStateStore {
             .get(definition_id)
             .expect("state initialization definition must remain registered");
 
-        let mut state = vec![0.0; definition.state_count()];
+        let device_slot = network
+            .devices()
+            .get(device.index())
+            .and_then(Option::as_ref)
+            .expect("state initialization device must exist");
 
-        match definition.body() {
-            DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
-                debug_assert_eq!(state.len(), 1,);
+        let parameters = device_slot
+            .parameters()
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let parameter = ParameterId::new(
+                    u32::try_from(index).expect("definition parameter index must fit ParameterId"),
+                );
 
-                let parameter = ParameterId::new(0);
+                match value {
+                    Some(value) => InitialParameterValue::Value(*value),
 
-                let device_slot = network
-                    .devices()
-                    .get(device.index())
-                    .and_then(Option::as_ref)
-                    .expect("state initialization device must exist");
-
-                let initial = device_slot
-                    .parameters()
-                    .get(parameter.index())
-                    .copied()
-                    .flatten()
-                    .ok_or(PhysicalStateError::MissingInitialParameter { device, parameter })?;
-
-                state[0] = initial;
-            }
-
-            DeviceBody::Primitive(
-                PrimitiveElementKind::Capacitor
-                | PrimitiveElementKind::Inductor
-                | PrimitiveElementKind::VoltageControlledSwitch,
-            ) => {
-                debug_assert_eq!(state.len(), 1);
-            }
-
-            DeviceBody::Primitive(_) => {
-                debug_assert!(state.is_empty(),);
-            }
-
-            DeviceBody::Composite(_) => {
-                if !state.is_empty() {
-                    return Err(PhysicalStateError::CompositeNotYetSupported);
+                    None => InitialParameterValue::Unassigned(parameter),
                 }
-            }
-        }
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = Vec::with_capacity(definition.state_count());
+
+        initialize_definition_state(definitions, definition, &parameters, device, &mut state)?;
+
+        debug_assert_eq!(
+            state.len(),
+            definition.state_count(),
+            "recursive state initialization must produce exactly \
+         the definition state count",
+        );
 
         self.devices[device.index()] = Some(state.into_boxed_slice());
 
@@ -691,11 +824,85 @@ impl PhysicalStateStore {
     }
 }
 
+fn initialize_definition_state(
+    definitions: &DefinitionRegistry,
+    definition: &DeviceDefinition,
+    parameters: &[InitialParameterValue],
+    device: DeviceId,
+    state: &mut Vec<f64>,
+) -> Result<(), PhysicalStateError> {
+    debug_assert_eq!(
+        parameters.len(),
+        definition.parameters().len(),
+        "initial parameter mapping must match definition",
+    );
+
+    match definition.body() {
+        DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
+            debug_assert_eq!(definition.state_count(), 1,);
+
+            let initial = match parameters[0] {
+                InitialParameterValue::Value(value) => value,
+
+                InitialParameterValue::Unassigned(parameter) => {
+                    return Err(PhysicalStateError::MissingInitialParameter { device, parameter });
+                }
+            };
+
+            state.push(initial);
+        }
+
+        DeviceBody::Primitive(
+            PrimitiveElementKind::Capacitor
+            | PrimitiveElementKind::Inductor
+            | PrimitiveElementKind::VoltageControlledSwitch,
+        ) => {
+            debug_assert_eq!(definition.state_count(), 1,);
+
+            state.push(0.0);
+        }
+
+        DeviceBody::Primitive(_) => {
+            debug_assert_eq!(definition.state_count(), 0,);
+        }
+
+        DeviceBody::Composite(circuit) => {
+            for element in circuit.elements() {
+                let child = definitions
+                    .get(element.definition())
+                    .expect("registered composite child must remain registered");
+
+                let mut child_parameters = Vec::with_capacity(element.parameters().len());
+
+                for value in element.parameters() {
+                    let value = match *value {
+                        ValueRef::Literal(value) => InitialParameterValue::Value(value),
+
+                        ValueRef::Parameter(parameter) => parameters[parameter.index()],
+                    };
+
+                    child_parameters.push(value);
+                }
+
+                let before = state.len();
+
+                initialize_definition_state(definitions, child, &child_parameters, device, state)?;
+
+                debug_assert_eq!(
+                    state.len() - before,
+                    child.state_count(),
+                    "child state initialization must match \
+                     child definition state count",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum WorldTickError {
-    #[error("timestep must be finite and greater than zero")]
-    InvalidTimestep,
-
     #[error(transparent)]
     Compile(#[from] IslandCompileError),
 
@@ -713,9 +920,16 @@ mod tests {
     use crate::compile::island::IslandNode;
     use crate::runtime::island::StagedStateWrite;
     use crate::topology::DeviceComponent;
+    use hynergy_model::circuit::{Element, ValueRef};
+    use hynergy_model::device::builder::DeviceDefinitionBuilder;
     use hynergy_model::device::definition::{DevicePartitionId, PrimitiveElementKind};
     use hynergy_model::device::registry::DefinitionRegistry;
     use hynergy_model::parameter::{ParameterConstraintError, ParameterId};
+    use std::num::NonZeroU32;
+
+    fn world_config() -> WorldConfig {
+        WorldConfig::new(NonZeroU32::new(30).unwrap())
+    }
 
     fn wire(raw: u32) -> WireId {
         WireId::try_from(raw).unwrap()
@@ -734,7 +948,7 @@ mod tests {
     #[should_panic(expected = "live wire is missing from derived nets")]
     fn successful_world_command_checks_derived_topology() {
         let mut engine = Engine::new();
-        let world_id = engine.new_world().unwrap();
+        let world_id = engine.new_world(world_config()).unwrap();
 
         let untracked = wire(1);
         let added = wire(2);
@@ -753,7 +967,7 @@ mod tests {
     #[test]
     fn world_updates_network_and_topology_consistently() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
         let a = wire(1);
         let b = wire(2);
         let d = device(1);
@@ -782,7 +996,7 @@ mod tests {
     fn failed_network_mutation_does_not_change_topology() {
         let definitions = DefinitionRegistry::new();
 
-        let mut world = World::default();
+        let mut world = World::new(world_config());
         let a = wire(1);
         let b = wire(2);
 
@@ -806,7 +1020,7 @@ mod tests {
     #[test]
     fn parameter_changes_invalidate_numerics_without_changing_topology() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
         let d = device(1);
 
         world.add_device(&definitions, d, admittance()).unwrap();
@@ -867,7 +1081,7 @@ mod tests {
     fn every_world_command_variant_dispatches() {
         let mut engine = Engine::new();
         let definitions = DefinitionRegistry::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
 
         let a = wire(1);
         let b = wire(2);
@@ -969,7 +1183,7 @@ mod tests {
     #[test]
     fn command_dispatch_preserves_model_errors() {
         let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
         let wire = wire(1);
 
         engine
@@ -987,7 +1201,7 @@ mod tests {
     #[test]
     fn parameter_change_invalidates_all_component_islands() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
         let delay = device(1);
 
         world
@@ -1059,7 +1273,7 @@ mod tests {
     #[test]
     fn tick_delay_state_initializes_once_from_parameter() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
 
         let delay = device(1);
 
@@ -1102,7 +1316,7 @@ mod tests {
     #[test]
     fn removing_device_removes_physical_state() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
 
         let capacitor = device(1);
 
@@ -1131,7 +1345,7 @@ mod tests {
     #[test]
     fn world_tick_delays_value_across_separate_islands() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
 
         let input_negative = wire(1);
         let input_positive = wire(2);
@@ -1226,7 +1440,7 @@ mod tests {
 
         let physical_state = DeviceState::new(delay, DefinitionStateId::new(0));
 
-        world.tick(&definitions, 1.0).unwrap();
+        world.tick(&definitions).unwrap();
 
         let runtime = world.island_runtimes[output_island.index()]
             .as_ref()
@@ -1239,7 +1453,7 @@ mod tests {
 
         assert_eq!(world.physical_state.get(physical_state), Some(9.0),);
 
-        world.tick(&definitions, 1.0).unwrap();
+        world.tick(&definitions).unwrap();
 
         let runtime = world.island_runtimes[output_island.index()]
             .as_ref()
@@ -1254,7 +1468,7 @@ mod tests {
     #[test]
     fn failed_state_commit_does_not_modify_state() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
 
         let capacitor = device(1);
 
@@ -1291,7 +1505,7 @@ mod tests {
     #[test]
     fn parameter_change_refreshes_cached_island_runtime() {
         let definitions = DefinitionRegistry::new();
-        let mut world = World::default();
+        let mut world = World::new(world_config());
 
         let negative = wire(1);
         let positive = wire(2);
@@ -1336,7 +1550,7 @@ mod tests {
             .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
             .unwrap();
 
-        world.tick(&definitions, 1.0).unwrap();
+        world.tick(&definitions).unwrap();
 
         let island = world
             .derived_topology
@@ -1356,7 +1570,7 @@ mod tests {
             .set_device_parameter(&definitions, source, ParameterId::new(0), 9.0)
             .unwrap();
 
-        world.tick(&definitions, 1.0).unwrap();
+        world.tick(&definitions).unwrap();
 
         let runtime = world.island_runtimes[island.index()].as_ref().unwrap();
 
@@ -1391,5 +1605,541 @@ mod tests {
             states.get(DeviceState::new(switch, DefinitionStateId::new(0),)),
             Some(0.0),
         );
+    }
+
+    #[test]
+    fn engine_ticks_configured_world() {
+        let mut engine = Engine::new();
+
+        assert_eq!(engine.tick_world(0), Err(EngineTickError::UnknownWorld),);
+
+        let world = engine.new_world(world_config()).unwrap();
+
+        assert_eq!(engine.tick_world(world), Ok(()),);
+    }
+
+    #[test]
+    fn nonconvergent_switch_does_not_commit_physical_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let common = wire(1);
+        let output = wire(2);
+
+        let switch = device(1);
+        let source = device(2);
+
+        world.add_wire(common).unwrap();
+        world.add_wire(output).unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                switch,
+                PrimitiveElementKind::VoltageControlledSwitch.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        // Switch output.
+        world
+            .attach_terminal(&definitions, output, switch, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, common, switch, TerminalId::new(1))
+            .unwrap();
+
+        // Self-control:
+        //
+        // Vc = Vout.
+        world
+            .attach_terminal(&definitions, output, switch, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, common, switch, TerminalId::new(3))
+            .unwrap();
+
+        // Inject 8 A into output.
+        world
+            .attach_terminal(&definitions, common, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output, source, TerminalId::new(1))
+            .unwrap();
+
+        // threshold = 5
+        // hysteresis = 2
+        // lower = 4
+        // upper = 6
+        // G_max = 4
+        // G_min = 1
+        //
+        // OFF:
+        //     Vout = 8 / 1 = 8 V
+        //     8 >= upper -> ON
+        //
+        // ON:
+        //     Vout = 8 / 4 = 2 V
+        //     2 <= lower -> OFF
+        //
+        // Therefore no stable discrete operating point exists.
+        for (index, value) in [5.0, 2.0, 4.0, 1.0].into_iter().enumerate() {
+            world
+                .set_device_parameter(&definitions, switch, ParameterId::new(index as u32), value)
+                .unwrap();
+        }
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 8.0)
+            .unwrap();
+
+        let error = world.tick(&definitions).unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorldTickError::Runtime(IslandRuntimeError::NonlinearDidNotConverge { .. })
+        ));
+
+        let state = DeviceState::new(switch, DefinitionStateId::new(0));
+
+        // initialize_physical_state() ran before the solve, so the
+        // state exists. The failed solve must not have changed OFF -> ON.
+        assert_eq!(world.physical_state.get(state), Some(0.0),);
+    }
+
+    #[test]
+    fn engine_tick_reports_missing_device_parameter() {
+        let mut engine = Engine::new();
+
+        let world_id = engine.new_world(world_config()).unwrap();
+        let device = device(1);
+
+        engine
+            .apply_world_command(
+                world_id,
+                WorldCommand::AddDevice {
+                    device,
+                    definition: PrimitiveElementKind::Conductance.into(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine.tick_world(world_id),
+            Err(EngineTickError::MissingParameter {
+                device,
+                parameter: ParameterId::new(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn nested_composite_initializes_flattened_state_in_element_order() {
+        let mut definitions = DefinitionRegistry::new();
+
+        let tick_delay = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        let delay_parameter_constraint = definitions.get(tick_delay).unwrap().parameters()[0];
+
+        /*
+         * Inner composite:
+         *
+         * parameter 0
+         *     ↓
+         * TickDelay initial value
+         */
+        let inner = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let input_positive = builder.add_terminal().unwrap();
+            let input_negative = builder.add_terminal().unwrap();
+            let output_positive = builder.add_terminal().unwrap();
+            let output_negative = builder.add_terminal().unwrap();
+
+            let initial = builder.add_parameter(delay_parameter_constraint).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    tick_delay,
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Parameter(initial)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let inner = definitions.register(inner).unwrap();
+
+        let inner_parameter_constraint = definitions.get(inner).unwrap().parameters()[0];
+
+        /*
+         * Outer state order:
+         *
+         * state 0 = capacitor
+         * state 1 = inner TickDelay using outer parameter
+         * state 2 = inner TickDelay using literal
+         */
+        let outer = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let input_positive = builder.add_terminal().unwrap();
+            let input_negative = builder.add_terminal().unwrap();
+            let output_positive = builder.add_terminal().unwrap();
+            let output_negative = builder.add_terminal().unwrap();
+
+            let initial = builder.add_parameter(inner_parameter_constraint).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Capacitor.into(),
+                    vec![input_positive, input_negative],
+                    vec![ValueRef::Literal(2.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    inner,
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Parameter(initial)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    inner,
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Literal(1.5)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(outer.state_count(), 3);
+
+        let outer = definitions.register(outer).unwrap();
+
+        let mut network = Network::new();
+
+        let device = DeviceId::try_from(1).unwrap();
+
+        network.add_device(&definitions, device, outer).unwrap();
+
+        network
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 7.25)
+            .unwrap();
+
+        let mut store = PhysicalStateStore::new();
+
+        store
+            .initialize_device(&definitions, &network, device)
+            .unwrap();
+
+        assert_eq!(
+            store.get(DeviceState::new(device, DefinitionStateId::new(0),)),
+            Some(0.0),
+        );
+
+        assert_eq!(
+            store.get(DeviceState::new(device, DefinitionStateId::new(1),)),
+            Some(7.25),
+        );
+
+        assert_eq!(
+            store.get(DeviceState::new(device, DefinitionStateId::new(2),)),
+            Some(1.5),
+        );
+    }
+
+    #[test]
+    fn nested_composite_missing_initial_parameter_reports_outer_parameter() {
+        let mut definitions = DefinitionRegistry::new();
+
+        let tick_delay = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        let constraint = definitions.get(tick_delay).unwrap().parameters()[0];
+
+        let inner = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let a = builder.add_terminal().unwrap();
+            let b = builder.add_terminal().unwrap();
+            let c = builder.add_terminal().unwrap();
+            let d = builder.add_terminal().unwrap();
+
+            let parameter = builder.add_parameter(constraint).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    tick_delay,
+                    vec![a, b, c, d],
+                    vec![ValueRef::Parameter(parameter)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let inner = definitions.register(inner).unwrap();
+
+        let constraint = definitions.get(inner).unwrap().parameters()[0];
+
+        let outer = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let a = builder.add_terminal().unwrap();
+            let b = builder.add_terminal().unwrap();
+            let c = builder.add_terminal().unwrap();
+            let d = builder.add_terminal().unwrap();
+
+            let parameter = builder.add_parameter(constraint).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    inner,
+                    vec![a, b, c, d],
+                    vec![ValueRef::Parameter(parameter)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let outer = definitions.register(outer).unwrap();
+
+        let mut network = Network::new();
+
+        let device = DeviceId::try_from(1).unwrap();
+
+        network.add_device(&definitions, device, outer).unwrap();
+
+        let mut store = PhysicalStateStore::new();
+
+        assert_eq!(
+            store.initialize_device(&definitions, &network, device,),
+            Err(PhysicalStateError::MissingInitialParameter {
+                device,
+                parameter: ParameterId::new(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn composite_tick_delay_uses_old_state_until_next_tick() {
+        let mut definitions = DefinitionRegistry::new();
+
+        let tick_delay = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        let initial_constraint = definitions.get(tick_delay).unwrap().parameters()[0];
+
+        let composite = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let input_positive = builder.add_terminal().unwrap();
+
+            let input_negative = builder.add_terminal().unwrap();
+
+            let output_positive = builder.add_terminal().unwrap();
+
+            let output_negative = builder.add_terminal().unwrap();
+
+            let initial = builder.add_parameter(initial_constraint).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    tick_delay,
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Parameter(initial)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(composite.state_count(), 1);
+        assert_eq!(composite.partition_count(), 2);
+
+        let composite = definitions.register(composite).unwrap();
+
+        let mut world = World::new(world_config());
+
+        let input_negative = WireId::try_from(1).unwrap();
+        let input_positive = WireId::try_from(2).unwrap();
+        let output_negative = WireId::try_from(3).unwrap();
+        let output_positive = WireId::try_from(4).unwrap();
+
+        for wire in [
+            input_negative,
+            input_positive,
+            output_negative,
+            output_positive,
+        ] {
+            world.add_wire(wire).unwrap();
+        }
+
+        let delay = DeviceId::try_from(1).unwrap();
+        let source = DeviceId::try_from(2).unwrap();
+
+        world.add_device(&definitions, delay, composite).unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        /*
+         * Composite TickDelay:
+         *
+         * terminals 0,1 = input partition
+         * terminals 2,3 = output partition
+         */
+        world
+            .attach_terminal(&definitions, input_positive, delay, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, delay, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, delay, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, delay, TerminalId::new(3))
+            .unwrap();
+
+        /*
+         * Drive the input to 5 V.
+         */
+        world
+            .attach_terminal(&definitions, input_positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        /*
+         * Initial TickDelay output = 1.5 V.
+         */
+        world
+            .set_device_parameter(&definitions, delay, ParameterId::new(0), 1.5)
+            .unwrap();
+
+        let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
+
+        let output_island = world.derived_topology.component_island(output_component);
+
+        let output_positive_node =
+            IslandNode::net(world.derived_topology.wire_net(output_positive));
+
+        let output_negative_node =
+            IslandNode::net(world.derived_topology.wire_net(output_negative));
+
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+
+        /*
+         * Tick 1:
+         *
+         * output partition must read initial old state = 1.5 V.
+         *
+         * input partition sees 5 V and stages state = 5 V.
+         *
+         * Only after every island succeeds may 5 V be committed.
+         */
+        world.tick(&definitions).unwrap();
+
+        let output_runtime = world
+            .island_runtimes
+            .get(output_island.index())
+            .and_then(Option::as_ref)
+            .unwrap();
+
+        let voltage = output_runtime.node_voltage(output_positive_node).unwrap()
+            - output_runtime.node_voltage(output_negative_node).unwrap();
+
+        assert!((voltage - 1.5).abs() < 1.0e-12);
+
+        /*
+         * The staged 5 V input has now committed to physical state.
+         */
+        assert_eq!(world.physical_state.get(state), Some(5.0),);
+
+        /*
+         * Tick 2:
+         *
+         * output now reads the state committed by tick 1.
+         */
+        world.tick(&definitions).unwrap();
+
+        let output_runtime = world
+            .island_runtimes
+            .get(output_island.index())
+            .and_then(Option::as_ref)
+            .unwrap();
+
+        let voltage = output_runtime.node_voltage(output_positive_node).unwrap()
+            - output_runtime.node_voltage(output_negative_node).unwrap();
+
+        assert!((voltage - 5.0).abs() < 1.0e-12);
+
+        assert_eq!(world.physical_state.get(state), Some(5.0),);
+    }
+
+    #[test]
+    fn world_uses_configured_fixed_tick_frequency() {
+        let config = WorldConfig::new(NonZeroU32::new(20).unwrap());
+
+        assert_eq!(config.tick_frequency_hz(), NonZeroU32::new(20).unwrap(),);
+
+        assert!((config.timestep() - 0.05).abs() < 1.0e-12);
+
+        let mut engine = Engine::new();
+
+        let world_id = engine.new_world(config).unwrap();
+
+        let world = engine.world(world_id).unwrap();
+
+        assert_eq!(world.config(), config);
     }
 }

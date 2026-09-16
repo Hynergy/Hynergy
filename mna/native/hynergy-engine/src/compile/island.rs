@@ -490,7 +490,7 @@ pub(crate) fn compile_topology_island(
                 .get(definition_id)
                 .expect("island definition must remain registered");
 
-            let compiled = CompiledDefinition::compile(definition)?;
+            let compiled = CompiledDefinition::compile(definitions, definition)?;
 
             compiled_definitions.push((definition_id, compiled));
 
@@ -595,7 +595,7 @@ mod test {
             .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
 
@@ -650,7 +650,7 @@ mod test {
             .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
 
@@ -698,7 +698,7 @@ mod test {
             .get(DefinitionId::from(PrimitiveElementKind::VoltageSource))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let template = compiled
             .partition(DevicePartitionId::new(0))
@@ -753,7 +753,7 @@ mod test {
             .get(DefinitionId::from(PrimitiveElementKind::VoltageSource))
             .unwrap();
 
-        let compiled = CompiledDefinition::compile(definition).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let template = compiled
             .partition(DevicePartitionId::new(0))
@@ -807,7 +807,7 @@ mod test {
             .get(DefinitionId::from(PrimitiveElementKind::Conductance))
             .unwrap();
 
-        let compiled_definition = CompiledDefinition::compile(definition).unwrap();
+        let compiled_definition = CompiledDefinition::compile(&registry, definition).unwrap();
 
         let partition = compiled_definition
             .partition(DevicePartitionId::new(0))

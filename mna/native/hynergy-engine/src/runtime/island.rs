@@ -582,6 +582,8 @@ mod test {
     use crate::topology::{DerivedTopology, DeviceComponent};
     use hynergy_ir::StateSlot;
     use hynergy_mna::pattern::PatternBuilder;
+    use hynergy_model::circuit::{Element, ValueRef};
+    use hynergy_model::device::builder::DeviceDefinitionBuilder;
     use hynergy_model::device::definition::{
         DefinitionId, DeviceId, DevicePartitionId, PrimitiveElementKind, TerminalId,
     };
@@ -1636,5 +1638,184 @@ mod test {
         assert!(!all_finite(&[f64::NAN]));
         assert!(!all_finite(&[f64::INFINITY]));
         assert!(!all_finite(&[f64::NEG_INFINITY]));
+    }
+
+    #[test]
+    fn voltage_controlled_switch_with_zero_hysteresis_turns_on_at_threshold() {
+        let (definitions, mut network, compiled, output_node, common_node, switch, control_source) =
+            voltage_controlled_switch_island();
+
+        // threshold = 2
+        // hysteresis = 0
+        //
+        // Exact-threshold convention:
+        // Vc >= threshold => ON.
+        network
+            .set_device_parameter(&definitions, switch, ParameterId::new(1), 0.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        let state = DeviceState::new(switch, DefinitionStateId::new(0));
+
+        let writes = runtime
+            .solve_tick(&network, 1.0, |candidate| {
+                (candidate == state).then_some(0.0)
+            })
+            .unwrap();
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].state(), state);
+        assert_eq!(writes[0].value(), 1.0);
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        // 8 A / G_max(4 S).
+        assert!((voltage - 2.0).abs() < 1.0e-9);
+    }
+    #[test]
+    fn stateless_composite_solves_through_island_runtime() {
+        let mut definitions = DefinitionRegistry::new();
+
+        let resistance = DefinitionId::from(PrimitiveElementKind::Resistance);
+
+        let resistance_constraint = definitions.get(resistance).unwrap().parameters()[0];
+
+        let composite_definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let positive = builder.add_terminal().unwrap();
+            let negative = builder.add_terminal().unwrap();
+            let middle = builder.add_node().unwrap();
+
+            let r2 = builder.add_parameter(resistance_constraint).unwrap();
+
+            // R1 = 2 ohm.
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![positive, middle],
+                    vec![ValueRef::Literal(2.0)],
+                ))
+                .unwrap();
+
+            // R2 comes from the composite parameter.
+            builder
+                .add_element(Element::new(
+                    resistance,
+                    vec![middle, negative],
+                    vec![ValueRef::Parameter(r2)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let composite_definition = definitions.register(composite_definition).unwrap();
+
+        let mut network = Network::new();
+
+        let common = WireId::try_from(1).unwrap();
+        let output = WireId::try_from(2).unwrap();
+
+        let composite = DeviceId::try_from(1).unwrap();
+        let source = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(common).unwrap();
+        network.add_wire(output).unwrap();
+
+        network
+            .add_device(&definitions, composite, composite_definition)
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        network
+            .attach_terminal(output, composite, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(common, composite, TerminalId::new(1))
+            .unwrap();
+
+        // Inject current from common into output.
+        network
+            .attach_terminal(common, source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(output, source, TerminalId::new(1))
+            .unwrap();
+
+        // R2 = 3 ohm, so the composite is 5 ohm total.
+        network
+            .set_device_parameter(&definitions, composite, ParameterId::new(0), 3.0)
+            .unwrap();
+
+        // I = 2 A.
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(composite, DevicePartitionId::new(0)));
+
+        let output_node = IslandNode::net(topology.wire_net(output));
+
+        let common_node = IslandNode::net(topology.wire_net(common));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert!(writes.is_empty());
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        // 2 A * (2 + 3) ohm = 10 V.
+        assert!((voltage - 10.0).abs() < 1.0e-12);
+
+        assert_eq!(runtime.matrix_stamp_count(), 1);
+
+        /*
+         * Change only the forwarded composite parameter.
+         *
+         * R2 = 8 ohm:
+         * total R = 10 ohm
+         * V = 2 A * 10 ohm = 20 V.
+         */
+        network
+            .set_device_parameter(&definitions, composite, ParameterId::new(0), 8.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+
+        let writes = runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert!(writes.is_empty());
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        assert!((voltage - 20.0).abs() < 1.0e-12);
+
+        // Resistance affects the matrix, so it must restamp.
+        assert_eq!(runtime.matrix_stamp_count(), 2);
     }
 }

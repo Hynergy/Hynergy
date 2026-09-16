@@ -1,8 +1,9 @@
-use hynergy_engine::{Engine, WorldManagementError};
+use hynergy_engine::{Engine, WorldConfig, WorldManagementError};
 use hynergy_protocol::{
     DefinitionRegistrationError, DefinitionRegistrationErrorKind, WorldCommandError,
     WorldCommandErrorKind,
 };
+use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub const ABI_VERSION: u32 = 1;
@@ -278,6 +279,7 @@ pub enum WorldCode {
     NullResult = 2,
     UnknownWorld = 3,
     WorldIdExhausted = 4,
+    InvalidTickFrequency = 5,
     InternalPanic = u32::MAX,
 }
 
@@ -318,18 +320,31 @@ impl WorldCreationResult {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_create_world(
     engine: *mut Engine,
+    tick_frequency_hz: u32,
     result: *mut WorldCreationResult,
 ) -> u32 {
     if result.is_null() {
         return WorldCode::NullResult as u32;
     }
 
+    let Some(tick_frequency_hz) = NonZeroU32::new(tick_frequency_hz) else {
+        let output = WorldCreationResult::failure(WorldCode::InvalidTickFrequency);
+
+        let code = output.code;
+
+        unsafe {
+            result.write(output);
+        }
+
+        return code;
+    };
+
     let output = if engine.is_null() {
         WorldCreationResult::failure(WorldCode::NullEngine)
     } else {
         let creation = catch_unwind(AssertUnwindSafe(|| {
             let engine = unsafe { &mut *engine };
-            engine.new_world()
+            engine.new_world(WorldConfig::new(tick_frequency_hz))
         }));
 
         match creation {
@@ -810,7 +825,7 @@ mod tests {
         let mut result = world_result_sentinel();
 
         assert_eq!(
-            unsafe { hynergy_engine_create_world(engine, &mut result) },
+            unsafe { hynergy_engine_create_world(engine, 30, &mut result) },
             WorldCode::Success as u32
         );
 
@@ -1101,7 +1116,7 @@ mod tests {
         let engine = hynergy_engine_create();
 
         assert_eq!(
-            unsafe { hynergy_engine_create_world(engine, std::ptr::null_mut(),) },
+            unsafe { hynergy_engine_create_world(engine, 30, std::ptr::null_mut(),) },
             WorldCode::NullResult as u32
         );
 
@@ -1118,7 +1133,7 @@ mod tests {
     fn create_world_reports_null_engine() {
         let mut result = world_result_sentinel();
 
-        let code = unsafe { hynergy_engine_create_world(std::ptr::null_mut(), &mut result) };
+        let code = unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 30, &mut result) };
 
         assert_eq!(code, WorldCode::NullEngine as u32);
         assert_eq!(

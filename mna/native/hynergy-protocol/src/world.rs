@@ -393,10 +393,15 @@ fn truncated_header(error: Truncated) -> WorldCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hynergy_engine::WorldConfig;
     use hynergy_model::device::definition::PrimitiveElementKind;
     use hynergy_model::network::ConnectionType;
     use hynergy_model::parameter::{ParameterConstraintError, ParameterId};
     use std::num::NonZeroU32;
+
+    fn world_config() -> WorldConfig {
+        WorldConfig::new(NonZeroU32::new(30).unwrap())
+    }
 
     fn command(tag: u16, payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(6 + payload.len());
@@ -465,7 +470,7 @@ mod tests {
     #[test]
     fn empty_buffer_succeeds() {
         let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
 
         apply_world_command_buffer(&mut engine, world, &buffer(&[])).unwrap();
     }
@@ -616,7 +621,7 @@ mod tests {
     #[test]
     fn truncated_command_frame_reports_command_index() {
         let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
 
         let mut bytes = buffer(&[]);
         bytes[12..16].copy_from_slice(&1_u32.to_le_bytes());
@@ -634,7 +639,7 @@ mod tests {
     #[test]
     fn truncated_payload_reports_input_end() {
         let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
 
         let bytes = buffer(&[framed_command(WORLD_COMMAND_ADD_WIRE, 4, &[1, 0])]);
 
@@ -651,7 +656,7 @@ mod tests {
     #[test]
     fn unknown_command_is_rejected_at_command_start() {
         let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
 
         assert_error(
             &mut engine,
@@ -681,7 +686,7 @@ mod tests {
             assert_eq!(expected_world_payload_length(tag), Some(expected_length));
 
             let mut engine = Engine::new();
-            let world = engine.new_world().unwrap();
+            let world = engine.new_world(world_config()).unwrap();
 
             let payload = vec![0; expected_length - 1];
 
@@ -708,7 +713,7 @@ mod tests {
 
         for (tag, payload, offset) in cases {
             let mut engine = Engine::new();
-            let world = engine.new_world().unwrap();
+            let world = engine.new_world(world_config()).unwrap();
 
             assert_error(
                 &mut engine,
@@ -724,7 +729,7 @@ mod tests {
     #[test]
     fn trailing_bytes_are_rejected() {
         let mut engine = Engine::new();
-        let world = engine.new_world().unwrap();
+        let world = engine.new_world(world_config()).unwrap();
         let mut bytes = buffer(&[]);
         bytes.push(0);
 
@@ -742,7 +747,7 @@ mod tests {
     fn earlier_commands_remain_applied_after_later_failure() {
         {
             let mut engine = Engine::new();
-            let world = engine.new_world().unwrap();
+            let world = engine.new_world(world_config()).unwrap();
 
             let first = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
 
@@ -767,7 +772,7 @@ mod tests {
 
         {
             let mut engine = Engine::new();
-            let world = engine.new_world().unwrap();
+            let world = engine.new_world(world_config()).unwrap();
 
             let add = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
 

@@ -106,6 +106,7 @@ mod tests {
             Vec::new(),
             DevicePartitionLayout::try_new(vec![0.into(), 0.into()]).unwrap(),
             0,
+            Vec::new(),
         )
     }
 

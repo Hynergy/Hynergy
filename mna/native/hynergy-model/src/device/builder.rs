@@ -1,6 +1,7 @@
 use crate::circuit::{Circuit, Element, ElementId, NodeId, ValueRef};
 use crate::device::definition::{
-    DefinitionId, DeviceBody, DeviceDefinition, DevicePartitionId, DevicePartitionLayout,
+    DefinitionId, DefinitionObserver, DefinitionObserverId, DefinitionObserverSource, DeviceBody,
+    DeviceDefinition, DevicePartitionId, DevicePartitionLayout, ObserverQuantity,
     PrimitiveParameterError,
 };
 use crate::device::registry::DefinitionRegistry;
@@ -99,6 +100,52 @@ pub enum DeviceDefinitionBuilderError {
 
     #[error("definition state count exceeds the addressable state range")]
     StateCountExhausted,
+
+    #[error("definition observer ID space is exhausted")]
+    DefinitionObserverIdExhausted,
+
+    #[error(
+        "observer references out-of-range node {node:?}; \
+     definition contains {node_count} nodes"
+    )]
+    ObserverNodeOutOfRange { node: NodeId, node_count: u32 },
+
+    #[error(
+        "observer references out-of-range element {element:?}; \
+     definition contains {element_count} elements"
+    )]
+    ObserverElementOutOfRange {
+        element: ElementId,
+        element_count: usize,
+    },
+
+    #[error(
+        "element {element:?} has no observer {observer:?}; \
+     child definition contains {observer_count} observers"
+    )]
+    ChildObserverOutOfRange {
+        element: ElementId,
+        observer: DefinitionObserverId,
+        observer_count: usize,
+    },
+
+    #[error(
+        "voltage observer nodes {positive:?} and {negative:?} \
+     belong to different device partitions \
+     {positive_partition:?} and {negative_partition:?}"
+    )]
+    ObserverCrossesPartitions {
+        positive: NodeId,
+        negative: NodeId,
+        positive_partition: DevicePartitionId,
+        negative_partition: DevicePartitionId,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingDefinitionObserver {
+    quantity: ObserverQuantity,
+    source: DefinitionObserverSource,
 }
 
 pub struct DeviceDefinitionBuilder<'a> {
@@ -107,6 +154,7 @@ pub struct DeviceDefinitionBuilder<'a> {
     param_constraints: Vec<ParameterConstraints>,
     node_count: u32,
     elements: Vec<Element>,
+    observers: Vec<PendingDefinitionObserver>,
 }
 
 impl<'a> DeviceDefinitionBuilder<'a> {
@@ -117,6 +165,7 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             param_constraints: Vec::new(),
             node_count: 0,
             elements: Vec::new(),
+            observers: Vec::new(),
         }
     }
 
@@ -174,6 +223,77 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         );
 
         self.elements.push(element);
+
+        Ok(id)
+    }
+
+    pub fn add_voltage_observer(
+        &mut self,
+        positive: NodeId,
+        negative: NodeId,
+    ) -> Result<DefinitionObserverId, DeviceDefinitionBuilderError> {
+        self.validate_observer_node(positive)?;
+        self.validate_observer_node(negative)?;
+
+        self.push_observer(PendingDefinitionObserver {
+            quantity: ObserverQuantity::Voltage,
+            source: DefinitionObserverSource::Voltage { positive, negative },
+        })
+    }
+
+    pub fn add_child_observer(
+        &mut self,
+        element: ElementId,
+        observer: DefinitionObserverId,
+    ) -> Result<DefinitionObserverId, DeviceDefinitionBuilderError> {
+        let element_definition = self.elements.get(element.index()).ok_or(
+            DeviceDefinitionBuilderError::ObserverElementOutOfRange {
+                element,
+                element_count: self.elements.len(),
+            },
+        )?;
+
+        let definition = self
+            .registry
+            .get(element_definition.definition())
+            .expect("inserted element definition must remain registered");
+
+        let child_observer = definition.observer(observer).ok_or(
+            DeviceDefinitionBuilderError::ChildObserverOutOfRange {
+                element,
+                observer,
+                observer_count: definition.observers().len(),
+            },
+        )?;
+
+        self.push_observer(PendingDefinitionObserver {
+            quantity: child_observer.quantity(),
+            source: DefinitionObserverSource::Child { element, observer },
+        })
+    }
+
+    #[inline]
+    fn validate_observer_node(&self, node: NodeId) -> Result<(), DeviceDefinitionBuilderError> {
+        if node.id() >= self.node_count {
+            return Err(DeviceDefinitionBuilderError::ObserverNodeOutOfRange {
+                node,
+                node_count: self.node_count,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn push_observer(
+        &mut self,
+        observer: PendingDefinitionObserver,
+    ) -> Result<DefinitionObserverId, DeviceDefinitionBuilderError> {
+        let raw = u32::try_from(self.observers.len())
+            .map_err(|_| DeviceDefinitionBuilderError::DefinitionObserverIdExhausted)?;
+
+        let id = DefinitionObserverId::new(raw);
+
+        self.observers.push(observer);
 
         Ok(id)
     }
@@ -288,7 +408,8 @@ impl<'a> DeviceDefinitionBuilder<'a> {
         self.validate_parameter_usage()?;
 
         let state_count = self.derive_state_count()?;
-        let partition_layout = self.derive_partition_layout()?;
+        let (partition_layout, node_partitions) = self.derive_partition_layout()?;
+        let observers = self.derive_observers(&partition_layout, &node_partitions)?;
 
         Ok(DeviceDefinition::new_composite(
             Circuit::new(self.node_count, self.elements),
@@ -296,12 +417,13 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             self.param_constraints,
             partition_layout,
             state_count,
+            observers,
         ))
     }
 
     fn derive_partition_layout(
         &self,
-    ) -> Result<DevicePartitionLayout, DeviceDefinitionBuilderError> {
+    ) -> Result<(DevicePartitionLayout, Vec<DevicePartitionId>), DeviceDefinitionBuilderError> {
         let node_count = self.node_count as usize;
 
         let mut union_find = UnionFind::new(node_count);
@@ -457,11 +579,103 @@ impl<'a> DeviceDefinitionBuilder<'a> {
             }
         }
 
-        Ok(DevicePartitionLayout::from_derived_parts(
-            terminal_partitions,
-            element_partitions,
-            next_partition,
+        let mut node_partitions = Vec::with_capacity(node_count);
+
+        for node_index in 0..node_count {
+            let root = union_find.find(node_index);
+
+            node_partitions.push(
+                root_partitions[root].expect("every valid definition node belongs to a partition"),
+            );
+        }
+
+        Ok((
+            DevicePartitionLayout::from_derived_parts(
+                terminal_partitions,
+                element_partitions,
+                next_partition,
+            ),
+            node_partitions,
         ))
+    }
+
+    fn derive_observers(
+        &self,
+        partition_layout: &DevicePartitionLayout,
+        node_partitions: &[DevicePartitionId],
+    ) -> Result<Vec<DefinitionObserver>, DeviceDefinitionBuilderError> {
+        let mut element_partition_offsets = Vec::with_capacity(self.elements.len());
+
+        let mut partition_offset = 0usize;
+
+        for element in &self.elements {
+            element_partition_offsets.push(partition_offset);
+
+            let definition = self
+                .registry
+                .get(element.definition())
+                .expect("inserted element definition must remain registered");
+
+            partition_offset = partition_offset
+                .checked_add(definition.partition_count())
+                .expect("partition count overflow was rejected during partition derivation");
+        }
+
+        debug_assert_eq!(
+            partition_offset,
+            partition_layout.element_partitions().len(),
+        );
+
+        let mut observers = Vec::with_capacity(self.observers.len());
+
+        for pending in &self.observers {
+            let partition = match pending.source {
+                DefinitionObserverSource::Voltage { positive, negative } => {
+                    let positive_partition = node_partitions[positive.index()];
+                    let negative_partition = node_partitions[negative.index()];
+
+                    if positive_partition != negative_partition {
+                        return Err(DeviceDefinitionBuilderError::ObserverCrossesPartitions {
+                            positive,
+                            negative,
+                            positive_partition,
+                            negative_partition,
+                        });
+                    }
+
+                    positive_partition
+                }
+
+                DefinitionObserverSource::Child { element, observer } => {
+                    let child_element = &self.elements[element.index()];
+
+                    let child_definition = self
+                        .registry
+                        .get(child_element.definition())
+                        .expect("inserted element definition must remain registered");
+
+                    let child_observer = child_definition
+                        .observer(observer)
+                        .expect("child observer was validated before insertion");
+
+                    debug_assert_eq!(pending.quantity, child_observer.quantity(),);
+
+                    let flat_partition = element_partition_offsets[element.index()]
+                        .checked_add(child_observer.partition().index())
+                        .expect("child partition index overflow");
+
+                    partition_layout.element_partitions()[flat_partition]
+                }
+            };
+
+            observers.push(DefinitionObserver::new(
+                pending.quantity,
+                partition,
+                pending.source,
+            ));
+        }
+
+        Ok(observers)
     }
 
     fn validate_parameter_usage(&self) -> Result<(), DeviceDefinitionBuilderError> {
@@ -571,7 +785,10 @@ impl UnionFind {
 mod tests {
     use super::{DeviceDefinitionBuilder, DeviceDefinitionBuilderError};
     use crate::circuit::{Element, NodeId, ValueRef};
-    use crate::device::definition::{DefinitionId, DevicePartitionId, PrimitiveElementKind};
+    use crate::device::definition::{
+        DefinitionId, DefinitionObserverId, DefinitionObserverSource, DevicePartitionId,
+        ObserverQuantity, PrimitiveElementKind,
+    };
     use crate::device::registry::DefinitionRegistry;
 
     use crate::parameter::{Bound, ParameterConstraintError, ParameterConstraints, ParameterId};
@@ -1151,6 +1368,141 @@ mod tests {
                 DevicePartitionId::new(1),
                 DevicePartitionId::new(0),
             ]
+        );
+    }
+
+    #[test]
+    fn voltage_observer_inherits_its_node_partition() {
+        let registry = DefinitionRegistry::new();
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        let [positive, negative] = terminals(&mut builder);
+
+        builder
+            .add_element(Element::new(
+                DefinitionId::from(PrimitiveElementKind::Resistance),
+                vec![positive, negative],
+                vec![ValueRef::Literal(1.0)],
+            ))
+            .unwrap();
+
+        let observer = builder.add_voltage_observer(positive, negative).unwrap();
+
+        assert_eq!(observer, DefinitionObserverId::new(0));
+
+        let definition = builder.build_definition().unwrap();
+        let observer = definition.observer(observer).unwrap();
+
+        assert_eq!(observer.quantity(), ObserverQuantity::Voltage);
+        assert_eq!(observer.partition(), DevicePartitionId::new(0));
+        assert_eq!(
+            observer.source(),
+            DefinitionObserverSource::Voltage { positive, negative }
+        );
+    }
+
+    #[test]
+    fn voltage_observer_cannot_cross_device_partitions() {
+        let registry = DefinitionRegistry::new();
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        let input_positive = builder.add_terminal().unwrap();
+        let input_negative = builder.add_terminal().unwrap();
+        let output_positive = builder.add_terminal().unwrap();
+        let output_negative = builder.add_terminal().unwrap();
+
+        builder
+            .add_element(Element::new(
+                DefinitionId::from(PrimitiveElementKind::TickDelay),
+                vec![
+                    input_positive,
+                    input_negative,
+                    output_positive,
+                    output_negative,
+                ],
+                vec![ValueRef::Literal(0.0)],
+            ))
+            .unwrap();
+
+        builder
+            .add_voltage_observer(input_positive, output_positive)
+            .unwrap();
+
+        assert_eq!(
+            builder.build_definition(),
+            Err(DeviceDefinitionBuilderError::ObserverCrossesPartitions {
+                positive: input_positive,
+                negative: output_positive,
+                positive_partition: DevicePartitionId::new(0),
+                negative_partition: DevicePartitionId::new(1),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_child_observer_maps_hidden_child_partition() {
+        let mut registry = DefinitionRegistry::new();
+
+        let (child_definition, child_observer) = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let input_positive = builder.add_terminal().unwrap();
+            let input_negative = builder.add_terminal().unwrap();
+
+            let output_positive = builder.add_node().unwrap();
+            let output_negative = builder.add_node().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    DefinitionId::from(PrimitiveElementKind::TickDelay),
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Literal(0.0)],
+                ))
+                .unwrap();
+
+            let observer = builder
+                .add_voltage_observer(output_positive, output_negative)
+                .unwrap();
+
+            (builder.build_definition().unwrap(), observer)
+        };
+
+        let child = registry.register(child_definition).unwrap();
+
+        let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+        let input_positive = builder.add_terminal().unwrap();
+        let input_negative = builder.add_terminal().unwrap();
+
+        let element = builder
+            .add_element(Element::new(
+                child,
+                vec![input_positive, input_negative],
+                Vec::<ValueRef>::new(),
+            ))
+            .unwrap();
+
+        let observer = builder.add_child_observer(element, child_observer).unwrap();
+
+        let definition = builder.build_definition().unwrap();
+        let observer = definition.observer(observer).unwrap();
+
+        assert_eq!(definition.partition_count(), 2);
+
+        assert_eq!(observer.quantity(), ObserverQuantity::Voltage);
+        assert_eq!(observer.partition(), DevicePartitionId::new(1));
+
+        assert_eq!(
+            observer.source(),
+            DefinitionObserverSource::Child {
+                element,
+                observer: child_observer,
+            }
         );
     }
 

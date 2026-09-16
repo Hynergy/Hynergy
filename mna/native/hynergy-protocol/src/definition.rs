@@ -473,7 +473,8 @@ fn map_builder_error(
             DefinitionRegistrationErrorKind::ParameterCountMismatch
         }
 
-        DeviceDefinitionBuilderError::NodeOutOfRange { .. } => {
+        DeviceDefinitionBuilderError::NodeOutOfRange { .. }
+        | DeviceDefinitionBuilderError::ObserverNodeOutOfRange { .. } => {
             DefinitionRegistrationErrorKind::NodeOutOfRange
         }
 
@@ -501,7 +502,11 @@ fn map_builder_error(
             DefinitionRegistrationErrorKind::ParameterIdExhausted
         }
 
-        DeviceDefinitionBuilderError::ElementIdExhausted => {
+        DeviceDefinitionBuilderError::ElementIdExhausted
+        | DeviceDefinitionBuilderError::DefinitionObserverIdExhausted
+        | DeviceDefinitionBuilderError::ObserverElementOutOfRange { .. }
+        | DeviceDefinitionBuilderError::ChildObserverOutOfRange { .. }
+        | DeviceDefinitionBuilderError::ObserverCrossesPartitions { .. } => {
             DefinitionRegistrationErrorKind::InvalidDefinition
         }
 
@@ -516,6 +521,7 @@ fn map_builder_error(
         DeviceDefinitionBuilderError::DevicePartitionIdExhausted => {
             DefinitionRegistrationErrorKind::DevicePartitionIdExhausted
         }
+
         DeviceDefinitionBuilderError::StateCountExhausted => {
             DefinitionRegistrationErrorKind::StateCountExhausted
         }
