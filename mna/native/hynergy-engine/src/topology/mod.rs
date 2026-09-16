@@ -906,7 +906,7 @@ impl DerivedTopology {
     }
 
     #[inline]
-    fn wire_net(&self, wire: WireId) -> NetId {
+    pub(crate) fn wire_net(&self, wire: WireId) -> NetId {
         self.wire_net_map[wire.index()].expect("live wire must have a derived NetId")
     }
 

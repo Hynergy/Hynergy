@@ -66,7 +66,6 @@ impl DeviceSlot {
     }
 
     #[inline]
-    #[cfg(test)]
     pub fn parameters(&self) -> &[Option<f64>] {
         &self.parameters
     }

@@ -6,6 +6,7 @@ use hynergy_ids::define_id;
 use hynergy_model::device::definition::{
     DeviceBody, DeviceDefinition, DevicePartitionId, PrimitiveElementKind, TerminalId,
 };
+use hynergy_model::parameter::ParameterId;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -34,10 +35,12 @@ impl CompiledDefinition {
                 );
 
                 let partition = DevicePartitionId::new(0);
+                let definition_parameters = definition_parameters(definition);
                 let definition_states = definition_states(definition);
 
                 vec![CompiledPartitionTemplate {
                     definition_terminals: definition_terminals_for_partition(definition, partition),
+                    definition_parameters,
                     definition_state_reads: definition_states.clone(),
                     definition_state_writes: definition_states.clone(),
                     definition_states,
@@ -81,6 +84,7 @@ impl CompiledDefinition {
 #[derive(Debug)]
 pub(crate) struct CompiledPartitionTemplate {
     definition_terminals: SmallVec<[TerminalId; 8]>,
+    definition_parameters: SmallVec<[ParameterId; 1]>,
     definition_states: SmallVec<[DefinitionStateId; 4]>,
     definition_state_reads: SmallVec<[DefinitionStateId; 4]>,
     definition_state_writes: SmallVec<[DefinitionStateId; 4]>,
@@ -112,6 +116,19 @@ impl CompiledPartitionTemplate {
     pub(crate) const fn template(&self) -> &CompiledDefinitionTemplate {
         &self.template
     }
+
+    #[inline]
+    pub(crate) fn definition_parameters(&self) -> &[ParameterId] {
+        &self.definition_parameters
+    }
+}
+
+fn definition_parameters(definition: &DeviceDefinition) -> SmallVec<[ParameterId; 1]> {
+    (0..definition.parameters().len())
+        .map(|index| {
+            ParameterId::new(u32::try_from(index).expect("parameter index must fit ParameterId"))
+        })
+        .collect()
 }
 
 fn definition_states(definition: &DeviceDefinition) -> SmallVec<[DefinitionStateId; 4]> {
@@ -192,6 +209,7 @@ fn compile_tick_delay_partitions(
 
         partitions.push(CompiledPartitionTemplate {
             definition_terminals,
+            definition_parameters: SmallVec::new(),
             definition_states: SmallVec::from_slice(&[state]),
             definition_state_reads,
             definition_state_writes,
@@ -481,6 +499,7 @@ mod tests {
         definition::{DefinitionId, PrimitiveElementKind},
         registry::DefinitionRegistry,
     };
+    use hynergy_model::parameter::ParameterId;
 
     fn template(kind: PrimitiveElementKind) -> CompiledDefinitionTemplate {
         let registry = DefinitionRegistry::new();
@@ -1362,5 +1381,49 @@ mod tests {
 
         assert_eq!(state.index(), 0);
         assert!((next_state[state.index()] - 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn conductance_partition_maps_definition_parameter() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::Conductance))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        assert_eq!(partition.definition_parameters(), &[ParameterId::new(0)],);
+    }
+
+    #[test]
+    fn tick_delay_partition_templates_have_no_runtime_parameters() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        assert_eq!(compiled.state_count(), 1);
+
+        assert!(
+            compiled
+                .partition(DevicePartitionId::new(0))
+                .unwrap()
+                .definition_parameters()
+                .is_empty()
+        );
+
+        assert!(
+            compiled
+                .partition(DevicePartitionId::new(1))
+                .unwrap()
+                .definition_parameters()
+                .is_empty()
+        );
     }
 }
