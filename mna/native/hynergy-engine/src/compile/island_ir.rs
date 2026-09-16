@@ -1,7 +1,7 @@
 use hynergy_ir::{
-    InputSlot, MatrixAdd, MatrixProgram, RhsAdd, RhsProgram, StateProgramError, StateSlot,
-    StateTransitionProgram, StateWrite, ValueBuildError, ValueProgram, ValueProgramBuilder,
-    ValueSlot,
+    EvaluationRate, InputSlot, MatrixAdd, MatrixProgram, RhsAdd, RhsProgram, StateProgramError,
+    StateSlot, StateTransitionProgram, StateWrite, ValueBuildError, ValueProgram,
+    ValueProgramBuilder, ValueSlot,
 };
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -16,6 +16,25 @@ pub(crate) enum IslandIrBuildError {
     State(#[from] StateProgramError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IterationStampDependency {
+    None,
+    Rhs,
+    Matrix,
+}
+
+impl IterationStampDependency {
+    #[inline]
+    const fn requires_iteration(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[inline]
+    const fn affects_matrix(self) -> bool {
+        matches!(self, Self::Matrix)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct IslandIrBuilder<'a> {
     pattern: &'a MnaPattern,
@@ -28,6 +47,7 @@ pub(crate) struct IslandIrBuilder<'a> {
     zero_value: Option<ValueSlot>,
     solution_inputs: BTreeMap<UnknownIndex, InputSlot>,
     state_inputs: BTreeMap<StateSlot, InputSlot>,
+    iteration_stamp_dependency: IterationStampDependency,
 }
 
 impl<'a> IslandIrBuilder<'a> {
@@ -43,6 +63,7 @@ impl<'a> IslandIrBuilder<'a> {
             zero_value: None,
             solution_inputs: BTreeMap::new(),
             state_inputs: BTreeMap::new(),
+            iteration_stamp_dependency: IterationStampDependency::None,
         }
     }
 
@@ -180,12 +201,15 @@ impl<'a> IslandIrBuilder<'a> {
 
     #[inline]
     pub(crate) fn add_matrix(&mut self, destination: MatrixSlot, source: ValueSlot, scale: f64) {
+        self.record_iteration_stamp_dependency(source, true);
+
         self.matrix_ops
             .push(MatrixAdd::new(destination, source, scale));
     }
 
     #[inline]
     pub(crate) fn add_rhs(&mut self, destination: UnknownIndex, source: ValueSlot, scale: f64) {
+        self.record_iteration_stamp_dependency(source, false);
         self.rhs_ops.push(RhsAdd::new(destination, source, scale));
     }
 
@@ -218,6 +242,7 @@ impl<'a> IslandIrBuilder<'a> {
             rhs_program: RhsProgram::new(self.rhs_ops),
             state_transition,
             matrix_static_inputs: self.matrix_static_inputs.into_boxed_slice(),
+            iteration_stamp_dependency: self.iteration_stamp_dependency,
             timestep_input: self.timestep_input,
             solution_inputs,
             state_inputs,
@@ -228,6 +253,24 @@ impl<'a> IslandIrBuilder<'a> {
     fn mark_matrix_static_input(&mut self, input: InputSlot) {
         self.matrix_static_inputs.push(input);
     }
+
+    #[inline]
+    fn record_iteration_stamp_dependency(&mut self, source: ValueSlot, affects_matrix: bool) {
+        let rate = self
+            .values
+            .rate(source)
+            .expect("island IR stamp source must belong to its value program");
+
+        if rate != EvaluationRate::Iteration {
+            return;
+        }
+
+        if affects_matrix {
+            self.iteration_stamp_dependency = IterationStampDependency::Matrix;
+        } else if self.iteration_stamp_dependency == IterationStampDependency::None {
+            self.iteration_stamp_dependency = IterationStampDependency::Rhs;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -237,6 +280,7 @@ pub(crate) struct CompiledIslandIr {
     rhs_program: RhsProgram,
     state_transition: StateTransitionProgram,
     matrix_static_inputs: Box<[InputSlot]>,
+    iteration_stamp_dependency: IterationStampDependency,
     timestep_input: Option<InputSlot>,
     solution_inputs: Box<[(UnknownIndex, InputSlot)]>,
     state_inputs: Box<[(StateSlot, InputSlot)]>,
@@ -281,6 +325,26 @@ impl CompiledIslandIr {
     #[inline]
     pub(crate) fn state_inputs(&self) -> &[(StateSlot, InputSlot)] {
         &self.state_inputs
+    }
+
+    #[inline]
+    pub(crate) const fn requires_nonlinear_iteration(&self) -> bool {
+        self.iteration_stamp_dependency.requires_iteration()
+    }
+
+    #[inline]
+    pub(crate) const fn iteration_affects_matrix(&self) -> bool {
+        self.iteration_stamp_dependency.affects_matrix()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn force_nonlinear_iteration_for_test(&mut self, affects_matrix: bool) {
+        self.iteration_stamp_dependency = if affects_matrix {
+            IterationStampDependency::Matrix
+        } else {
+            IterationStampDependency::Rhs
+        };
     }
 }
 
@@ -410,5 +474,44 @@ mod tests {
                 destination: state,
             },),
         );
+    }
+
+    #[test]
+    fn iteration_dependent_rhs_marks_island_nonlinear() {
+        let pattern = empty_pattern(1);
+        let unknown = UnknownIndex::new(0);
+
+        let mut builder = IslandIrBuilder::new(&pattern);
+
+        let solution = builder.unknown_value(Some(unknown)).unwrap();
+
+        builder.add_rhs(unknown, solution, 1.0);
+
+        let ir = builder.finish().unwrap();
+
+        assert!(ir.requires_nonlinear_iteration());
+        assert!(!ir.iteration_affects_matrix());
+    }
+
+    #[test]
+    fn iteration_dependent_matrix_marks_nonlinear_matrix() {
+        let unknown = UnknownIndex::new(0);
+
+        let mut pattern_builder = PatternBuilder::new(1).unwrap();
+
+        pattern_builder.request(unknown, unknown).unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+        let mut builder = IslandIrBuilder::new(&pattern);
+
+        let solution = builder.unknown_value(Some(unknown)).unwrap();
+        let destination = pattern.slot(unknown, unknown).unwrap();
+
+        builder.add_matrix(destination, solution, 1.0);
+
+        let ir = builder.finish().unwrap();
+
+        assert!(ir.requires_nonlinear_iteration());
+        assert!(ir.iteration_affects_matrix());
     }
 }

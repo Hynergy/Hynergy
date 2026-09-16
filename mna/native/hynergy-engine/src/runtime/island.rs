@@ -11,6 +11,25 @@ use hynergy_model::network::Network;
 use hynergy_model::parameter::ParameterId;
 use thiserror::Error;
 
+const NONLINEAR_ABSOLUTE_TOLERANCE: f64 = 1.0e-9;
+const NONLINEAR_RELATIVE_TOLERANCE: f64 = 1.0e-6;
+const NONLINEAR_MAX_ITERATIONS: usize = 32;
+
+#[derive(Debug)]
+struct NonlinearScratch {
+    current: Box<[f64]>,
+    next: Box<[f64]>,
+}
+
+impl NonlinearScratch {
+    fn new(dimension: usize) -> Self {
+        Self {
+            current: vec![0.0; dimension].into_boxed_slice(),
+            next: vec![0.0; dimension].into_boxed_slice(),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum IslandRuntimeError {
     #[error("device {device:?} no longer exists")]
@@ -33,6 +52,9 @@ pub(crate) enum IslandRuntimeError {
 
     #[error("timestep must be finite and greater than zero")]
     InvalidTimestep,
+
+    #[error("nonlinear island did not converge after {iterations} iterations")]
+    NonlinearDidNotConverge { iterations: usize },
 }
 
 #[derive(Debug)]
@@ -49,8 +71,12 @@ pub(crate) struct IslandRuntime {
     matrix_dirty: bool,
     last_timestep: f64,
     static_inputs_dirty: bool,
+    nonlinear_scratch: Option<Box<NonlinearScratch>>,
+
     #[cfg(test)]
     matrix_stamp_count: usize,
+    #[cfg(test)]
+    solve_count: usize,
 }
 
 impl IslandRuntime {
@@ -64,10 +90,12 @@ impl IslandRuntime {
         } = compiled.into_parts();
 
         let dimension = pattern.dimension();
-
         let workspace = ir.value_program().new_workspace();
-
         let system = MnaSystem::new(pattern)?;
+
+        let nonlinear_scratch = ir
+            .requires_nonlinear_iteration()
+            .then(|| Box::new(NonlinearScratch::new(dimension)));
 
         Ok(Self {
             system,
@@ -82,12 +110,15 @@ impl IslandRuntime {
             matrix_dirty: true,
             last_timestep: f64::NAN,
             static_inputs_dirty: true,
+            nonlinear_scratch,
             #[cfg(test)]
             matrix_stamp_count: 0,
+            #[cfg(test)]
+            solve_count: 0,
         })
     }
 
-    fn solve_current_values(&mut self) -> Result<(), IslandRuntimeError> {
+    fn factorize_matrix_if_dirty(&mut self) -> Result<(), IslandRuntimeError> {
         if self.matrix_dirty {
             {
                 let mut matrix = self.system.values_mut();
@@ -100,7 +131,6 @@ impl IslandRuntime {
             }
 
             self.system.factorize()?;
-
             self.matrix_dirty = false;
 
             #[cfg(test)]
@@ -114,24 +144,99 @@ impl IslandRuntime {
             "clean island matrix must remain factorized",
         );
 
+        Ok(())
+    }
+
+    fn solve_linear(&mut self) -> Result<(), IslandRuntimeError> {
+        self.factorize_matrix_if_dirty()?;
+
         self.ir
             .rhs_program()
             .execute(&mut self.solution, self.workspace.values());
 
         self.system.solve_in_place(&mut self.solution)?;
 
-        for &(unknown, input) in self.ir.solution_inputs() {
-            self.workspace
-                .set_input(input, self.solution[unknown.index()]);
+        #[cfg(test)]
+        {
+            self.solve_count += 1;
         }
 
-        self.ir
-            .value_program()
-            .execute_iteration(&mut self.workspace);
+        evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
         self.solution_valid = true;
 
         Ok(())
+    }
+
+    fn solve_nonlinear_candidate(
+        &mut self,
+        candidate: &mut [f64],
+    ) -> Result<(), IslandRuntimeError> {
+        self.factorize_matrix_if_dirty()?;
+
+        self.ir
+            .rhs_program()
+            .execute(candidate, self.workspace.values());
+
+        self.system.solve_in_place(candidate)?;
+
+        #[cfg(test)]
+        {
+            self.solve_count += 1;
+        }
+
+        Ok(())
+    }
+
+    fn solve_nonlinear(
+        &mut self,
+        scratch: &mut NonlinearScratch,
+    ) -> Result<(), IslandRuntimeError> {
+        let iteration_affects_matrix = self.ir.iteration_affects_matrix();
+
+        evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
+
+        if iteration_affects_matrix {
+            self.matrix_dirty = true;
+        }
+
+        self.solve_nonlinear_candidate(&mut scratch.current)?;
+
+        if solutions_converged(&self.solution, &scratch.current) {
+            std::mem::swap(&mut self.solution, &mut scratch.current);
+
+            evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
+
+            self.solution_valid = true;
+
+            return Ok(());
+        }
+
+        for _ in 1..NONLINEAR_MAX_ITERATIONS {
+            evaluate_iteration(&self.ir, &mut self.workspace, &scratch.current);
+
+            if iteration_affects_matrix {
+                self.matrix_dirty = true;
+            }
+
+            self.solve_nonlinear_candidate(&mut scratch.next)?;
+
+            if solutions_converged(&scratch.current, &scratch.next) {
+                std::mem::swap(&mut self.solution, &mut scratch.next);
+
+                evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
+
+                self.solution_valid = true;
+
+                return Ok(());
+            }
+
+            std::mem::swap(&mut scratch.current, &mut scratch.next);
+        }
+
+        Err(IslandRuntimeError::NonlinearDidNotConverge {
+            iterations: NONLINEAR_MAX_ITERATIONS,
+        })
     }
 
     pub(crate) fn solve_tick<F>(
@@ -164,7 +269,20 @@ impl IslandRuntime {
 
         self.ir.value_program().execute_tick(&mut self.workspace);
 
-        self.solve_current_values()?;
+        if self.nonlinear_scratch.is_none() {
+            self.solve_linear()?;
+        } else {
+            let mut scratch = self
+                .nonlinear_scratch
+                .take()
+                .expect("nonlinear scratch was checked above");
+
+            let result = self.solve_nonlinear(&mut scratch);
+
+            self.nonlinear_scratch = Some(scratch);
+
+            result?;
+        }
 
         let mut next_state = vec![0.0; self.states.state_count()];
 
@@ -288,6 +406,34 @@ impl IslandRuntime {
     fn matrix_stamp_count(&self) -> usize {
         self.matrix_stamp_count
     }
+
+    #[cfg(test)]
+    #[inline]
+    fn solve_count(&self) -> usize {
+        self.solve_count
+    }
+}
+
+#[inline]
+fn evaluate_iteration(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace, solution: &[f64]) {
+    for &(unknown, input) in ir.solution_inputs() {
+        workspace.set_input(input, solution[unknown.index()]);
+    }
+
+    ir.value_program().execute_iteration(workspace);
+}
+
+#[inline]
+fn solutions_converged(previous: &[f64], current: &[f64]) -> bool {
+    debug_assert_eq!(previous.len(), current.len());
+
+    previous.iter().zip(current).all(|(&previous, &current)| {
+        let delta = (current - previous).abs();
+        let limit = NONLINEAR_ABSOLUTE_TOLERANCE
+            + NONLINEAR_RELATIVE_TOLERANCE * current.abs().max(previous.abs());
+
+        delta <= limit
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -339,6 +485,104 @@ mod test {
     use hynergy_model::device::registry::DefinitionRegistry;
     use hynergy_model::network::{Network, WireId};
     use hynergy_model::parameter::ParameterId;
+
+    fn voltage_source_island() -> (Network, crate::compile::island::CompiledIsland) {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let negative = WireId::try_from(1).unwrap();
+        let positive = WireId::try_from(2).unwrap();
+
+        let source = DeviceId::try_from(1).unwrap();
+
+        network.add_wire(negative).unwrap();
+        network.add_wire(positive).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        network
+            .attach_terminal(positive, source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(negative, source, TerminalId::new(1))
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        (network, compiled)
+    }
+
+    #[test]
+    fn linear_island_solves_once() {
+        let (network, compiled) = voltage_source_island();
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 1);
+    }
+
+    #[test]
+    fn nonlinear_rhs_iteration_reuses_matrix_factorization() {
+        let (network, mut compiled) = voltage_source_island();
+
+        compiled.force_nonlinear_iteration_for_test(false);
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 2);
+        assert_eq!(runtime.matrix_stamp_count(), 1);
+    }
+
+    #[test]
+    fn nonlinear_matrix_iteration_restamps_matrix() {
+        let (network, mut compiled) = voltage_source_island();
+
+        compiled.force_nonlinear_iteration_for_test(true);
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 2);
+        assert_eq!(runtime.matrix_stamp_count(), 2);
+    }
+
+    #[test]
+    fn nonlinear_island_reuses_previous_solution_as_guess() {
+        let (network, mut compiled) = voltage_source_island();
+
+        compiled.force_nonlinear_iteration_for_test(false);
+
+        let mut runtime = IslandRuntime::new(compiled).unwrap();
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 2);
+
+        runtime.solve_tick(&network, 1.0, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 3);
+    }
 
     #[test]
     fn voltage_source_and_conductance_solve_node_voltage() {

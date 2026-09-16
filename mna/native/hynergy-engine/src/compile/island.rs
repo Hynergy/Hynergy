@@ -310,6 +310,11 @@ impl CompiledIsland {
     pub(crate) fn partition_inputs(&self) -> &[CompiledPartitionInputs] {
         &self.partition_inputs
     }
+
+    #[inline]
+    pub(crate) fn force_nonlinear_iteration_for_test(&mut self, affects_matrix: bool) {
+        self.ir.force_nonlinear_iteration_for_test(affects_matrix);
+    }
 }
 
 pub(crate) fn compile_island_parts(
