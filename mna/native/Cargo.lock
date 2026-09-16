@@ -525,6 +525,7 @@ name = "hynergy-ffi"
 version = "0.0.1-dev"
 dependencies = [
  "hynergy-engine",
+ "hynergy-model",
  "hynergy-protocol",
 ]
 

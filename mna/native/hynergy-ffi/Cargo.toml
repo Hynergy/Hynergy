@@ -9,4 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hynergy-engine = { path = "../hynergy-engine" }
+hynergy-model = { path = "../hynergy-model" }
 hynergy-protocol = { path = "../hynergy-protocol" }

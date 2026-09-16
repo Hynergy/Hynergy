@@ -1,4 +1,7 @@
-use hynergy_engine::{Engine, WorldConfig, WorldManagementError};
+use hynergy_engine::{
+    Engine, EngineTickError, SubscriptionError, SubscriptionId, WorldConfig, WorldManagementError,
+};
+use hynergy_model::device::definition::{DefinitionObserverId, DeviceId};
 use hynergy_protocol::{
     DefinitionRegistrationError, DefinitionRegistrationErrorKind, WorldCommandError,
     WorldCommandErrorKind,
@@ -559,9 +562,406 @@ fn map_world_command_error(error: WorldCommandError) -> CommandResult {
     CommandResult::failure(code, error.command_index(), error.byte_offset())
 }
 
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickCode {
+    Success = 0,
+
+    NullEngine = 1,
+    NullResult = 2,
+    NullOutput = 3,
+    UnknownWorld = 4,
+    BufferTooSmall = 5,
+
+    MissingParameter = 20,
+    Singular = 21,
+    NonlinearDidNotConverge = 22,
+    NonFiniteMatrix = 23,
+    NonFiniteSolution = 24,
+    ResourceExhausted = 25,
+    BackendFailure = 26,
+    CompilationFailed = 27,
+    InternalInvariant = 28,
+
+    InternalPanic = u32::MAX,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickResult {
+    pub code: u32,
+
+    pub record_count: u32,
+    pub required_capacity: u32,
+
+    pub device_id: u32,
+    pub parameter_id: u32,
+    pub iterations: u32,
+}
+
+impl TickResult {
+    const fn success(record_count: u32, required_capacity: u32) -> Self {
+        Self {
+            code: TickCode::Success as u32,
+            record_count,
+            required_capacity,
+            device_id: u32::MAX,
+            parameter_id: u32::MAX,
+            iterations: u32::MAX,
+        }
+    }
+
+    const fn failure(code: TickCode, required_capacity: u32) -> Self {
+        Self {
+            code: code as u32,
+            record_count: 0,
+            required_capacity,
+            device_id: u32::MAX,
+            parameter_id: u32::MAX,
+            iterations: u32::MAX,
+        }
+    }
+}
+
+fn map_tick_error(error: EngineTickError, required_capacity: u32) -> TickResult {
+    match error {
+        EngineTickError::UnknownWorld => {
+            TickResult::failure(TickCode::UnknownWorld, required_capacity)
+        }
+
+        EngineTickError::MissingParameter { device, parameter } => TickResult {
+            code: TickCode::MissingParameter as u32,
+            record_count: 0,
+            required_capacity,
+            device_id: device.get(),
+            parameter_id: parameter.id(),
+            iterations: u32::MAX,
+        },
+
+        EngineTickError::Singular => TickResult::failure(TickCode::Singular, required_capacity),
+
+        EngineTickError::NonlinearDidNotConverge { iterations } => TickResult {
+            code: TickCode::NonlinearDidNotConverge as u32,
+            record_count: 0,
+            required_capacity,
+            device_id: u32::MAX,
+            parameter_id: u32::MAX,
+            iterations: u32::try_from(iterations).unwrap_or(u32::MAX),
+        },
+
+        EngineTickError::NonFiniteMatrix => {
+            TickResult::failure(TickCode::NonFiniteMatrix, required_capacity)
+        }
+
+        EngineTickError::NonFiniteSolution => {
+            TickResult::failure(TickCode::NonFiniteSolution, required_capacity)
+        }
+
+        EngineTickError::ResourceExhausted => {
+            TickResult::failure(TickCode::ResourceExhausted, required_capacity)
+        }
+
+        EngineTickError::BackendFailure => {
+            TickResult::failure(TickCode::BackendFailure, required_capacity)
+        }
+
+        EngineTickError::CompilationFailed => {
+            TickResult::failure(TickCode::CompilationFailed, required_capacity)
+        }
+
+        EngineTickError::InternalInvariant => {
+            TickResult::failure(TickCode::InternalInvariant, required_capacity)
+        }
+    }
+}
+
+/// Advances a world by one tick and writes subscription updates to `records`.
+///
+/// The first successful tick reports each subscribed observer. Later ticks
+/// report an observer only when the bit pattern of its value changes.
+/// On success, `record_count` gives the number of records written.
+///
+/// `record_capacity` must be at least the number of active subscriptions.
+/// If the capacity is too small, the function returns [`TickCode::BufferTooSmall`]
+/// and sets `required_capacity` to that number. The world does not advance.
+/// `records` can be null only when no active subscriptions exist.
+///
+/// The function returns a [`TickCode`] value. If `result` is not null, the
+/// function also writes that code and the tick details to `result`.
+///
+/// # Safety
+///
+/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
+/// access for this call. If `records` is not null, it must point to aligned,
+/// writable storage for `record_capacity` consecutive [`SubscriptionRecord`]
+/// values. If `result` is not null, it must point to aligned, writable storage
+/// for one [`TickResult`]. The records, result, and engine storage must not
+/// overlap. The caller must prevent concurrent use of the same engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_world_tick(
+    engine: *mut Engine,
+    world_id: u32,
+    records: *mut SubscriptionRecord,
+    record_capacity: u32,
+    result: *mut TickResult,
+) -> u32 {
+    if result.is_null() {
+        return TickCode::NullResult as u32;
+    }
+
+    let output = if engine.is_null() {
+        TickResult::failure(TickCode::NullEngine, 0)
+    } else {
+        let execution = catch_unwind(AssertUnwindSafe(|| {
+            let engine = unsafe { &mut *engine };
+
+            let required = match engine.subscription_count(world_id) {
+                Ok(required) => required,
+
+                Err(SubscriptionError::UnknownWorld) => {
+                    return TickResult::failure(TickCode::UnknownWorld, 0);
+                }
+
+                Err(_) => {
+                    return TickResult::failure(TickCode::InternalInvariant, 0);
+                }
+            };
+
+            let required = u32::try_from(required).expect("active subscription count must fit u32");
+
+            if record_capacity < required {
+                return TickResult::failure(TickCode::BufferTooSmall, required);
+            }
+
+            if required != 0 && records.is_null() {
+                return TickResult::failure(TickCode::NullOutput, required);
+            }
+
+            if let Err(error) = engine.tick_world(world_id) {
+                return map_tick_error(error, required);
+            }
+
+            let updates = engine
+                .subscription_updates(world_id)
+                .expect("world validated before successful tick");
+
+            debug_assert!(updates.len() <= required as usize);
+
+            for (index, update) in updates.iter().enumerate() {
+                let record = SubscriptionRecord {
+                    subscription_id: update.subscription().get(),
+
+                    status: SubscriptionStatusCode::Available as u32,
+
+                    value: update.value(),
+                };
+
+                unsafe {
+                    records.add(index).write(record);
+                }
+            }
+
+            TickResult::success(
+                u32::try_from(updates.len()).expect("update count must fit u32"),
+                required,
+            )
+        }));
+
+        execution.unwrap_or_else(|_| TickResult::failure(TickCode::InternalPanic, 0))
+    };
+
+    let code = output.code;
+
+    unsafe {
+        result.write(output);
+    }
+
+    code
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionCode {
+    Success = 0,
+
+    NullEngine = 1,
+    NullResult = 2,
+    UnknownWorld = 3,
+    InvalidDeviceId = 4,
+    InvalidSubscriptionId = 5,
+
+    UnknownDevice = 20,
+    UnknownObserver = 21,
+    IdExhausted = 22,
+    UnknownSubscription = 23,
+
+    InternalPanic = u32::MAX,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionCreationResult {
+    pub code: u32,
+    pub subscription_id: u32,
+}
+
+impl SubscriptionCreationResult {
+    const fn success(subscription_id: u32) -> Self {
+        Self {
+            code: SubscriptionCode::Success as u32,
+            subscription_id,
+        }
+    }
+
+    const fn failure(code: SubscriptionCode) -> Self {
+        Self {
+            code: code as u32,
+            subscription_id: u32::MAX,
+        }
+    }
+}
+
+fn map_subscription_error(error: SubscriptionError) -> SubscriptionCode {
+    match error {
+        SubscriptionError::UnknownWorld => SubscriptionCode::UnknownWorld,
+        SubscriptionError::UnknownDevice { .. } => SubscriptionCode::UnknownDevice,
+        SubscriptionError::UnknownObserver { .. } => SubscriptionCode::UnknownObserver,
+        SubscriptionError::IdExhausted => SubscriptionCode::IdExhausted,
+        SubscriptionError::UnknownSubscription { .. } => SubscriptionCode::UnknownSubscription,
+    }
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionStatusCode {
+    Available = 0,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubscriptionRecord {
+    pub subscription_id: u32,
+    pub status: u32,
+    pub value: f64,
+}
+
+/// Creates a subscription to a device observer in a world.
+///
+/// `device_id` identifies a device in `world_id`. `observer_id` identifies an
+/// observer in that device's definition. On success, `subscription_id` in
+/// `result` contains the new subscription ID. On failure, it contains `u32::MAX`.
+///
+/// The caller receives observer values through [`hynergy_world_tick`]. The
+/// caller can pass the subscription ID to [`hynergy_world_unsubscribe`] to
+/// remove the subscription.
+///
+/// The function returns a [`SubscriptionCode`] value. If `result` is not null,
+/// the function also writes that code and the subscription ID to `result`.
+///
+/// # Safety
+///
+/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
+/// access for this call. If `result` is not null, it must point to aligned,
+/// writable storage for one [`SubscriptionCreationResult`]. The result and
+/// engine storage must not overlap. The caller must prevent concurrent use
+/// of the same engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_world_subscribe_observer(
+    engine: *mut Engine,
+    world_id: u32,
+    device_id: u32,
+    observer_id: u32,
+    result: *mut SubscriptionCreationResult,
+) -> u32 {
+    if result.is_null() {
+        return SubscriptionCode::NullResult as u32;
+    }
+
+    let output = if engine.is_null() {
+        SubscriptionCreationResult::failure(SubscriptionCode::NullEngine)
+    } else {
+        let Ok(device) = DeviceId::try_from(device_id) else {
+            let output = SubscriptionCreationResult::failure(SubscriptionCode::InvalidDeviceId);
+
+            let code = output.code;
+
+            unsafe {
+                result.write(output);
+            }
+
+            return code;
+        };
+
+        let observer = DefinitionObserverId::new(observer_id);
+
+        let subscription = catch_unwind(AssertUnwindSafe(|| {
+            let engine = unsafe { &mut *engine };
+
+            engine.subscribe_observer(world_id, device, observer)
+        }));
+
+        match subscription {
+            Ok(Ok(subscription)) => SubscriptionCreationResult::success(subscription.get()),
+
+            Ok(Err(error)) => SubscriptionCreationResult::failure(map_subscription_error(error)),
+
+            Err(_) => SubscriptionCreationResult::failure(SubscriptionCode::InternalPanic),
+        }
+    };
+
+    let code = output.code;
+
+    unsafe {
+        result.write(output);
+    }
+
+    code
+}
+
+/// Removes a subscription from a world.
+///
+/// `subscription_id` identifies a subscription in `world_id`. After this call
+/// succeeds, later ticks do not report updates for the removed subscription.
+/// The function returns a [`SubscriptionCode`] value.
+///
+/// # Safety
+///
+/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
+/// access for this call. The caller must prevent concurrent use of the same
+/// engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hynergy_world_unsubscribe(
+    engine: *mut Engine,
+    world_id: u32,
+    subscription_id: u32,
+) -> u32 {
+    if engine.is_null() {
+        return SubscriptionCode::NullEngine as u32;
+    }
+
+    let Ok(subscription) = SubscriptionId::try_from(subscription_id) else {
+        return SubscriptionCode::InvalidSubscriptionId as u32;
+    };
+
+    let removal = catch_unwind(AssertUnwindSafe(|| {
+        let engine = unsafe { &mut *engine };
+
+        engine.unsubscribe(world_id, subscription)
+    }));
+
+    match removal {
+        Ok(Ok(())) => SubscriptionCode::Success as u32,
+
+        Ok(Err(error)) => map_subscription_error(error) as u32,
+
+        Err(_) => SubscriptionCode::InternalPanic as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hynergy_model::device::definition::{DefinitionId, PrimitiveElementKind};
     use std::mem::{align_of, offset_of, size_of};
 
     fn definition_buffer() -> Vec<u8> {
@@ -786,6 +1186,197 @@ mod tests {
         unsafe { hynergy_world_apply_commands(engine, world, bytes.as_ptr(), bytes.len(), result) }
     }
 
+    fn set_parameter_payload(device_id: u32, parameter_id: u32, value: f64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16);
+
+        bytes.extend_from_slice(&device_id.to_le_bytes());
+        bytes.extend_from_slice(&parameter_id.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+
+        bytes
+    }
+
+    fn subscription_result_sentinel() -> SubscriptionCreationResult {
+        SubscriptionCreationResult {
+            code: 0xaaaa_aaaa,
+            subscription_id: 0xbbbb_bbbb,
+        }
+    }
+
+    fn tick_result_sentinel() -> TickResult {
+        TickResult {
+            code: 0xaaaa_aaaa,
+            record_count: 0xbbbb_bbbb,
+            required_capacity: 0xcccc_cccc,
+            device_id: 0xdddd_dddd,
+            parameter_id: 0xeeee_eeee,
+            iterations: 0xffff_ffff,
+        }
+    }
+
+    fn subscription_record_sentinel() -> SubscriptionRecord {
+        SubscriptionRecord {
+            subscription_id: 0xaaaa_aaaa,
+            status: 0xbbbb_bbbb,
+            value: f64::from_bits(0xcccc_cccc_dddd_dddd),
+        }
+    }
+
+    fn register_observed_conductance(engine: *mut Engine) -> u32 {
+        const ADD_TERMINAL: u16 = 1;
+        const ADD_ELEMENT: u16 = 4;
+        const ADD_VOLTAGE_OBSERVER: u16 = 5;
+
+        let commands = [
+            definition_command(ADD_TERMINAL, &[]),
+            definition_command(ADD_TERMINAL, &[]),
+            definition_command(
+                ADD_ELEMENT,
+                &literal_element_payload(
+                    DefinitionId::from(PrimitiveElementKind::Conductance).get(),
+                    &[0, 1],
+                    &[1.0],
+                ),
+            ),
+            definition_command(ADD_VOLTAGE_OBSERVER, &u32_payload(&[0, 1])),
+        ];
+
+        let bytes = definition_buffer_with_commands(&commands);
+
+        let mut result = definition_result_sentinel();
+
+        assert_eq!(
+            register(engine, &bytes, &mut result),
+            DefinitionRegistrationCode::Success as u32,
+        );
+
+        assert_ne!(result.definition_id, u32::MAX);
+
+        result.definition_id
+    }
+
+    fn create_observed_voltage_world(engine: *mut Engine, voltage: f64) -> (u32, u32, u32) {
+        const ADD_WIRE: u16 = 1;
+        const ADD_DEVICE: u16 = 5;
+        const ATTACH_TERMINAL: u16 = 7;
+        const SET_DEVICE_PARAMETER: u16 = 9;
+
+        const NEGATIVE_WIRE: u32 = 1;
+        const POSITIVE_WIRE: u32 = 2;
+
+        const OBSERVED_DEVICE: u32 = 1;
+        const SOURCE_DEVICE: u32 = 2;
+
+        let observed_definition = register_observed_conductance(engine);
+
+        let world = create_world(engine).world_id;
+
+        let voltage_source_definition =
+            DefinitionId::from(PrimitiveElementKind::VoltageSource).get();
+
+        let commands = [
+            world_command(ADD_WIRE, &u32_payload(&[NEGATIVE_WIRE])),
+            world_command(ADD_WIRE, &u32_payload(&[POSITIVE_WIRE])),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[OBSERVED_DEVICE, observed_definition]),
+            ),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[SOURCE_DEVICE, voltage_source_definition]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[POSITIVE_WIRE, OBSERVED_DEVICE, 0]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[NEGATIVE_WIRE, OBSERVED_DEVICE, 1]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[POSITIVE_WIRE, SOURCE_DEVICE, 0]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[NEGATIVE_WIRE, SOURCE_DEVICE, 1]),
+            ),
+            world_command(
+                SET_DEVICE_PARAMETER,
+                &set_parameter_payload(SOURCE_DEVICE, 0, voltage),
+            ),
+        ];
+
+        let bytes = world_buffer(&commands);
+
+        let mut result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &bytes, &mut result),
+            CommandCode::Success as u32,
+        );
+
+        (world, OBSERVED_DEVICE, SOURCE_DEVICE)
+    }
+
+    fn subscribe_first_observer(engine: *mut Engine, world: u32, device: u32) -> u32 {
+        let mut result = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, device, 0, &mut result,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        assert_eq!(result.code, SubscriptionCode::Success as u32,);
+
+        assert_ne!(result.subscription_id, 0);
+        assert_ne!(result.subscription_id, u32::MAX);
+
+        result.subscription_id
+    }
+
+    #[test]
+    fn subscription_creation_result_layout_is_stable() {
+        assert_eq!(size_of::<SubscriptionCreationResult>(), 8,);
+
+        assert_eq!(align_of::<SubscriptionCreationResult>(), align_of::<u32>(),);
+
+        assert_eq!(offset_of!(SubscriptionCreationResult, code), 0,);
+
+        assert_eq!(offset_of!(SubscriptionCreationResult, subscription_id), 4,);
+    }
+
+    #[test]
+    fn subscription_record_layout_is_stable() {
+        assert_eq!(size_of::<SubscriptionRecord>(), 16,);
+
+        assert_eq!(align_of::<SubscriptionRecord>(), align_of::<f64>(),);
+
+        assert_eq!(offset_of!(SubscriptionRecord, subscription_id), 0,);
+
+        assert_eq!(offset_of!(SubscriptionRecord, status), 4,);
+
+        assert_eq!(offset_of!(SubscriptionRecord, value), 8,);
+    }
+
+    #[test]
+    fn tick_result_layout_is_stable() {
+        assert_eq!(size_of::<TickResult>(), 24);
+
+        assert_eq!(align_of::<TickResult>(), align_of::<u32>(),);
+
+        assert_eq!(offset_of!(TickResult, code), 0);
+        assert_eq!(offset_of!(TickResult, record_count), 4);
+
+        assert_eq!(offset_of!(TickResult, required_capacity), 8,);
+
+        assert_eq!(offset_of!(TickResult, device_id), 12);
+
+        assert_eq!(offset_of!(TickResult, parameter_id), 16,);
+
+        assert_eq!(offset_of!(TickResult, iterations), 20,);
+    }
+
     #[test]
     fn abi_version_is_stable() {
         assert_eq!(hynergy_abi_version(), ABI_VERSION);
@@ -888,6 +1479,485 @@ mod tests {
 
             InternalPanic = u32::MAX,
         });
+
+        assert_codes!(SubscriptionCode {
+            Success = 0,
+
+            NullEngine = 1,
+            NullResult = 2,
+            UnknownWorld = 3,
+            InvalidDeviceId = 4,
+            InvalidSubscriptionId = 5,
+
+            UnknownDevice = 20,
+            UnknownObserver = 21,
+            IdExhausted = 22,
+            UnknownSubscription = 23,
+
+            InternalPanic = u32::MAX,
+        });
+
+        assert_codes!(SubscriptionStatusCode {
+            Available = 0,
+        });
+
+        assert_codes!(TickCode {
+            Success = 0,
+
+            NullEngine = 1,
+            NullResult = 2,
+            NullOutput = 3,
+            UnknownWorld = 4,
+            BufferTooSmall = 5,
+
+            MissingParameter = 20,
+            Singular = 21,
+            NonlinearDidNotConverge = 22,
+            NonFiniteMatrix = 23,
+            NonFiniteSolution = 24,
+            ResourceExhausted = 25,
+            BackendFailure = 26,
+            CompilationFailed = 27,
+            InternalInvariant = 28,
+
+            InternalPanic = u32::MAX,
+        });
+    }
+
+    #[test]
+    fn observer_subscription_lifecycle_is_exposed_through_ffi() {
+        let engine = hynergy_engine_create();
+
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+
+        let mut first = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 0, &mut first,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        assert_eq!(first.code, SubscriptionCode::Success as u32,);
+
+        assert_eq!(first.subscription_id, 1);
+
+        let mut second = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 0, &mut second,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        assert_eq!(second.subscription_id, 2);
+
+        assert_eq!(
+            unsafe { hynergy_world_unsubscribe(engine, world, first.subscription_id,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        assert_eq!(
+            unsafe { hynergy_world_unsubscribe(engine, world, first.subscription_id,) },
+            SubscriptionCode::UnknownSubscription as u32,
+        );
+
+        let mut third = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 0, &mut third,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        assert_eq!(third.subscription_id, 3);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn observer_subscription_validates_device_and_observer() {
+        let engine = hynergy_engine_create();
+
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+
+        let mut result = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, 999, 0, &mut result,) },
+            SubscriptionCode::UnknownDevice as u32,
+        );
+
+        assert_eq!(
+            result,
+            SubscriptionCreationResult {
+                code: SubscriptionCode::UnknownDevice as u32,
+                subscription_id: u32::MAX,
+            },
+        );
+
+        result = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 1, &mut result,) },
+            SubscriptionCode::UnknownObserver as u32,
+        );
+
+        assert_eq!(
+            result,
+            SubscriptionCreationResult {
+                code: SubscriptionCode::UnknownObserver as u32,
+                subscription_id: u32::MAX,
+            },
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn subscription_ffi_rejects_invalid_raw_ids() {
+        let engine = hynergy_engine_create();
+
+        let world = create_world(engine).world_id;
+
+        let mut result = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, 0, 0, &mut result,) },
+            SubscriptionCode::InvalidDeviceId as u32,
+        );
+
+        assert_eq!(
+            result,
+            SubscriptionCreationResult {
+                code: SubscriptionCode::InvalidDeviceId as u32,
+                subscription_id: u32::MAX,
+            },
+        );
+
+        assert_eq!(
+            unsafe { hynergy_world_unsubscribe(engine, world, 0,) },
+            SubscriptionCode::InvalidSubscriptionId as u32,
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn subscribe_rejects_null_result_without_subscribing() {
+        let engine = hynergy_engine_create();
+
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_subscribe_observer(engine, world, observed, 0, std::ptr::null_mut())
+            },
+            SubscriptionCode::NullResult as u32,
+        );
+
+        let mut result = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 0, &mut result,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        assert_eq!(result.subscription_id, 1);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn tick_writes_subscription_updates_to_caller_buffer() {
+        let engine = hynergy_engine_create();
+
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+
+        let subscription = subscribe_first_observer(engine, world, observed);
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, std::ptr::null_mut(), 0, &mut result,) },
+            TickCode::BufferTooSmall as u32,
+        );
+
+        assert_eq!(
+            result,
+            TickResult {
+                code: TickCode::BufferTooSmall as u32,
+                record_count: 0,
+                required_capacity: 1,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        let mut record = subscription_record_sentinel();
+
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(
+            result,
+            TickResult {
+                code: TickCode::Success as u32,
+                record_count: 1,
+                required_capacity: 1,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        assert_eq!(record.subscription_id, subscription,);
+
+        assert_eq!(record.status, SubscriptionStatusCode::Available as u32,);
+
+        assert_eq!(record.value.to_bits(), 5.0f64.to_bits(),);
+
+        record = subscription_record_sentinel();
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 0);
+        assert_eq!(result.required_capacity, 1);
+
+        assert_eq!(record, subscription_record_sentinel(),);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn tick_publishes_changed_subscription_value() {
+        const SET_DEVICE_PARAMETER: u16 = 9;
+
+        let engine = hynergy_engine_create();
+        let (world, observed, source) = create_observed_voltage_world(engine, 5.0);
+        let subscription = subscribe_first_observer(engine, world, observed);
+
+        let mut record = subscription_record_sentinel();
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 1);
+
+        assert_eq!(record.value.to_bits(), 5.0f64.to_bits(),);
+
+        let bytes = world_buffer(&[world_command(
+            SET_DEVICE_PARAMETER,
+            &set_parameter_payload(source, 0, 7.0),
+        )]);
+
+        let mut command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &bytes, &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        record = subscription_record_sentinel();
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 1);
+        assert_eq!(record.subscription_id, subscription,);
+        assert_eq!(record.status, SubscriptionStatusCode::Available as u32,);
+        assert_eq!(record.value.to_bits(), 7.0f64.to_bits(),);
+
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 0);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn tick_rejects_null_output_before_executing() {
+        let engine = hynergy_engine_create();
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+        let subscription = subscribe_first_observer(engine, world, observed);
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, std::ptr::null_mut(), 1, &mut result,) },
+            TickCode::NullOutput as u32,
+        );
+
+        assert_eq!(result.record_count, 0);
+        assert_eq!(result.required_capacity, 1);
+
+        let mut record = subscription_record_sentinel();
+
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 1);
+        assert_eq!(record.subscription_id, subscription);
+        assert_eq!(record.value.to_bits(), 5.0f64.to_bits(),);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn tick_allows_null_output_when_no_subscriptions_exist() {
+        let engine = hynergy_engine_create();
+        let (world, _, _) = create_observed_voltage_world(engine, 5.0);
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, std::ptr::null_mut(), 0, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(
+            result,
+            TickResult {
+                code: TickCode::Success as u32,
+                record_count: 0,
+                required_capacity: 0,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn unsubscribe_reduces_tick_required_capacity() {
+        let engine = hynergy_engine_create();
+
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+
+        let first = subscribe_first_observer(engine, world, observed);
+        let second = subscribe_first_observer(engine, world, observed);
+
+        assert_ne!(first, second);
+
+        let mut records = [
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+        ];
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, records.as_mut_ptr(), 2, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 2);
+        assert_eq!(result.required_capacity, 2);
+
+        assert_eq!(
+            unsafe { hynergy_world_unsubscribe(engine, world, first,) },
+            SubscriptionCode::Success as u32,
+        );
+
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, records.as_mut_ptr(), 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.required_capacity, 1);
+        assert_eq!(result.record_count, 0);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn removing_device_removes_dependent_subscription_from_tick_capacity() {
+        const REMOVE_DEVICE: u16 = 6;
+
+        let engine = hynergy_engine_create();
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+        let subscription = subscribe_first_observer(engine, world, observed);
+
+        let mut record = subscription_record_sentinel();
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.required_capacity, 1);
+
+        let bytes = world_buffer(&[world_command(REMOVE_DEVICE, &u32_payload(&[observed]))]);
+
+        let mut command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &bytes, &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, std::ptr::null_mut(), 0, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.required_capacity, 0);
+        assert_eq!(result.record_count, 0);
+
+        assert_eq!(
+            unsafe { hynergy_world_unsubscribe(engine, world, subscription,) },
+            SubscriptionCode::UnknownSubscription as u32,
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
     }
 
     #[test]

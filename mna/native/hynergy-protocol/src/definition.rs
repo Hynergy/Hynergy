@@ -1,8 +1,8 @@
 use crate::decoder::{Decoder, Truncated};
 use hynergy_engine::Engine;
-use hynergy_model::circuit::{Element, NodeId, ValueRef};
+use hynergy_model::circuit::{Element, ElementId, NodeId, ValueRef};
 use hynergy_model::device::builder::{DeviceDefinitionBuilder, DeviceDefinitionBuilderError};
-use hynergy_model::device::definition::{DefinitionId, DeviceDefinition};
+use hynergy_model::device::definition::{DefinitionId, DefinitionObserverId, DeviceDefinition};
 use hynergy_model::device::registry::RegisterDeviceError;
 use hynergy_model::parameter::{Bound, ParameterConstraints, ParameterId};
 
@@ -12,6 +12,9 @@ pub const DEFINITION_COMMAND_ADD_TERMINAL: u16 = 1;
 pub const DEFINITION_COMMAND_ADD_NODE: u16 = 2;
 pub const DEFINITION_COMMAND_ADD_PARAMETER: u16 = 3;
 pub const DEFINITION_COMMAND_ADD_ELEMENT: u16 = 4;
+pub const DEFINITION_COMMAND_ADD_VOLTAGE_OBSERVER: u16 = 5;
+pub const DEFINITION_COMMAND_ADD_CHILD_OBSERVER: u16 = 6;
+
 pub const DEFINITION_VALUE_LITERAL: u8 = 0;
 pub const DEFINITION_VALUE_PARAMETER: u8 = 1;
 
@@ -238,6 +241,51 @@ fn decode_definition(
                 }
                 builder
                     .add_element(element)
+                    .map_err(|error| map_builder_error(error, command_index, command_offset))?;
+            }
+            DEFINITION_COMMAND_ADD_VOLTAGE_OBSERVER => {
+                let positive = payload_decoder
+                    .read_u32()
+                    .map_err(|error| truncated(error, command_index))?;
+
+                let negative = payload_decoder
+                    .read_u32()
+                    .map_err(|error| truncated(error, command_index))?;
+
+                if !payload_decoder.is_empty() {
+                    return Err(DefinitionRegistrationError::command(
+                        DefinitionRegistrationErrorKind::InvalidCommandLength,
+                        command_index,
+                        command_offset,
+                    ));
+                }
+
+                builder
+                    .add_voltage_observer(NodeId::new(positive), NodeId::new(negative))
+                    .map_err(|error| map_builder_error(error, command_index, command_offset))?;
+            }
+            DEFINITION_COMMAND_ADD_CHILD_OBSERVER => {
+                let element = payload_decoder
+                    .read_u32()
+                    .map_err(|error| truncated(error, command_index))?;
+
+                let observer = payload_decoder
+                    .read_u32()
+                    .map_err(|error| truncated(error, command_index))?;
+
+                if !payload_decoder.is_empty() {
+                    return Err(DefinitionRegistrationError::command(
+                        DefinitionRegistrationErrorKind::InvalidCommandLength,
+                        command_index,
+                        command_offset,
+                    ));
+                }
+
+                builder
+                    .add_child_observer(
+                        ElementId::new(element),
+                        DefinitionObserverId::new(observer),
+                    )
                     .map_err(|error| map_builder_error(error, command_index, command_offset))?;
             }
             _ => {
@@ -566,6 +614,10 @@ fn truncated_header(error: Truncated) -> DefinitionRegistrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hynergy_model::device::definition::DefinitionObserverSource;
+    use hynergy_model::device::definition::DevicePartitionId;
+    use hynergy_model::device::definition::ObserverQuantity;
+    use hynergy_model::device::definition::PrimitiveElementKind;
     use hynergy_model::device::definition::{DeviceBody, PrimitiveParameterError};
     use hynergy_model::parameter::ParameterConstraintError;
 
@@ -573,6 +625,15 @@ mod tests {
     enum TestValue {
         Literal(f64),
         Parameter(u32),
+    }
+
+    fn pair_payload(first: u32, second: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8);
+
+        bytes.extend_from_slice(&first.to_le_bytes());
+        bytes.extend_from_slice(&second.to_le_bytes());
+
+        bytes
     }
 
     fn command(tag: u16, payload: &[u8]) -> Vec<u8> {
@@ -699,6 +760,121 @@ mod tests {
         assert_eq!(error.kind(), kind);
         assert_eq!(error.command_index(), command_index);
         assert_eq!(error.byte_offset(), byte_offset);
+    }
+
+    #[test]
+    fn voltage_observer_command_registers_observer() {
+        let mut engine = Engine::new();
+
+        let commands = [
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(
+                    PrimitiveElementKind::Conductance as u32,
+                    &[0, 1],
+                    &[TestValue::Literal(1.0)],
+                ),
+            ),
+            command(DEFINITION_COMMAND_ADD_VOLTAGE_OBSERVER, &pair_payload(0, 1)),
+        ];
+
+        let definition_id =
+            register_definition_buffer(&mut engine, &definition_buffer(&commands)).unwrap();
+
+        let definition = engine.definitions().get(definition_id).unwrap();
+
+        assert_eq!(definition.observers().len(), 1);
+
+        let observer = definition.observer(DefinitionObserverId::new(0)).unwrap();
+
+        assert_eq!(observer.quantity(), ObserverQuantity::Voltage,);
+
+        assert_eq!(
+            observer.source(),
+            DefinitionObserverSource::Voltage {
+                positive: NodeId::new(0),
+                negative: NodeId::new(1),
+            },
+        );
+
+        assert_eq!(observer.partition(), DevicePartitionId::new(0),);
+    }
+
+    #[test]
+    fn child_observer_command_registers_forwarded_observer() {
+        let mut engine = Engine::new();
+
+        let child_commands = [
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(
+                    PrimitiveElementKind::Conductance as u32,
+                    &[0, 1],
+                    &[TestValue::Literal(1.0)],
+                ),
+            ),
+            command(DEFINITION_COMMAND_ADD_VOLTAGE_OBSERVER, &pair_payload(0, 1)),
+        ];
+
+        let child =
+            register_definition_buffer(&mut engine, &definition_buffer(&child_commands)).unwrap();
+
+        let parent_commands = [
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(
+                DEFINITION_COMMAND_ADD_ELEMENT,
+                &element_payload(child.get(), &[0, 1], &[]),
+            ),
+            command(DEFINITION_COMMAND_ADD_CHILD_OBSERVER, &pair_payload(0, 0)),
+        ];
+
+        let parent =
+            register_definition_buffer(&mut engine, &definition_buffer(&parent_commands)).unwrap();
+
+        let definition = engine.definitions().get(parent).unwrap();
+
+        assert_eq!(definition.observers().len(), 1);
+
+        let observer = definition.observer(DefinitionObserverId::new(0)).unwrap();
+
+        assert_eq!(observer.quantity(), ObserverQuantity::Voltage,);
+        assert_eq!(
+            observer.source(),
+            DefinitionObserverSource::Child {
+                element: ElementId::new(0),
+                observer: DefinitionObserverId::new(0),
+            },
+        );
+
+        assert_eq!(observer.partition(), DevicePartitionId::new(0),);
+    }
+
+    #[test]
+    fn voltage_observer_command_rejects_extra_payload_bytes() {
+        let mut payload = pair_payload(0, 1);
+        payload.push(0);
+
+        let commands = [
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
+            command(DEFINITION_COMMAND_ADD_VOLTAGE_OBSERVER, &payload),
+        ];
+
+        let bytes = definition_buffer(&commands);
+
+        let observer_command_offset = 16 + commands[..2].iter().map(Vec::len).sum::<usize>();
+
+        assert_error(
+            &bytes,
+            DefinitionRegistrationErrorKind::InvalidCommandLength,
+            2,
+            observer_command_offset as u32,
+        );
     }
 
     #[test]

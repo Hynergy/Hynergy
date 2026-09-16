@@ -6,9 +6,8 @@ use crate::compile::island::{
     DeviceObserver, DeviceState, IslandCompileError, compile_topology_island,
 };
 use crate::runtime::island::{IslandRuntime, IslandRuntimeError, StagedStateWrite};
-use crate::runtime::subscription::{
-    SubscriptionError, SubscriptionId, SubscriptionRegistry, SubscriptionUpdate,
-};
+pub use crate::runtime::subscription::{SubscriptionError, SubscriptionId};
+use crate::runtime::subscription::{SubscriptionRegistry, SubscriptionUpdate};
 use crate::topology::{DerivedTopology, TraversalScratch};
 use hynergy_mna::system::MnaError;
 use hynergy_model::circuit::ValueRef;
@@ -183,6 +182,16 @@ impl Engine {
             definition_registry: DefinitionRegistry::new(),
             universe: Vec::new(),
         }
+    }
+
+    pub fn subscription_count(&self, world_id: u32) -> Result<usize, SubscriptionError> {
+        let world = self
+            .universe
+            .get(world_id as usize)
+            .and_then(Option::as_ref)
+            .ok_or(SubscriptionError::UnknownWorld)?;
+
+        Ok(world.subscriptions.subscriptions().len())
     }
 
     pub fn tick_world(&mut self, world_id: u32) -> Result<(), EngineTickError> {
