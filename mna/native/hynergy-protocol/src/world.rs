@@ -470,6 +470,7 @@ mod tests {
     #[test]
     fn empty_buffer_succeeds() {
         let mut engine = Engine::new();
+
         let world = engine.new_world(world_config()).unwrap();
 
         apply_world_command_buffer(&mut engine, world, &buffer(&[])).unwrap();
