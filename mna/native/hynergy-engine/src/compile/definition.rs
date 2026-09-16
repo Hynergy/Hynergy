@@ -145,9 +145,19 @@ fn compile_tick_delay_partitions(
 
         match partition_index {
             0 => {
-                for _ in &definition_terminals {
-                    builder.terminal_voltage()?;
-                }
+                debug_assert_eq!(definition_terminals.len(), 2);
+
+                let positive = builder.terminal_voltage()?;
+                let negative = builder.terminal_voltage()?;
+
+                let next_state = builder.write_only_state()?;
+
+                let positive_voltage = builder.unknown_value(positive)?;
+                let negative_voltage = builder.unknown_value(negative)?;
+
+                let voltage = builder.sub(positive_voltage, negative_voltage)?;
+
+                builder.write_state_id(next_state, voltage)?;
             }
 
             1 => {
@@ -1251,5 +1261,81 @@ mod tests {
 
         assert_eq!(output.template().state_count(), 1);
         assert_eq!(output.template().allocated_unknown_count(), 1);
+    }
+
+    #[test]
+    fn tick_delay_input_writes_terminal_voltage_to_shared_state() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::TickDelay))
+            .unwrap();
+
+        let compiled = CompiledDefinition::compile(definition).unwrap();
+
+        let input = compiled.partition(DevicePartitionId::new(0)).unwrap();
+
+        let template = input.template();
+
+        assert_eq!(template.state_count(), 1);
+        assert_eq!(template.allocated_unknown_count(), 0);
+
+        let positive = UnknownIndex::new(0);
+        let negative = UnknownIndex::new(1);
+
+        let mut unknown_allocator = UnknownAllocator::new(2).unwrap();
+
+        let allocated = unknown_allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let unknowns = template
+            .bind_unknowns(&[Some(positive), Some(negative)], allocated)
+            .unwrap();
+
+        let pattern = PatternBuilder::with_capacity(
+            unknown_allocator.dimension(),
+            template.matrix_entry_count(),
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+
+        let mut state_allocator = StateAllocator::new();
+        let states = state_allocator.allocate(template.state_count()).unwrap();
+
+        let state = states.get(0).unwrap();
+
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        template.bind(&unknowns, states, &mut ir_builder).unwrap();
+
+        let ir = ir_builder.finish().unwrap();
+
+        assert_eq!(ir.solution_inputs().len(), 2);
+
+        let mut workspace = ir.value_program().new_workspace();
+
+        for &(unknown, input) in ir.solution_inputs() {
+            let value = if unknown == positive {
+                5.0
+            } else if unknown == negative {
+                2.0
+            } else {
+                panic!("TickDelay input uses an unexpected unknown");
+            };
+
+            workspace.set_input(input, value);
+        }
+
+        ir.value_program().execute_iteration(&mut workspace);
+
+        let mut next_state = [0.0];
+
+        ir.state_transition()
+            .execute(&mut next_state, workspace.values());
+
+        assert_eq!(state.index(), 0);
+        assert!((next_state[state.index()] - 3.0).abs() < 1.0e-12);
     }
 }

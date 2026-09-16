@@ -212,32 +212,31 @@ impl DefinitionTemplateBuilder {
     }
 
     pub(crate) fn state(&mut self) -> Result<LocalState, DefinitionTemplateBuildError> {
-        self.allocate_state(true)
+        self.allocate_read_state(true)
     }
 
     pub(crate) fn read_state(&mut self) -> Result<LocalState, DefinitionTemplateBuildError> {
-        self.allocate_state(false)
+        self.allocate_read_state(false)
     }
 
-    fn allocate_state(
+    fn allocate_read_state(
         &mut self,
         requires_write: bool,
     ) -> Result<LocalState, DefinitionTemplateBuildError> {
-        let index = self.state_writes.len();
-
-        let raw = u32::try_from(index).map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
-
-        let id = LocalStateId::new(raw);
+        let id = self.allocate_state_slot(requires_write)?;
 
         let value = self.allocate_value(LocalValueInfo {
             node: LocalValueNode::State(id),
             constant: None,
         })?;
 
-        self.state_writes.push(None);
-        self.set_state_requires_write(index, requires_write);
-
         Ok(LocalState { id, value })
+    }
+
+    pub(crate) fn write_only_state(
+        &mut self,
+    ) -> Result<LocalStateId, DefinitionTemplateBuildError> {
+        self.allocate_state_slot(true)
     }
 
     pub(crate) fn write_state(
@@ -245,13 +244,21 @@ impl DefinitionTemplateBuilder {
         state: LocalState,
         source: LocalValueId,
     ) -> Result<(), DefinitionTemplateBuildError> {
+        self.write_state_id(state.id, source)
+    }
+
+    pub(crate) fn write_state_id(
+        &mut self,
+        state: LocalStateId,
+        source: LocalValueId,
+    ) -> Result<(), DefinitionTemplateBuildError> {
         debug_assert!(source.index() < self.values.len());
 
-        let destination = &mut self.state_writes[state.id.index()];
+        let destination = &mut self.state_writes[state.index()];
 
         if destination.is_some() {
             return Err(DefinitionTemplateBuildError::DuplicateStateProducer {
-                state: state.id.index(),
+                state: state.index(),
             });
         }
 
@@ -584,6 +591,22 @@ impl DefinitionTemplateBuilder {
         self.state_requires_write
             .get(word)
             .is_some_and(|word| word & (1u64 << bit) != 0)
+    }
+
+    fn allocate_state_slot(
+        &mut self,
+        requires_write: bool,
+    ) -> Result<LocalStateId, DefinitionTemplateBuildError> {
+        let index = self.state_writes.len();
+
+        let raw = u32::try_from(index).map_err(|_| DefinitionTemplateBuildError::IdExhausted)?;
+
+        let id = LocalStateId::new(raw);
+
+        self.state_writes.push(None);
+        self.set_state_requires_write(index, requires_write);
+
+        Ok(id)
     }
 }
 

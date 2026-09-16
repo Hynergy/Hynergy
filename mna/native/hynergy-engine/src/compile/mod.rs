@@ -4,6 +4,7 @@ mod template;
 mod unknown;
 
 pub(crate) mod definition;
+mod isalnd;
 
 pub(crate) use template::{
     CompiledDefinitionTemplate, DefinitionTemplateBuildError, DefinitionTemplateBuilder,
