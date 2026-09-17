@@ -646,6 +646,10 @@ impl<'a> DeviceDefinitionBuilder<'a> {
                     positive_partition
                 }
 
+                DefinitionObserverSource::Current { .. } => {
+                    unreachable!("composite definitions cannot contain direct current observers",)
+                }
+
                 DefinitionObserverSource::Child { element, observer } => {
                     let child_element = &self.elements[element.index()];
 

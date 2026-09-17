@@ -41,8 +41,18 @@ impl CompiledDefinition {
                 );
 
                 let partition = DevicePartitionId::new(0);
+
                 let definition_parameters = definition_parameters(definition);
                 let definition_states = definition_states(definition);
+
+                let definition_observers =
+                    definition_observers_for_partition(definition, partition);
+
+                debug_assert_eq!(
+                    template.output_count(),
+                    definition_observers.len(),
+                    "primitive template outputs must match primitive observers",
+                );
 
                 vec![CompiledPartitionTemplate {
                     definition_terminals: definition_terminals_for_partition(definition, partition),
@@ -50,8 +60,8 @@ impl CompiledDefinition {
                     definition_state_reads: definition_states.clone(),
                     definition_state_writes: definition_states.clone(),
                     definition_states,
+                    definition_observers,
                     template,
-                    definition_observers: SmallVec::new(),
                 }]
                 .into_boxed_slice()
             }
@@ -90,6 +100,17 @@ impl CompiledDefinition {
     ) -> Option<&CompiledPartitionTemplate> {
         self.partitions.get(partition.index())
     }
+}
+
+fn voltage_difference(
+    builder: &mut DefinitionTemplateBuilder,
+    positive: LocalUnknownId,
+    negative: LocalUnknownId,
+) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+    let positive = builder.unknown_value(positive)?;
+    let negative = builder.unknown_value(negative)?;
+
+    builder.sub(positive, negative)
 }
 
 #[derive(Debug)]
@@ -158,6 +179,23 @@ fn definition_states(definition: &DeviceDefinition) -> SmallVec<[DefinitionState
         .collect()
 }
 
+fn definition_observers_for_partition(
+    definition: &DeviceDefinition,
+    partition: DevicePartitionId,
+) -> SmallVec<[DefinitionObserverId; 4]> {
+    definition
+        .observers()
+        .iter()
+        .enumerate()
+        .filter(|&(_, observer)| observer.partition() == partition)
+        .map(|(index, _)| {
+            DefinitionObserverId::new(
+                u32::try_from(index).expect("observer index must fit DefinitionObserverId"),
+            )
+        })
+        .collect()
+}
+
 fn compile_tick_delay_partitions(
     definition: &DeviceDefinition,
 ) -> Result<Box<[CompiledPartitionTemplate]>, DefinitionCompileError> {
@@ -174,34 +212,28 @@ fn compile_tick_delay_partitions(
         );
 
         let definition_terminals = definition_terminals_for_partition(definition, partition);
+        let definition_observers = definition_observers_for_partition(definition, partition);
 
         let mut builder = DefinitionTemplateBuilder::default();
 
         match partition_index {
             0 => {
-                debug_assert_eq!(definition_terminals.len(), 2);
+                debug_assert_eq!(definition_terminals.len(), 2,);
 
                 let positive = builder.terminal_voltage()?;
                 let negative = builder.terminal_voltage()?;
-
                 let next_state = builder.write_only_state()?;
-
-                let positive_voltage = builder.unknown_value(positive)?;
-                let negative_voltage = builder.unknown_value(negative)?;
-
-                let voltage = builder.sub(positive_voltage, negative_voltage)?;
+                let voltage = voltage_difference(&mut builder, positive, negative)?;
 
                 builder.write_state_id(next_state, voltage)?;
+                builder.output(voltage)?;
             }
-
             1 => {
-                debug_assert_eq!(definition_terminals.len(), 2);
+                debug_assert_eq!(definition_terminals.len(), 2,);
 
                 let positive = builder.terminal_voltage()?;
                 let negative = builder.terminal_voltage()?;
-
                 let branch_current = builder.branch_current_unknown()?;
-
                 let previous = builder.read_state()?;
 
                 stamp_voltage_source(
@@ -211,17 +243,30 @@ fn compile_tick_delay_partitions(
                     branch_current,
                     previous.value(),
                 )?;
-            }
 
-            _ => unreachable!("TickDelay must have exactly two partitions"),
+                let voltage = voltage_difference(&mut builder, positive, negative)?;
+                let current = builder.unknown_value(branch_current)?;
+
+                builder.output(voltage)?;
+                builder.output(current)?;
+            }
+            _ => {
+                unreachable!("TickDelay must have exactly two partitions",)
+            }
         }
+
+        debug_assert_eq!(
+            builder.output_count(),
+            definition_observers.len(),
+            "TickDelay partition outputs must match observers",
+        );
 
         let (definition_state_reads, definition_state_writes) = match partition_index {
             0 => (SmallVec::new(), SmallVec::from_slice(&[state])),
-
             1 => (SmallVec::from_slice(&[state]), SmallVec::new()),
-
-            _ => unreachable!("TickDelay must have exactly two partitions"),
+            _ => {
+                unreachable!("TickDelay must have exactly two partitions",)
+            }
         };
 
         partitions.push(CompiledPartitionTemplate {
@@ -230,8 +275,8 @@ fn compile_tick_delay_partitions(
             definition_states: SmallVec::from_slice(&[state]),
             definition_state_reads,
             definition_state_writes,
+            definition_observers,
             template: builder.finish()?,
-            definition_observers: SmallVec::new(),
         });
     }
 
@@ -256,6 +301,13 @@ fn definition_terminals_for_partition(
             ))
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlledConductanceValues {
+    output_voltage: LocalValueId,
+    control_voltage: LocalValueId,
+    output_current: LocalValueId,
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -287,24 +339,36 @@ fn compile_primitive(
 
     match kind {
         PrimitiveElementKind::Conductance => {
-            let a = builder.terminal_voltage()?;
-            let b = builder.terminal_voltage()?;
+            let positive = builder.terminal_voltage()?;
+            let negative = builder.terminal_voltage()?;
 
             let conductance = builder.parameter()?;
 
-            stamp_conductance(&mut builder, a, b, conductance);
+            stamp_conductance(&mut builder, positive, negative, conductance);
+
+            let voltage = voltage_difference(&mut builder, positive, negative)?;
+            let current = builder.mul(conductance, voltage)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
         }
 
         PrimitiveElementKind::Resistance => {
-            let a = builder.terminal_voltage()?;
-            let b = builder.terminal_voltage()?;
+            let positive = builder.terminal_voltage()?;
+            let negative = builder.terminal_voltage()?;
 
             let resistance = builder.parameter()?;
             let one = builder.constant(1.0)?;
 
             let conductance = builder.div(one, resistance)?;
 
-            stamp_conductance(&mut builder, a, b, conductance);
+            stamp_conductance(&mut builder, positive, negative, conductance);
+
+            let voltage = voltage_difference(&mut builder, positive, negative)?;
+            let current = builder.mul(conductance, voltage)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
         }
 
         PrimitiveElementKind::CurrentSource => {
@@ -314,6 +378,11 @@ fn compile_primitive(
             let current = builder.parameter()?;
 
             stamp_current_source(&mut builder, from, to, current);
+
+            let voltage = voltage_difference(&mut builder, from, to)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
         }
 
         PrimitiveElementKind::VoltageSource => {
@@ -322,10 +391,24 @@ fn compile_primitive(
 
             let branch_current = builder.branch_current_unknown()?;
 
-            let voltage = builder.parameter()?;
+            let voltage_parameter = builder.parameter()?;
 
-            stamp_voltage_source(&mut builder, positive, negative, branch_current, voltage)?;
+            stamp_voltage_source(
+                &mut builder,
+                positive,
+                negative,
+                branch_current,
+                voltage_parameter,
+            )?;
+
+            let voltage = voltage_difference(&mut builder, positive, negative)?;
+
+            let current = builder.unknown_value(branch_current)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
         }
+
         PrimitiveElementKind::VoltageControlledCurrentSource => {
             let output_positive = builder.terminal_voltage()?;
             let output_negative = builder.terminal_voltage()?;
@@ -342,6 +425,18 @@ fn compile_primitive(
                 control_negative,
                 transconductance,
             );
+
+            let output_voltage =
+                voltage_difference(&mut builder, output_positive, output_negative)?;
+
+            let control_voltage =
+                voltage_difference(&mut builder, control_positive, control_negative)?;
+
+            let output_current = builder.mul(transconductance, control_voltage)?;
+
+            builder.output(output_voltage)?;
+            builder.output(control_voltage)?;
+            builder.output(output_current)?;
         }
 
         PrimitiveElementKind::VoltageControlledVoltageSource => {
@@ -363,6 +458,18 @@ fn compile_primitive(
                 branch_current,
                 gain,
             )?;
+
+            let output_voltage =
+                voltage_difference(&mut builder, output_positive, output_negative)?;
+
+            let control_voltage =
+                voltage_difference(&mut builder, control_positive, control_negative)?;
+
+            let output_current = builder.unknown_value(branch_current)?;
+
+            builder.output(output_voltage)?;
+            builder.output(control_voltage)?;
+            builder.output(output_current)?;
         }
 
         PrimitiveElementKind::Capacitor => {
@@ -373,7 +480,6 @@ fn compile_primitive(
             let timestep = builder.timestep()?;
 
             let previous_voltage = builder.state()?;
-
             let conductance = builder.div(capacitance, timestep)?;
 
             stamp_conductance(&mut builder, positive, negative, conductance);
@@ -383,11 +489,14 @@ fn compile_primitive(
             builder.add_rhs(positive, history, 1.0);
             builder.add_rhs(negative, history, -1.0);
 
-            let positive_voltage = builder.unknown_value(positive)?;
-            let negative_voltage = builder.unknown_value(negative)?;
-            let next_voltage = builder.sub(positive_voltage, negative_voltage)?;
+            let voltage = voltage_difference(&mut builder, positive, negative)?;
+            let voltage_delta = builder.sub(voltage, previous_voltage.value())?;
+            let current = builder.mul(conductance, voltage_delta)?;
 
-            builder.write_state(previous_voltage, next_voltage)?;
+            builder.write_state(previous_voltage, voltage)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
         }
 
         PrimitiveElementKind::Inductor => {
@@ -405,18 +514,23 @@ fn compile_primitive(
 
             stamp_current_source(&mut builder, positive, negative, previous_current.value());
 
-            let positive_voltage = builder.unknown_value(positive)?;
-            let negative_voltage = builder.unknown_value(negative)?;
-            let voltage = builder.sub(positive_voltage, negative_voltage)?;
-            let current_delta = builder.mul(conductance, voltage)?;
-            let next_current = builder.add(previous_current.value(), current_delta)?;
+            let voltage = voltage_difference(&mut builder, positive, negative)?;
 
-            builder.write_state(previous_current, next_current)?;
+            let current_delta = builder.mul(conductance, voltage)?;
+
+            let current = builder.add(previous_current.value(), current_delta)?;
+
+            builder.write_state(previous_current, current)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
         }
 
         PrimitiveElementKind::VoltageControlledConductance => {
             let output_positive = builder.terminal_voltage()?;
+
             let output_negative = builder.terminal_voltage()?;
+
             let control = builder.terminal_voltage()?;
 
             let parameters = ControlledConductanceParameters {
@@ -426,13 +540,17 @@ fn compile_primitive(
                 g_max: builder.parameter()?,
             };
 
-            stamp_voltage_controlled_conductance(
+            let values = stamp_voltage_controlled_conductance(
                 &mut builder,
                 output_positive,
                 output_negative,
                 control,
                 parameters,
             )?;
+
+            builder.output(values.output_voltage)?;
+            builder.output(values.control_voltage)?;
+            builder.output(values.output_current)?;
         }
 
         PrimitiveElementKind::VoltageControlledSwitch => {
@@ -453,7 +571,7 @@ fn compile_primitive(
 
             let state = builder.state()?;
 
-            let next_mode = stamp_voltage_controlled_switch(
+            let values = stamp_voltage_controlled_switch(
                 &mut builder,
                 output_positive,
                 output_negative,
@@ -463,10 +581,14 @@ fn compile_primitive(
                 parameters,
             )?;
 
-            builder.write_state(state, next_mode)?;
+            builder.write_state(state, values.next_mode)?;
+
+            builder.output(values.output_voltage)?;
+            builder.output(values.control_voltage)?;
+            builder.output(values.output_current)?;
         }
 
-        _ => {
+        PrimitiveElementKind::TickDelay => {
             return Err(DefinitionCompileError::UnsupportedPrimitive { kind });
         }
     }
@@ -914,7 +1036,7 @@ fn stamp_voltage_controlled_conductance(
     output_negative: LocalUnknownId,
     control: LocalUnknownId,
     parameters: ControlledConductanceParameters,
-) -> Result<(), DefinitionTemplateBuildError> {
+) -> Result<ControlledConductanceValues, DefinitionTemplateBuildError> {
     let ControlledConductanceParameters {
         threshold,
         transition,
@@ -974,7 +1096,13 @@ fn stamp_voltage_controlled_conductance(
     builder.add_rhs(output_positive, correction, 1.0);
     builder.add_rhs(output_negative, correction, -1.0);
 
-    Ok(())
+    let output_current = builder.mul(conductance, output_voltage)?;
+
+    Ok(ControlledConductanceValues {
+        output_voltage,
+        control_voltage,
+        output_current,
+    })
 }
 
 fn stamp_voltage_controlled_switch(
@@ -985,7 +1113,7 @@ fn stamp_voltage_controlled_switch(
     control_negative: LocalUnknownId,
     initial_mode: LocalValueId,
     parameters: ControlledSwitchParameters,
-) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+) -> Result<ControlledSwitchValues, DefinitionTemplateBuildError> {
     let ControlledSwitchParameters {
         threshold,
         hysteresis,
@@ -1038,7 +1166,16 @@ fn stamp_voltage_controlled_switch(
 
     stamp_conductance(builder, output_positive, output_negative, conductance);
 
-    Ok(next_mode)
+    let output_voltage = voltage_difference(builder, output_positive, output_negative)?;
+
+    let output_current = builder.mul(conductance, output_voltage)?;
+
+    Ok(ControlledSwitchValues {
+        next_mode,
+        output_voltage,
+        control_voltage,
+        output_current,
+    })
 }
 
 fn compile_partition_observers(
@@ -1070,6 +1207,10 @@ fn compile_partition_observers(
                 builder.sub(positive, negative)?
             }
 
+            DefinitionObserverSource::Current { .. } => {
+                unreachable!("direct current observers are only emitted by primitive compilation",)
+            }
+
             DefinitionObserverSource::Child { .. } => forwarded_values[index]
                 .expect("forwarded child observer must have a compiled child output"),
         };
@@ -1081,6 +1222,14 @@ fn compile_partition_observers(
     }
 
     Ok(compiled)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlledSwitchValues {
+    next_mode: LocalValueId,
+    output_voltage: LocalValueId,
+    control_voltage: LocalValueId,
+    output_current: LocalValueId,
 }
 
 #[cfg(test)]
@@ -1114,6 +1263,62 @@ mod tests {
         let definition = registry.get(DefinitionId::from(kind)).unwrap();
 
         CompiledDefinitionTemplate::compile(definition).unwrap()
+    }
+
+    fn assert_compiled_primitive_observers(kind: PrimitiveElementKind, expected: &[&[u32]]) {
+        let registry = DefinitionRegistry::new();
+        let definition = registry.get(DefinitionId::from(kind)).unwrap();
+        let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
+
+        assert_eq!(compiled.partition_count(), expected.len(), "{kind:?}",);
+
+        for (partition_index, &expected_observers) in expected.iter().enumerate() {
+            let partition = compiled
+                .partition(DevicePartitionId::new(partition_index as u16))
+                .unwrap();
+
+            let actual = partition
+                .definition_observers()
+                .iter()
+                .map(|observer| observer.id())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                actual, expected_observers,
+                "{kind:?} partition {partition_index}",
+            );
+
+            assert_eq!(
+                partition.template().output_count(),
+                expected_observers.len(),
+                "{kind:?} partition {partition_index}",
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_observers_become_partition_template_outputs() {
+        for kind in [
+            PrimitiveElementKind::Resistance,
+            PrimitiveElementKind::Conductance,
+            PrimitiveElementKind::VoltageSource,
+            PrimitiveElementKind::CurrentSource,
+            PrimitiveElementKind::Capacitor,
+            PrimitiveElementKind::Inductor,
+        ] {
+            assert_compiled_primitive_observers(kind, &[&[0, 1]]);
+        }
+
+        for kind in [
+            PrimitiveElementKind::VoltageControlledCurrentSource,
+            PrimitiveElementKind::VoltageControlledVoltageSource,
+            PrimitiveElementKind::VoltageControlledSwitch,
+            PrimitiveElementKind::VoltageControlledConductance,
+        ] {
+            assert_compiled_primitive_observers(kind, &[&[0, 1, 2]]);
+        }
+
+        assert_compiled_primitive_observers(PrimitiveElementKind::TickDelay, &[&[0], &[1, 2]]);
     }
 
     #[test]
@@ -1710,12 +1915,22 @@ mod tests {
 
         assert_eq!(ir.state_inputs().len(), 1);
         assert_eq!(ir.state_inputs()[0].0, inductor_state);
-        assert_eq!(ir.solution_inputs().len(), 1);
-        assert_eq!(ir.solution_inputs()[0].0, node);
+        assert_eq!(ir.solution_inputs().len(), 2);
+
+        assert!(
+            ir.solution_inputs()
+                .iter()
+                .any(|&(unknown, _)| unknown == node),
+        );
+
+        assert!(
+            ir.solution_inputs()
+                .iter()
+                .any(|&(unknown, _)| unknown == source_branch),
+        );
 
         let timestep_input = ir.timestep_input().unwrap();
         let state_input = ir.state_inputs()[0].1;
-        let solution_input = ir.solution_inputs()[0].1;
 
         let mut workspace = ir.value_program().new_workspace();
 
@@ -1747,7 +1962,9 @@ mod tests {
         assert!((solution[node.index()] - 2.0).abs() < 1.0e-12);
         assert!((solution[source_branch.index()] + 0.5).abs() < 1.0e-12);
 
-        workspace.set_input(solution_input, solution[node.index()]);
+        for &(unknown, input) in ir.solution_inputs() {
+            workspace.set_input(input, solution[unknown.index()]);
+        }
 
         ir.value_program().execute_iteration(&mut workspace);
 
@@ -1770,7 +1987,10 @@ mod tests {
         assert!((solution[node.index()] - 2.0).abs() < 1.0e-12);
         assert!((solution[source_branch.index()] + 1.0).abs() < 1.0e-12);
 
-        workspace.set_input(solution_input, solution[node.index()]);
+        for &(unknown, input) in ir.solution_inputs() {
+            workspace.set_input(input, solution[unknown.index()]);
+        }
+
         ir.value_program().execute_iteration(&mut workspace);
 
         let mut next_state = [0.0];

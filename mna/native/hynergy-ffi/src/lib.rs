@@ -1014,6 +1014,394 @@ mod tests {
         bytes
     }
 
+    fn subscription_result_sentinel() -> SubscriptionCreationResult {
+        SubscriptionCreationResult {
+            code: 0xaaaa_aaaa,
+            subscription_id: 0xbbbb_bbbb,
+        }
+    }
+
+    fn subscribe_observer(engine: *mut Engine, world: u32, device: u32, observer: u32) -> u32 {
+        let mut result = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_subscribe_observer(engine, world, device, observer, &mut result)
+            },
+            SubscriptionCode::Success as u32,
+        );
+
+        result.subscription_id
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        let tolerance = 1.0e-10 * expected.abs().max(1.0);
+
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, got {actual}",
+        );
+    }
+
+    fn record_value(records: &[SubscriptionRecord], subscription: u32) -> f64 {
+        records
+            .iter()
+            .find(|record| record.subscription_id == subscription)
+            .expect("subscription update must exist")
+            .value
+    }
+
+    #[test]
+    fn primitive_voltage_and_current_observers_preserve_current_direction() {
+        const ADD_WIRE: u16 = 1;
+        const ADD_DEVICE: u16 = 5;
+        const ATTACH_TERMINAL: u16 = 7;
+        const SET_DEVICE_PARAMETER: u16 = 9;
+
+        let engine = hynergy_engine_create();
+        let world = create_world(engine).world_id;
+
+        let conductance = 1;
+        let source = 2;
+
+        let negative = 1;
+        let positive = 2;
+
+        let commands = [
+            world_command(ADD_WIRE, &u32_payload(&[negative])),
+            world_command(ADD_WIRE, &u32_payload(&[positive])),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    conductance,
+                    DefinitionId::from(PrimitiveElementKind::Conductance).get(),
+                ]),
+            ),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    source,
+                    DefinitionId::from(PrimitiveElementKind::VoltageSource).get(),
+                ]),
+            ),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[positive, conductance, 0])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[negative, conductance, 1])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[positive, source, 0])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[negative, source, 1])),
+            world_command(
+                SET_DEVICE_PARAMETER,
+                &set_parameter_payload(conductance, 0, 2.0),
+            ),
+            world_command(SET_DEVICE_PARAMETER, &set_parameter_payload(source, 0, 5.0)),
+        ];
+
+        let mut command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &world_buffer(&commands), &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        let conductance_voltage = subscribe_observer(engine, world, conductance, 0);
+        let conductance_current = subscribe_observer(engine, world, conductance, 1);
+        let source_current = subscribe_observer(engine, world, source, 1);
+
+        let mut records = [
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+        ];
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_tick(
+                    engine,
+                    world,
+                    records.as_mut_ptr(),
+                    records.len() as u32,
+                    &mut result,
+                )
+            },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 3);
+
+        assert_close(record_value(&records, conductance_voltage), 5.0);
+        assert_close(record_value(&records, conductance_current), 10.0);
+        assert_close(record_value(&records, source_current), -10.0);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn vccs_observers_publish_output_control_and_current() {
+        const ADD_WIRE: u16 = 1;
+        const ADD_DEVICE: u16 = 5;
+        const ATTACH_TERMINAL: u16 = 7;
+        const SET_DEVICE_PARAMETER: u16 = 9;
+
+        let engine = hynergy_engine_create();
+        let world = create_world(engine).world_id;
+
+        let reference = 1;
+        let output = 2;
+        let control = 3;
+
+        let vccs = 1;
+        let output_source = 2;
+        let control_source = 3;
+
+        let commands = [
+            world_command(ADD_WIRE, &u32_payload(&[reference])),
+            world_command(ADD_WIRE, &u32_payload(&[output])),
+            world_command(ADD_WIRE, &u32_payload(&[control])),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    vccs,
+                    DefinitionId::from(PrimitiveElementKind::VoltageControlledCurrentSource).get(),
+                ]),
+            ),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    output_source,
+                    DefinitionId::from(PrimitiveElementKind::VoltageSource).get(),
+                ]),
+            ),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    control_source,
+                    DefinitionId::from(PrimitiveElementKind::VoltageSource).get(),
+                ]),
+            ),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[output, vccs, 0])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[reference, vccs, 1])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[control, vccs, 2])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[reference, vccs, 3])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[output, output_source, 0])),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[reference, output_source, 1]),
+            ),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[control, control_source, 0])),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[reference, control_source, 1]),
+            ),
+            world_command(SET_DEVICE_PARAMETER, &set_parameter_payload(vccs, 0, 2.0)),
+            world_command(
+                SET_DEVICE_PARAMETER,
+                &set_parameter_payload(output_source, 0, 4.0),
+            ),
+            world_command(
+                SET_DEVICE_PARAMETER,
+                &set_parameter_payload(control_source, 0, 3.0),
+            ),
+        ];
+
+        let mut command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &world_buffer(&commands), &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        let output_voltage = subscribe_observer(engine, world, vccs, 0);
+        let control_voltage = subscribe_observer(engine, world, vccs, 1);
+        let output_current = subscribe_observer(engine, world, vccs, 2);
+
+        let mut records = [
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+        ];
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_tick(
+                    engine,
+                    world,
+                    records.as_mut_ptr(),
+                    records.len() as u32,
+                    &mut result,
+                )
+            },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 3);
+
+        assert_close(record_value(&records, output_voltage), 4.0);
+        assert_close(record_value(&records, control_voltage), 3.0);
+        assert_close(record_value(&records, output_current), 6.0);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn tick_delay_observers_follow_partition_and_snapshot_semantics() {
+        const ADD_WIRE: u16 = 1;
+        const ADD_DEVICE: u16 = 5;
+        const ATTACH_TERMINAL: u16 = 7;
+        const SET_DEVICE_PARAMETER: u16 = 9;
+
+        let engine = hynergy_engine_create();
+        let world = create_world(engine).world_id;
+
+        let input_negative = 1;
+        let input_positive = 2;
+        let output_negative = 3;
+        let output_positive = 4;
+
+        let delay = 1;
+        let input_source = 2;
+        let output_load = 3;
+
+        let commands = [
+            world_command(ADD_WIRE, &u32_payload(&[input_negative])),
+            world_command(ADD_WIRE, &u32_payload(&[input_positive])),
+            world_command(ADD_WIRE, &u32_payload(&[output_negative])),
+            world_command(ADD_WIRE, &u32_payload(&[output_positive])),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    delay,
+                    DefinitionId::from(PrimitiveElementKind::TickDelay).get(),
+                ]),
+            ),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    input_source,
+                    DefinitionId::from(PrimitiveElementKind::VoltageSource).get(),
+                ]),
+            ),
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    output_load,
+                    DefinitionId::from(PrimitiveElementKind::Conductance).get(),
+                ]),
+            ),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[input_positive, delay, 0])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[input_negative, delay, 1])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[output_positive, delay, 2])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[output_negative, delay, 3])),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[input_positive, input_source, 0]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[input_negative, input_source, 1]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[output_positive, output_load, 0]),
+            ),
+            world_command(
+                ATTACH_TERMINAL,
+                &u32_payload(&[output_negative, output_load, 1]),
+            ),
+            world_command(SET_DEVICE_PARAMETER, &set_parameter_payload(delay, 0, 1.0)),
+            world_command(
+                SET_DEVICE_PARAMETER,
+                &set_parameter_payload(input_source, 0, 5.0),
+            ),
+            world_command(
+                SET_DEVICE_PARAMETER,
+                &set_parameter_payload(output_load, 0, 2.0),
+            ),
+        ];
+
+        let mut command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &world_buffer(&commands), &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        let input_voltage = subscribe_observer(engine, world, delay, 0);
+        let output_voltage = subscribe_observer(engine, world, delay, 1);
+        let output_current = subscribe_observer(engine, world, delay, 2);
+
+        let mut records = [
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+            subscription_record_sentinel(),
+        ];
+
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_tick(
+                    engine,
+                    world,
+                    records.as_mut_ptr(),
+                    records.len() as u32,
+                    &mut result,
+                )
+            },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 3);
+
+        assert_close(record_value(&records, input_voltage), 5.0);
+        assert_close(record_value(&records, output_voltage), 1.0);
+        assert_close(record_value(&records, output_current), -2.0);
+
+        records.fill(subscription_record_sentinel());
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe {
+                hynergy_world_tick(
+                    engine,
+                    world,
+                    records.as_mut_ptr(),
+                    records.len() as u32,
+                    &mut result,
+                )
+            },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 2);
+
+        assert_close(
+            record_value(&records[..result.record_count as usize], output_voltage),
+            5.0,
+        );
+
+        assert_close(
+            record_value(&records[..result.record_count as usize], output_current),
+            -10.0,
+        );
+
+        assert!(
+            records[..result.record_count as usize]
+                .iter()
+                .all(|record| { record.subscription_id != input_voltage }),
+        );
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
     #[test]
     fn definition_registration_preserves_command_error_location() {
         const ADD_TERMINAL: u16 = 1;
@@ -1194,13 +1582,6 @@ mod tests {
         bytes.extend_from_slice(&value.to_le_bytes());
 
         bytes
-    }
-
-    fn subscription_result_sentinel() -> SubscriptionCreationResult {
-        SubscriptionCreationResult {
-            code: 0xaaaa_aaaa,
-            subscription_id: 0xbbbb_bbbb,
-        }
     }
 
     fn tick_result_sentinel() -> TickResult {

@@ -20,6 +20,11 @@ pub enum DefinitionObserverSource {
         negative: NodeId,
     },
 
+    Current {
+        positive: NodeId,
+        negative: NodeId,
+    },
+
     Child {
         element: ElementId,
         observer: DefinitionObserverId,
@@ -124,6 +129,54 @@ impl PrimitiveElementKind {
             Self::VoltageControlledSwitch => 4,
             Self::VoltageControlledConductance => 4,
             Self::TickDelay => 1,
+        }
+    }
+
+    fn observers(self) -> Vec<DefinitionObserver> {
+        let p0 = DevicePartitionId::new(0);
+        let p1 = DevicePartitionId::new(1);
+
+        let voltage = |positive: u32, negative: u32, partition: DevicePartitionId| {
+            DefinitionObserver::new(
+                ObserverQuantity::Voltage,
+                partition,
+                DefinitionObserverSource::Voltage {
+                    positive: NodeId::new(positive),
+                    negative: NodeId::new(negative),
+                },
+            )
+        };
+
+        let current = |positive: u32, negative: u32, partition: DevicePartitionId| {
+            DefinitionObserver::new(
+                ObserverQuantity::Current,
+                partition,
+                DefinitionObserverSource::Current {
+                    positive: NodeId::new(positive),
+                    negative: NodeId::new(negative),
+                },
+            )
+        };
+
+        match self {
+            Self::Resistance
+            | Self::Conductance
+            | Self::VoltageSource
+            | Self::CurrentSource
+            | Self::Capacitor
+            | Self::Inductor => vec![voltage(0, 1, p0), current(0, 1, p0)],
+
+            Self::VoltageControlledCurrentSource
+            | Self::VoltageControlledVoltageSource
+            | Self::VoltageControlledSwitch => {
+                vec![voltage(0, 1, p0), voltage(2, 3, p0), current(0, 1, p0)]
+            }
+
+            Self::VoltageControlledConductance => {
+                vec![voltage(0, 1, p0), voltage(2, 1, p0), current(0, 1, p0)]
+            }
+
+            Self::TickDelay => vec![voltage(0, 1, p0), voltage(2, 3, p1), current(2, 3, p1)],
         }
     }
 
@@ -254,7 +307,7 @@ impl PrimitiveElementKind {
             terminals,
             param_constraints,
             terminal_partition_layout,
-            Vec::new(),
+            self.observers(),
         )
     }
 
@@ -563,6 +616,137 @@ mod tests {
         source: ParameterConstraintError,
     ) -> Result<(), PrimitiveParameterError> {
         Err(PrimitiveParameterError::InvalidParameter { index, source })
+    }
+
+    fn assert_primitive_observers(
+        kind: PrimitiveElementKind,
+        expected: &[(
+            ObserverQuantity,
+            DevicePartitionId,
+            DefinitionObserverSource,
+        )],
+    ) {
+        let definition = kind.definition();
+
+        assert_eq!(definition.observers().len(), expected.len(), "{kind:?}",);
+
+        for (index, &(quantity, partition, source)) in expected.iter().enumerate() {
+            let observer = definition
+                .observer(DefinitionObserverId::new(index as u32))
+                .unwrap();
+
+            assert_eq!(observer.quantity(), quantity, "{kind:?} observer {index}",);
+
+            assert_eq!(observer.partition(), partition, "{kind:?} observer {index}",);
+
+            assert_eq!(observer.source(), source, "{kind:?} observer {index}",);
+        }
+
+        assert!(
+            definition
+                .observer(DefinitionObserverId::new(expected.len() as u32,))
+                .is_none(),
+            "{kind:?}",
+        );
+    }
+
+    #[test]
+    fn primitive_observer_contract_is_stable() {
+        let p0 = DevicePartitionId::new(0);
+        let p1 = DevicePartitionId::new(1);
+
+        let output_voltage = DefinitionObserverSource::Voltage {
+            positive: NodeId::new(0),
+            negative: NodeId::new(1),
+        };
+
+        let output_current = DefinitionObserverSource::Current {
+            positive: NodeId::new(0),
+            negative: NodeId::new(1),
+        };
+
+        for kind in [
+            PrimitiveElementKind::Resistance,
+            PrimitiveElementKind::Conductance,
+            PrimitiveElementKind::VoltageSource,
+            PrimitiveElementKind::CurrentSource,
+            PrimitiveElementKind::Capacitor,
+            PrimitiveElementKind::Inductor,
+        ] {
+            assert_primitive_observers(
+                kind,
+                &[
+                    (ObserverQuantity::Voltage, p0, output_voltage),
+                    (ObserverQuantity::Current, p0, output_current),
+                ],
+            );
+        }
+
+        let differential_control_voltage = DefinitionObserverSource::Voltage {
+            positive: NodeId::new(2),
+            negative: NodeId::new(3),
+        };
+
+        for kind in [
+            PrimitiveElementKind::VoltageControlledCurrentSource,
+            PrimitiveElementKind::VoltageControlledVoltageSource,
+            PrimitiveElementKind::VoltageControlledSwitch,
+        ] {
+            assert_primitive_observers(
+                kind,
+                &[
+                    (ObserverQuantity::Voltage, p0, output_voltage),
+                    (ObserverQuantity::Voltage, p0, differential_control_voltage),
+                    (ObserverQuantity::Current, p0, output_current),
+                ],
+            );
+        }
+
+        assert_primitive_observers(
+            PrimitiveElementKind::VoltageControlledConductance,
+            &[
+                (ObserverQuantity::Voltage, p0, output_voltage),
+                (
+                    ObserverQuantity::Voltage,
+                    p0,
+                    DefinitionObserverSource::Voltage {
+                        positive: NodeId::new(2),
+                        negative: NodeId::new(1),
+                    },
+                ),
+                (ObserverQuantity::Current, p0, output_current),
+            ],
+        );
+
+        assert_primitive_observers(
+            PrimitiveElementKind::TickDelay,
+            &[
+                (
+                    ObserverQuantity::Voltage,
+                    p0,
+                    DefinitionObserverSource::Voltage {
+                        positive: NodeId::new(0),
+                        negative: NodeId::new(1),
+                    },
+                ),
+                (
+                    ObserverQuantity::Voltage,
+                    p1,
+                    DefinitionObserverSource::Voltage {
+                        positive: NodeId::new(2),
+                        negative: NodeId::new(3),
+                    },
+                ),
+                (
+                    ObserverQuantity::Current,
+                    p1,
+                    DefinitionObserverSource::Current {
+                        positive: NodeId::new(2),
+                        negative: NodeId::new(3),
+                    },
+                ),
+            ],
+        );
     }
 
     #[test]
