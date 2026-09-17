@@ -162,23 +162,43 @@ pub enum WorldCommand {
     },
 }
 
-pub struct Engine {
-    definition_registry: DefinitionRegistry,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EngineConfig {
+    max_worker_threads: usize,
+}
 
+impl EngineConfig {
+    pub fn new(max_worker_threads: usize) -> Self {
+        Self { max_worker_threads }
+    }
+
+    pub fn max_worker_threads(&self) -> usize {
+        self.max_worker_threads
+    }
+}
+
+#[allow(dead_code)]
+pub struct Engine {
+    config: EngineConfig,
+
+    definition_registry: DefinitionRegistry,
     universe: Vec<Option<World>>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
-        Self::new()
+        Self::new(EngineConfig {
+            max_worker_threads: 1,
+        })
     }
 }
 
 impl Engine {
     pub const COMPOSITE_DEFINITION_ID_BASE: u32 = DefinitionRegistry::COMPOSITE_DEFINITION_ID_BASE;
 
-    pub fn new() -> Self {
+    pub fn new(config: EngineConfig) -> Self {
         Self {
+            config,
             definition_registry: DefinitionRegistry::new(),
             universe: Vec::new(),
         }
@@ -464,31 +484,41 @@ impl World {
     fn collect_subscription_updates(&mut self) {
         self.subscription_updates.clear();
 
-        let topology = &self.derived_topology;
-        let runtimes = &self.island_runtimes;
-        let updates = &mut self.subscription_updates;
+        {
+            let topology = &self.derived_topology;
+            let runtimes = &self.island_runtimes;
+            let updates = &mut self.subscription_updates;
 
-        for subscription in self.subscriptions.subscriptions_mut() {
-            let island = topology.component_island(subscription.component());
+            for subscription in self.subscriptions.subscriptions_mut() {
+                let island = topology.component_island(subscription.component());
 
-            let runtime = runtimes
-                .get(island.index())
-                .and_then(Option::as_ref)
-                .expect("live subscription component must have an island runtime");
+                let runtime = runtimes
+                    .get(island.index())
+                    .and_then(Option::as_ref)
+                    .expect("live subscription component must have an island runtime");
 
-            let value = runtime
-                .observer_value(subscription.observer())
-                .expect("successful tick must make subscribed observer available");
+                if subscription.published_bits().is_some() && !runtime.observer_outputs_dirty() {
+                    continue;
+                }
 
-            let bits = value.to_bits();
+                let value = runtime
+                    .observer_value(subscription.observer())
+                    .expect("successful tick must make subscribed observer available");
 
-            if subscription.published_bits() == Some(bits) {
-                continue;
+                let bits = value.to_bits();
+
+                if subscription.published_bits() == Some(bits) {
+                    continue;
+                }
+
+                subscription.set_published_bits(bits);
+
+                updates.push(SubscriptionUpdate::new(subscription.id(), value));
             }
+        }
 
-            subscription.set_published_bits(bits);
-
-            updates.push(SubscriptionUpdate::new(subscription.id(), value));
+        for runtime in self.island_runtimes.iter_mut().flatten() {
+            runtime.mark_observer_outputs_clean();
         }
     }
 
@@ -1094,7 +1124,7 @@ mod tests {
     }
 
     fn observed_voltage_world() -> (Engine, u32, DeviceId, DeviceId, DefinitionObserverId) {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let observed_definition = {
             let mut builder = DeviceDefinitionBuilder::new(engine.definitions());
@@ -1200,8 +1230,52 @@ mod tests {
     }
 
     #[test]
+    fn sleeping_island_does_not_reevaluate_existing_subscription() {
+        let (mut engine, world, observed, _, observer) = observed_voltage_world();
+
+        engine
+            .subscribe_observer(world, observed, observer)
+            .unwrap();
+
+        let component = DeviceComponent::new(observed, DevicePartitionId::new(0));
+
+        let island = engine
+            .world(world)
+            .unwrap()
+            .derived_topology
+            .component_island(component);
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+                .as_ref()
+                .unwrap();
+
+            assert_eq!(runtime.observer_read_count(), 1);
+        }
+
+        assert_eq!(engine.subscription_updates(world).unwrap().len(), 1,);
+
+        engine.tick_world(world).unwrap();
+
+        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+
+        let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(
+            runtime.observer_read_count(),
+            1,
+            "existing subscription on a sleeping island \
+         should not be reevaluated",
+        );
+    }
+
+    #[test]
     fn subscription_ids_are_monotonic_and_not_reused() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let definition = register_observed_conductance(&mut engine);
 
@@ -1232,7 +1306,7 @@ mod tests {
 
     #[test]
     fn subscribing_unknown_definition_observer_is_rejected() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let definition = register_observed_conductance(&mut engine);
 
@@ -1256,7 +1330,7 @@ mod tests {
 
     #[test]
     fn removing_device_destroys_its_subscriptions() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let definition = register_observed_conductance(&mut engine);
 
         let world = engine
@@ -1463,7 +1537,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "live wire is missing from derived nets")]
     fn successful_world_command_checks_derived_topology() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let world_id = engine.new_world(world_config()).unwrap();
 
         let untracked = wire(1);
@@ -1595,7 +1669,7 @@ mod tests {
 
     #[test]
     fn every_world_command_variant_dispatches() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let definitions = DefinitionRegistry::new();
         let world = engine.new_world(world_config()).unwrap();
 
@@ -1698,7 +1772,7 @@ mod tests {
 
     #[test]
     fn command_dispatch_preserves_model_errors() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let world = engine.new_world(world_config()).unwrap();
         let wire = wire(1);
 
@@ -2125,7 +2199,7 @@ mod tests {
 
     #[test]
     fn engine_ticks_configured_world() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         assert_eq!(engine.tick_world(0), Err(EngineTickError::UnknownWorld),);
 
@@ -2235,7 +2309,7 @@ mod tests {
 
     #[test]
     fn engine_tick_reports_missing_device_parameter() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let world_id = engine.new_world(world_config()).unwrap();
         let device = device(1);
@@ -2650,12 +2724,313 @@ mod tests {
 
         assert!((config.timestep() - 0.05).abs() < 1.0e-12);
 
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let world_id = engine.new_world(config).unwrap();
 
         let world = engine.world(world_id).unwrap();
 
         assert_eq!(world.config(), config);
+    }
+
+    #[test]
+    fn new_subscription_on_sleeping_island_publishes_cached_value_once() {
+        let (mut engine, world, observed, _, observer) = observed_voltage_world();
+
+        let component = DeviceComponent::new(observed, DevicePartitionId::new(0));
+
+        let island = engine
+            .world(world)
+            .unwrap()
+            .derived_topology
+            .component_island(component);
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+                .as_ref()
+                .unwrap();
+
+            assert_eq!(runtime.observer_read_count(), 0);
+        }
+
+        let subscription = engine
+            .subscribe_observer(world, observed, observer)
+            .unwrap();
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].value().to_bits(), 5.0f64.to_bits());
+        }
+
+        {
+            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+                .as_ref()
+                .unwrap();
+
+            assert_eq!(runtime.observer_read_count(), 1);
+        }
+
+        engine.tick_world(world).unwrap();
+
+        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+
+        let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(runtime.observer_read_count(), 1);
+    }
+
+    #[test]
+    fn topology_change_recompiles_and_wakes_sleeping_island() {
+        let mut engine = Engine::default();
+
+        let fixed_load = {
+            let definition = {
+                let mut builder = DeviceDefinitionBuilder::new(engine.definitions());
+
+                let positive = builder.add_terminal().unwrap();
+                let negative = builder.add_terminal().unwrap();
+
+                builder
+                    .add_element(Element::new(
+                        PrimitiveElementKind::Conductance.into(),
+                        vec![positive, negative],
+                        vec![ValueRef::Literal(1.0)],
+                    ))
+                    .unwrap();
+
+                builder.build_definition().unwrap()
+            };
+
+            engine.register_definition(definition).unwrap()
+        };
+
+        let world = engine.new_world(world_config()).unwrap();
+
+        let negative = wire(1);
+        let positive = wire(2);
+
+        let source = device(1);
+        let first_load = device(2);
+        let second_load = device(3);
+
+        for wire in [negative, positive] {
+            engine
+                .apply_world_command(world, WorldCommand::AddWire { wire })
+                .unwrap();
+        }
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AddDevice {
+                    device: source,
+                    definition: PrimitiveElementKind::VoltageSource.into(),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AddDevice {
+                    device: first_load,
+                    definition: fixed_load,
+                },
+            )
+            .unwrap();
+
+        for device in [source, first_load] {
+            engine
+                .apply_world_command(
+                    world,
+                    WorldCommand::AttachTerminal {
+                        wire: positive,
+                        device,
+                        terminal: TerminalId::new(0),
+                    },
+                )
+                .unwrap();
+
+            engine
+                .apply_world_command(
+                    world,
+                    WorldCommand::AttachTerminal {
+                        wire: negative,
+                        device,
+                        terminal: TerminalId::new(1),
+                    },
+                )
+                .unwrap();
+        }
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::SetDeviceParameter {
+                    device: source,
+                    parameter: ParameterId::new(0),
+                    value: 5.0,
+                },
+            )
+            .unwrap();
+
+        let subscription = engine
+            .subscribe_observer(world, source, DefinitionObserverId::new(1))
+            .unwrap();
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].value().to_bits(), (-5.0f64).to_bits());
+        }
+
+        engine.tick_world(world).unwrap();
+
+        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AddDevice {
+                    device: second_load,
+                    definition: fixed_load,
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AttachTerminal {
+                    wire: positive,
+                    device: second_load,
+                    terminal: TerminalId::new(0),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AttachTerminal {
+                    wire: negative,
+                    device: second_load,
+                    terminal: TerminalId::new(1),
+                },
+            )
+            .unwrap();
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].value().to_bits(), (-10.0f64).to_bits(),);
+        }
+
+        engine.tick_world(world).unwrap();
+
+        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+    }
+
+    #[test]
+    fn parameter_change_wakes_sleeping_island_and_it_sleeps_again() {
+        let (mut engine, world, observed, source, observer) = observed_voltage_world();
+
+        let component = DeviceComponent::new(observed, DevicePartitionId::new(0));
+
+        let island = engine
+            .world(world)
+            .unwrap()
+            .derived_topology
+            .component_island(component);
+
+        let subscription = engine
+            .subscribe_observer(world, observed, observer)
+            .unwrap();
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].value().to_bits(), 5.0f64.to_bits());
+        }
+
+        {
+            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+                .as_ref()
+                .unwrap();
+
+            assert_eq!(runtime.observer_read_count(), 1);
+        }
+
+        engine.tick_world(world).unwrap();
+
+        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+
+        {
+            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+                .as_ref()
+                .unwrap();
+
+            assert_eq!(runtime.observer_read_count(), 1);
+        }
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::SetDeviceParameter {
+                    device: source,
+                    parameter: ParameterId::new(0),
+                    value: 7.0,
+                },
+            )
+            .unwrap();
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].value().to_bits(), 7.0f64.to_bits());
+        }
+
+        {
+            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+                .as_ref()
+                .unwrap();
+
+            assert_eq!(runtime.observer_read_count(), 2);
+        }
+
+        engine.tick_world(world).unwrap();
+
+        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+
+        let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(runtime.observer_read_count(), 2);
     }
 }

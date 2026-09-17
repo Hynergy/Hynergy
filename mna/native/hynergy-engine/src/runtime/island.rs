@@ -1,7 +1,7 @@
 use crate::compile::definition::DefinitionStateId;
 use crate::compile::island::{
     CompiledIsland, CompiledIslandParts, CompiledObserverOutput, CompiledPartitionInputs,
-    DeviceObserver, DeviceState, IslandNode, IslandStateLayout, IslandUnknownLayout,
+    DeviceObserver, DeviceState, IslandStateLayout,
 };
 use crate::compile::island_ir::CompiledIslandIr;
 use hynergy_ir::ValueWorkspace;
@@ -9,7 +9,14 @@ use hynergy_mna::system::{MnaError, MnaSystem};
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::Network;
 use hynergy_model::parameter::ParameterId;
+
 use thiserror::Error;
+
+#[cfg(test)]
+use {
+    crate::compile::island::{IslandNode, IslandUnknownLayout},
+    std::cell::Cell,
+};
 
 const NONLINEAR_ABSOLUTE_TOLERANCE: f64 = 1.0e-9;
 const NONLINEAR_RELATIVE_TOLERANCE: f64 = 1.0e-6;
@@ -66,7 +73,6 @@ pub(crate) enum IslandRuntimeError {
 pub(crate) struct IslandRuntime {
     system: MnaSystem,
     ir: CompiledIslandIr,
-    unknowns: IslandUnknownLayout,
     states: IslandStateLayout,
     partition_inputs: Box<[CompiledPartitionInputs]>,
     workspace: ValueWorkspace,
@@ -75,13 +81,20 @@ pub(crate) struct IslandRuntime {
     static_initialized: bool,
     matrix_dirty: bool,
     static_inputs_dirty: bool,
-    nonlinear_scratch: Option<Box<NonlinearScratch>>,
     observer_outputs: Box<[CompiledObserverOutput]>,
+    observer_outputs_dirty: bool,
+    sleepable: bool,
+    needs_solve: bool,
+    nonlinear_scratch: Option<Box<NonlinearScratch>>,
 
+    #[cfg(test)]
+    observer_read_count: Cell<usize>,
     #[cfg(test)]
     matrix_stamp_count: usize,
     #[cfg(test)]
     solve_count: usize,
+    #[cfg(test)]
+    unknowns: IslandUnknownLayout,
 }
 
 impl IslandRuntime {
@@ -92,6 +105,7 @@ impl IslandRuntime {
         let CompiledIslandParts {
             pattern,
             ir,
+            #[cfg(test)]
             unknowns,
             states,
             partition_inputs,
@@ -115,28 +129,43 @@ impl IslandRuntime {
             ))
         });
 
+        let sleepable = ir.timestep_input().is_none()
+            && ir.state_inputs().is_empty()
+            && ir.state_transition().is_empty();
+
         Ok(Self {
             system,
             ir,
-            unknowns,
             states,
             partition_inputs,
             observer_outputs,
+            observer_outputs_dirty: false,
             workspace,
             solution: vec![0.0; dimension].into_boxed_slice(),
             solution_valid: false,
             static_initialized: false,
             matrix_dirty: true,
             static_inputs_dirty: true,
+            sleepable,
+            needs_solve: true,
             nonlinear_scratch,
+
+            #[cfg(test)]
+            observer_read_count: Cell::new(0),
             #[cfg(test)]
             matrix_stamp_count: 0,
             #[cfg(test)]
             solve_count: 0,
+            #[cfg(test)]
+            unknowns,
         })
     }
 
     pub(crate) fn observer_value(&self, observer: DeviceObserver) -> Option<f64> {
+        #[cfg(test)]
+        self.observer_read_count
+            .set(self.observer_read_count.get() + 1);
+
         if !self.solution_valid {
             return None;
         }
@@ -298,6 +327,15 @@ impl IslandRuntime {
     where
         F: FnMut(DeviceState) -> Option<f64>,
     {
+        if self.sleepable && !self.needs_solve {
+            debug_assert!(
+                self.solution_valid,
+                "sleeping island must retain a valid solution",
+            );
+
+            return Ok(Vec::new());
+        }
+
         self.solution_valid = false;
 
         self.prepare_static(network)?;
@@ -352,6 +390,12 @@ impl IslandRuntime {
                 .expect("compiled state write must have a physical state");
 
             writes.push(StagedStateWrite::new(state, next_state[slot.index()]));
+        }
+
+        self.observer_outputs_dirty = true;
+
+        if self.sleepable {
+            self.needs_solve = false;
         }
 
         Ok(writes)
@@ -418,21 +462,10 @@ impl IslandRuntime {
         Ok(())
     }
 
-    pub(crate) fn node_voltage(&self, node: IslandNode) -> Option<f64> {
-        if !self.solution_valid {
-            return None;
-        }
-
-        Some(match self.unknowns.node_unknown(node) {
-            None => 0.0,
-
-            Some(unknown) => self.solution[unknown.index()],
-        })
-    }
-
     #[inline]
     pub(crate) fn mark_numerical_dirty(&mut self) {
         self.static_inputs_dirty = true;
+        self.needs_solve = true;
     }
 
     #[inline]
@@ -446,16 +479,45 @@ impl IslandRuntime {
         )
     }
 
-    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn observer_outputs_dirty(&self) -> bool {
+        self.observer_outputs_dirty
+    }
+
+    #[inline]
+    pub(crate) fn mark_observer_outputs_clean(&mut self) {
+        self.observer_outputs_dirty = false;
+    }
+}
+
+#[cfg(test)]
+impl IslandRuntime {
+    #[inline]
+    pub(crate) fn observer_read_count(&self) -> usize {
+        self.observer_read_count.get()
+    }
+
     #[inline]
     fn matrix_stamp_count(&self) -> usize {
         self.matrix_stamp_count
     }
 
-    #[cfg(test)]
     #[inline]
     fn solve_count(&self) -> usize {
         self.solve_count
+    }
+
+    #[inline]
+    pub(crate) fn node_voltage(&self, node: IslandNode) -> Option<f64> {
+        if !self.solution_valid {
+            return None;
+        }
+
+        Some(match self.unknowns.node_unknown(node) {
+            None => 0.0,
+
+            Some(unknown) => self.solution[unknown.index()],
+        })
     }
 }
 
@@ -640,6 +702,95 @@ mod test {
     }
 
     #[test]
+    fn nonlinear_island_reuses_previous_solution_after_invalidation() {
+        let (network, mut compiled) = voltage_source_island();
+
+        compiled.force_nonlinear_iteration_for_test(false);
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 2);
+
+        runtime.mark_numerical_dirty();
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            3,
+            "woken nonlinear island should reuse its previous solution as its initial guess",
+        );
+    }
+
+    #[test]
+    fn clean_stateless_island_sleeps_after_first_solve() {
+        let (network, compiled) = voltage_source_island();
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 1);
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            1,
+            "clean stateless island should reuse its previous solution",
+        );
+    }
+
+    #[test]
+    fn numerical_invalidation_wakes_sleeping_island() {
+        let (network, compiled) = voltage_source_island();
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 1);
+
+        runtime.mark_numerical_dirty();
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            2,
+            "numerical invalidation must wake a sleeping island",
+        );
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            2,
+            "island should sleep again after the wake-up solve",
+        );
+    }
+
+    #[test]
+    fn sleeping_island_keeps_cached_observer_values_available() {
+        let (network, compiled) = voltage_source_island();
+        let source = DeviceId::try_from(1).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        let observer = DeviceObserver::new(source, DefinitionObserverId::new(0));
+        let first = runtime.observer_value(observer).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(runtime.solve_count(), 1);
+        assert_eq!(runtime.observer_value(observer), Some(first));
+        assert!((first - 5.0).abs() < 1.0e-12);
+    }
+
+    #[test]
     fn linear_island_solves_once() {
         let (network, compiled) = voltage_source_island();
 
@@ -676,23 +827,6 @@ mod test {
 
         assert_eq!(runtime.solve_count(), 2);
         assert_eq!(runtime.matrix_stamp_count(), 2);
-    }
-
-    #[test]
-    fn nonlinear_island_reuses_previous_solution_as_guess() {
-        let (network, mut compiled) = voltage_source_island();
-
-        compiled.force_nonlinear_iteration_for_test(false);
-
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
-
-        runtime.solve_tick(&network, |_| None).unwrap();
-
-        assert_eq!(runtime.solve_count(), 2);
-
-        runtime.solve_tick(&network, |_| None).unwrap();
-
-        assert_eq!(runtime.solve_count(), 3);
     }
 
     #[test]
@@ -763,6 +897,82 @@ mod test {
             - runtime.node_voltage(negative_node).unwrap();
 
         assert!((voltage - 5.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn stateful_island_does_not_sleep_between_ticks() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let a = WireId::try_from(1).unwrap();
+        let b = WireId::try_from(2).unwrap();
+
+        let conductance = DeviceId::try_from(1).unwrap();
+        let capacitor = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(a).unwrap();
+        network.add_wire(b).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                conductance,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                capacitor,
+                PrimitiveElementKind::Capacitor.into(),
+            )
+            .unwrap();
+
+        for device in [conductance, capacitor] {
+            network
+                .attach_terminal(a, device, TerminalId::new(0))
+                .unwrap();
+
+            network
+                .attach_terminal(b, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, capacitor, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island =
+            topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled, 0.5).unwrap();
+
+        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+
+        runtime
+            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
+            .unwrap();
+
+        assert_eq!(runtime.solve_count(), 1);
+
+        runtime
+            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
+            .unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            2,
+            "state-dependent islands must remain awake",
+        );
     }
 
     #[test]

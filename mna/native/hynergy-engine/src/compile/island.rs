@@ -31,11 +31,6 @@ impl DeviceObserver {
     pub(crate) const fn device(self) -> DeviceId {
         self.device
     }
-
-    #[inline]
-    pub(crate) const fn observer(self) -> DefinitionObserverId {
-        self.observer
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -299,20 +294,22 @@ pub(crate) enum IslandCompileError {
 pub(crate) struct CompiledIsland {
     pattern: MnaPattern,
     ir: CompiledIslandIr,
-    unknowns: IslandUnknownLayout,
     states: IslandStateLayout,
     partition_inputs: Box<[CompiledPartitionInputs]>,
     observer_outputs: Box<[CompiledObserverOutput]>,
+    #[cfg(test)]
+    unknowns: IslandUnknownLayout,
 }
 
 #[derive(Debug)]
 pub(crate) struct CompiledIslandParts {
     pub(crate) pattern: MnaPattern,
     pub(crate) ir: CompiledIslandIr,
-    pub(crate) unknowns: IslandUnknownLayout,
     pub(crate) states: IslandStateLayout,
     pub(crate) partition_inputs: Box<[CompiledPartitionInputs]>,
     pub(crate) observer_outputs: Box<[CompiledObserverOutput]>,
+    #[cfg(test)]
+    pub(crate) unknowns: IslandUnknownLayout,
 }
 
 impl CompiledIsland {
@@ -321,6 +318,7 @@ impl CompiledIsland {
         CompiledIslandParts {
             pattern: self.pattern,
             ir: self.ir,
+            #[cfg(test)]
             unknowns: self.unknowns,
             states: self.states,
             partition_inputs: self.partition_inputs,
@@ -354,10 +352,6 @@ impl CompiledIsland {
     #[inline]
     pub(crate) fn force_nonlinear_iteration_for_test(&mut self, affects_matrix: bool) {
         self.ir.force_nonlinear_iteration_for_test(affects_matrix);
-    }
-    #[inline]
-    pub(crate) fn observer_outputs(&self) -> &[CompiledObserverOutput] {
-        &self.observer_outputs
     }
 }
 
@@ -448,6 +442,7 @@ pub(crate) fn compile_island_parts(
     Ok(CompiledIsland {
         pattern,
         ir,
+        #[cfg(test)]
         unknowns: unknown_layout,
         states: state_layout,
         partition_inputs: partition_inputs.into_boxed_slice(),

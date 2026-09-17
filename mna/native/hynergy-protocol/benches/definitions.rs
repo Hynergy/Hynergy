@@ -140,7 +140,7 @@ fn bench_definition_shape(c: &mut Criterion, name: &str, builder: fn(usize) -> (
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter_batched_ref(
-                Engine::new,
+                Engine::default,
                 |engine| {
                     let id = register_definition_buffer(engine, &buffer).unwrap();
 

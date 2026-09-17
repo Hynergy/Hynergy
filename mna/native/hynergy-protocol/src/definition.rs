@@ -755,7 +755,7 @@ mod tests {
         command_index: u32,
         byte_offset: u32,
     ) {
-        let error = register_definition_buffer(&mut Engine::new(), bytes).unwrap_err();
+        let error = register_definition_buffer(&mut Engine::default(), bytes).unwrap_err();
 
         assert_eq!(error.kind(), kind);
         assert_eq!(error.command_index(), command_index);
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn voltage_observer_command_registers_observer() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let commands = [
             command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn child_observer_command_registers_forwarded_observer() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let child_commands = [
             command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn empty_definition_registers() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let definition_id =
             register_definition_buffer(&mut engine, &definition_buffer(&[])).unwrap();
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn complete_definition_registers_expected_contents() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let lower = Bound {
             value: 1.0,
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn failed_buffer_does_not_register_definition() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let bytes = definition_buffer(&[
             command(DEFINITION_COMMAND_ADD_TERMINAL, &[]),

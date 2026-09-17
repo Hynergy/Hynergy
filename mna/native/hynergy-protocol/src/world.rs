@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn empty_buffer_succeeds() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         let world = engine.new_world(world_config()).unwrap();
 
@@ -565,7 +565,7 @@ mod tests {
 
         for length in [0, 1, 3, 5, 7, 11, 15] {
             assert_error(
-                &mut Engine::new(),
+                &mut Engine::default(),
                 0,
                 &bytes[..length],
                 WorldCommandErrorKind::TruncatedInput,
@@ -601,13 +601,13 @@ mod tests {
             (invalid_flags, WorldCommandErrorKind::InvalidFlags, 6),
             (invalid_reserved, WorldCommandErrorKind::InvalidReserved, 8),
         ] {
-            assert_error(&mut Engine::new(), 0, &bytes, kind, u32::MAX, offset);
+            assert_error(&mut Engine::default(), 0, &bytes, kind, u32::MAX, offset);
         }
     }
 
     #[test]
     fn unknown_world_is_reported_before_commands() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
 
         assert_error(
             &mut engine,
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn truncated_command_frame_reports_command_index() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let world = engine.new_world(world_config()).unwrap();
 
         let mut bytes = buffer(&[]);
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn truncated_payload_reports_input_end() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let world = engine.new_world(world_config()).unwrap();
 
         let bytes = buffer(&[framed_command(WORLD_COMMAND_ADD_WIRE, 4, &[1, 0])]);
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn unknown_command_is_rejected_at_command_start() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let world = engine.new_world(world_config()).unwrap();
 
         assert_error(
@@ -686,7 +686,7 @@ mod tests {
         for (tag, expected_length) in cases {
             assert_eq!(expected_world_payload_length(tag), Some(expected_length));
 
-            let mut engine = Engine::new();
+            let mut engine = Engine::default();
             let world = engine.new_world(world_config()).unwrap();
 
             let payload = vec![0; expected_length - 1];
@@ -713,7 +713,7 @@ mod tests {
         ];
 
         for (tag, payload, offset) in cases {
-            let mut engine = Engine::new();
+            let mut engine = Engine::default();
             let world = engine.new_world(world_config()).unwrap();
 
             assert_error(
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let mut engine = Engine::new();
+        let mut engine = Engine::default();
         let world = engine.new_world(world_config()).unwrap();
         let mut bytes = buffer(&[]);
         bytes.push(0);
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn earlier_commands_remain_applied_after_later_failure() {
         {
-            let mut engine = Engine::new();
+            let mut engine = Engine::default();
             let world = engine.new_world(world_config()).unwrap();
 
             let first = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));
@@ -772,7 +772,7 @@ mod tests {
         }
 
         {
-            let mut engine = Engine::new();
+            let mut engine = Engine::default();
             let world = engine.new_world(world_config()).unwrap();
 
             let add = command(WORLD_COMMAND_ADD_WIRE, &u32_payload(&[1]));

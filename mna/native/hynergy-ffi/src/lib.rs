@@ -1,5 +1,6 @@
 use hynergy_engine::{
-    Engine, EngineTickError, SubscriptionError, SubscriptionId, WorldConfig, WorldManagementError,
+    Engine, EngineConfig, EngineTickError, SubscriptionError, SubscriptionId, WorldConfig,
+    WorldManagementError,
 };
 use hynergy_model::device::definition::{DefinitionObserverId, DeviceId};
 use hynergy_protocol::{
@@ -99,8 +100,8 @@ pub extern "C" fn hynergy_abi_version() -> u32 {
 /// The returned pointer owns the engine. The caller must pass the pointer to
 /// [`hynergy_engine_destroy`] when the engine is no longer necessary.
 #[unsafe(no_mangle)]
-pub extern "C" fn hynergy_engine_create() -> *mut Engine {
-    Box::into_raw(Box::new(Engine::new()))
+pub extern "C" fn hynergy_engine_create(max_worker_threads: usize) -> *mut Engine {
+    Box::into_raw(Box::new(Engine::new(EngineConfig::new(max_worker_threads))))
 }
 
 /// Destroys an engine and all resources that it owns.
@@ -1058,7 +1059,7 @@ mod tests {
         const ATTACH_TERMINAL: u16 = 7;
         const SET_DEVICE_PARAMETER: u16 = 9;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine).world_id;
 
         let conductance = 1;
@@ -1145,7 +1146,7 @@ mod tests {
         const ATTACH_TERMINAL: u16 = 7;
         const SET_DEVICE_PARAMETER: u16 = 9;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine).world_id;
 
         let reference = 1;
@@ -1256,7 +1257,7 @@ mod tests {
         const ATTACH_TERMINAL: u16 = 7;
         const SET_DEVICE_PARAMETER: u16 = 9;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine).world_id;
 
         let input_negative = 1;
@@ -1409,7 +1410,7 @@ mod tests {
 
         const VOLTAGE_CONTROLLED_SWITCH: u32 = 9;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let mut commands = vec![
             definition_command(ADD_TERMINAL, &[]),
@@ -1464,7 +1465,7 @@ mod tests {
         const ADD_TERMINAL: u16 = 1;
         const ADD_NODE: u16 = 2;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let commands = vec![
             definition_command(ADD_TERMINAL, &[]),
@@ -1907,7 +1908,7 @@ mod tests {
 
     #[test]
     fn observer_subscription_lifecycle_is_exposed_through_ffi() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
 
@@ -1957,7 +1958,7 @@ mod tests {
 
     #[test]
     fn observer_subscription_validates_device_and_observer() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
 
@@ -1998,7 +1999,7 @@ mod tests {
 
     #[test]
     fn subscription_ffi_rejects_invalid_raw_ids() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let world = create_world(engine).world_id;
 
@@ -2029,7 +2030,7 @@ mod tests {
 
     #[test]
     fn subscribe_rejects_null_result_without_subscribing() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
 
@@ -2056,7 +2057,7 @@ mod tests {
 
     #[test]
     fn tick_writes_subscription_updates_to_caller_buffer() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
 
@@ -2130,7 +2131,7 @@ mod tests {
     fn tick_publishes_changed_subscription_value() {
         const SET_DEVICE_PARAMETER: u16 = 9;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let (world, observed, source) = create_observed_voltage_world(engine, 5.0);
         let subscription = subscribe_first_observer(engine, world, observed);
 
@@ -2187,7 +2188,7 @@ mod tests {
 
     #[test]
     fn tick_rejects_null_output_before_executing() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
         let subscription = subscribe_first_observer(engine, world, observed);
 
@@ -2221,7 +2222,7 @@ mod tests {
 
     #[test]
     fn tick_allows_null_output_when_no_subscriptions_exist() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let (world, _, _) = create_observed_voltage_world(engine, 5.0);
 
         let mut result = tick_result_sentinel();
@@ -2250,7 +2251,7 @@ mod tests {
 
     #[test]
     fn unsubscribe_reduces_tick_required_capacity() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
 
@@ -2298,7 +2299,7 @@ mod tests {
     fn removing_device_removes_dependent_subscription_from_tick_capacity() {
         const REMOVE_DEVICE: u16 = 6;
 
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
         let subscription = subscribe_first_observer(engine, world, observed);
 
@@ -2368,7 +2369,7 @@ mod tests {
 
     #[test]
     fn engine_lifecycle_accepts_created_and_null_engines() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         assert!(!engine.is_null());
 
@@ -2380,7 +2381,7 @@ mod tests {
 
     #[test]
     fn definition_registration_returns_assigned_ids() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let bytes = definition_buffer();
 
         let mut first = definition_result_sentinel();
@@ -2423,7 +2424,7 @@ mod tests {
 
     #[test]
     fn definition_registration_maps_protocol_errors() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let mut bytes = definition_buffer();
         bytes[0] = b'X';
 
@@ -2449,7 +2450,7 @@ mod tests {
 
     #[test]
     fn definition_registration_rejects_null_result_without_processing() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let bytes = definition_buffer();
 
         assert_eq!(
@@ -2490,7 +2491,7 @@ mod tests {
 
     #[test]
     fn definition_registration_reports_null_input() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let mut result = definition_result_sentinel();
 
         let code =
@@ -2514,7 +2515,7 @@ mod tests {
 
     #[test]
     fn create_world_rejects_null_result_without_creating_world() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         assert_eq!(
             unsafe { hynergy_engine_create_world(engine, 30, std::ptr::null_mut(),) },
@@ -2548,7 +2549,7 @@ mod tests {
 
     #[test]
     fn world_lifecycle_is_exposed_through_ffi() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
 
         let first = create_world(engine);
         let second = create_world(engine);
@@ -2584,7 +2585,7 @@ mod tests {
 
     #[test]
     fn apply_commands_rejects_null_result_without_applying() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine);
 
         let bytes = world_buffer(&[world_command(1, &u32_payload(&[1]))]);
@@ -2627,7 +2628,7 @@ mod tests {
 
     #[test]
     fn apply_commands_reports_null_input_without_applying() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine);
         let mut result = command_result_sentinel();
 
@@ -2653,7 +2654,7 @@ mod tests {
 
     #[test]
     fn command_buffer_applies_mutation_through_ffi() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine);
 
         let add = world_buffer(&[world_command(1, &u32_payload(&[1]))]);
@@ -2690,7 +2691,7 @@ mod tests {
 
     #[test]
     fn protocol_error_is_mapped_through_ffi() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine);
 
         let mut bytes = world_buffer(&[]);
@@ -2718,7 +2719,7 @@ mod tests {
 
     #[test]
     fn invalid_command_length_is_mapped_through_ffi() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine);
 
         let bytes = world_buffer(&[world_command(1, &[1, 0])]);
@@ -2745,7 +2746,7 @@ mod tests {
 
     #[test]
     fn unknown_world_is_mapped_through_ffi() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let bytes = world_buffer(&[]);
         let mut result = command_result_sentinel();
 
@@ -2769,7 +2770,7 @@ mod tests {
 
     #[test]
     fn command_failure_preserves_location_and_prior_mutations() {
-        let engine = hynergy_engine_create();
+        let engine = hynergy_engine_create(1);
         let world = create_world(engine);
 
         let add = world_command(1, &u32_payload(&[1]));
