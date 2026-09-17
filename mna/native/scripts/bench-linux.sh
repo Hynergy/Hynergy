@@ -375,7 +375,8 @@ if [[ "$MODE" == "profile" ]]; then
             -- \
             "$PROFILE_CASE" \
             --exact \
-            --profile-time "$PROFILE_SECONDS"
+            --profile-time "$PROFILE_SECONDS" \
+            --bench
 
     echo "Flamegraph: ${PROFILE_OUTPUT}"
     exit 0
