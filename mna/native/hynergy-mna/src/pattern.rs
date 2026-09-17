@@ -194,13 +194,13 @@ impl MnaPattern {
         Some(MatrixSlot::from_index(start + relative))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn column_ptrs(&self) -> &[u32] {
         &self.column_ptrs
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn row_indices(&self) -> &[u32] {
         &self.row_indices

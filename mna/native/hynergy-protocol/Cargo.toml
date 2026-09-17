@@ -9,4 +9,3 @@ hynergy-model = { path = "../hynergy-model" }
 
 [dev-dependencies]
 hynergy-ffi = { path = "../hynergy-ffi" }
-criterion = "0.8.2"

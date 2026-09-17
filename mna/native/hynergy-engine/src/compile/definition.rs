@@ -353,6 +353,40 @@ fn compile_primitive(
             builder.output(current)?;
         }
 
+        PrimitiveElementKind::Diode => {
+            let anode = builder.terminal_voltage()?;
+            let cathode = builder.terminal_voltage()?;
+
+            let g_max = builder.parameter()?;
+            let g_min = builder.parameter()?;
+
+            let voltage = voltage_difference(&mut builder, anode, cathode)?;
+            let zero = builder.constant(0.0)?;
+            let one = builder.constant(1.0)?;
+
+            let reverse_or_zero = builder.less_equal(voltage, zero)?;
+            let forward = builder.sub(one, reverse_or_zero)?;
+
+            builder.require_iteration_stability(forward);
+
+            let conductance = switched_conductance(&mut builder, forward, g_min, g_max)?;
+
+            stamp_conductance(&mut builder, anode, cathode, conductance);
+
+            let current = builder.mul(conductance, voltage)?;
+
+            builder.output(voltage)?;
+            builder.output(current)?;
+        }
+
+        PrimitiveElementKind::Not
+        | PrimitiveElementKind::And2
+        | PrimitiveElementKind::Nand2
+        | PrimitiveElementKind::Or2
+        | PrimitiveElementKind::Nor2 => {
+            compile_logic_gate(&mut builder, kind)?;
+        }
+
         PrimitiveElementKind::Resistance => {
             let positive = builder.terminal_voltage()?;
             let negative = builder.terminal_voltage()?;
@@ -669,8 +703,9 @@ fn compile_composite_partition(
         let node = definition.terminals()[terminal.index()];
         let unknown = builder.terminal_voltage()?;
 
+        let previous = node_unknowns[node.index()].replace(unknown);
         debug_assert!(
-            node_unknowns[node.index()].replace(unknown).is_none(),
+            previous.is_none(),
             "composite terminal nodes must be unique",
         );
     }
@@ -858,10 +893,9 @@ fn compile_composite_partition(
                         continue;
                     }
 
+                    let previous = forwarded_observer_values[parent_index].replace(output);
                     debug_assert!(
-                        forwarded_observer_values[parent_index]
-                            .replace(output)
-                            .is_none(),
+                        previous.is_none(),
                         "forwarded observer must have exactly one child output",
                     );
                 }
@@ -947,6 +981,120 @@ fn stamp_conductance(
     builder.add_matrix(b, a, conductance, -1.0);
     builder.add_matrix(a, b, conductance, -1.0);
     builder.add_matrix(b, b, conductance, 1.0);
+}
+
+#[inline]
+fn switched_conductance(
+    builder: &mut DefinitionTemplateBuilder,
+    mode: LocalValueId,
+    g_min: LocalValueId,
+    g_max: LocalValueId,
+) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+    let conductance_range = builder.sub(g_max, g_min)?;
+    let mode_conductance = builder.mul(mode, conductance_range)?;
+
+    builder.add(g_min, mode_conductance)
+}
+
+fn compile_logic_gate(
+    builder: &mut DefinitionTemplateBuilder,
+    kind: PrimitiveElementKind,
+) -> Result<(), DefinitionTemplateBuildError> {
+    let output = builder.terminal_voltage()?;
+    let vdd = builder.terminal_voltage()?;
+    let vss = builder.terminal_voltage()?;
+    let input_a = builder.terminal_voltage()?;
+
+    let input_b = match kind {
+        PrimitiveElementKind::Not => None,
+        PrimitiveElementKind::And2
+        | PrimitiveElementKind::Nand2
+        | PrimitiveElementKind::Or2
+        | PrimitiveElementKind::Nor2 => Some(builder.terminal_voltage()?),
+        _ => unreachable!("compile_logic_gate called for a non-logic primitive"),
+    };
+
+    let threshold = builder.parameter()?;
+    let g_max = builder.parameter()?;
+    let g_min = builder.parameter()?;
+
+    let one = builder.constant(1.0)?;
+
+    let input_a_voltage = voltage_difference(builder, input_a, vss)?;
+    let input_a_high = builder.less_equal(threshold, input_a_voltage)?;
+
+    let (input_b_voltage, input_b_high) = if let Some(input_b) = input_b {
+        let voltage = voltage_difference(builder, input_b, vss)?;
+        let high = builder.less_equal(threshold, voltage)?;
+
+        (Some(voltage), Some(high))
+    } else {
+        (None, None)
+    };
+
+    let output_high = match kind {
+        PrimitiveElementKind::Not => builder.sub(one, input_a_high)?,
+
+        PrimitiveElementKind::And2 => builder.mul(
+            input_a_high,
+            input_b_high.expect("binary gate must have input B"),
+        )?,
+
+        PrimitiveElementKind::Nand2 => {
+            let both = builder.mul(
+                input_a_high,
+                input_b_high.expect("binary gate must have input B"),
+            )?;
+
+            builder.sub(one, both)?
+        }
+
+        PrimitiveElementKind::Or2 => {
+            let input_b_high = input_b_high.expect("binary gate must have input B");
+            let either_sum = builder.add(input_a_high, input_b_high)?;
+            let both = builder.mul(input_a_high, input_b_high)?;
+
+            builder.sub(either_sum, both)?
+        }
+
+        PrimitiveElementKind::Nor2 => {
+            let input_b_high = input_b_high.expect("binary gate must have input B");
+            let input_a_low = builder.sub(one, input_a_high)?;
+            let input_b_low = builder.sub(one, input_b_high)?;
+
+            builder.mul(input_a_low, input_b_low)?
+        }
+
+        _ => unreachable!("compile_logic_gate called for a non-logic primitive"),
+    };
+
+    builder.require_iteration_stability(output_high);
+
+    // Complementary finite-conductance output stage:
+    // HIGH -> pull-up = G_max, pull-down = G_min
+    // LOW  -> pull-up = G_min, pull-down = G_max
+    let conductance_range = builder.sub(g_max, g_min)?;
+    let high_delta = builder.mul(output_high, conductance_range)?;
+    let pull_up = builder.add(g_min, high_delta)?;
+    let pull_down = builder.sub(g_max, high_delta)?;
+
+    stamp_conductance(builder, vdd, output, pull_up);
+    stamp_conductance(builder, output, vss, pull_down);
+
+    let output_voltage = voltage_difference(builder, output, vss)?;
+    let supply_branch_voltage = voltage_difference(builder, vdd, output)?;
+    let supply_current = builder.mul(pull_up, supply_branch_voltage)?;
+
+    builder.output(output_voltage)?;
+    builder.output(input_a_voltage)?;
+
+    if let Some(input_b_voltage) = input_b_voltage {
+        builder.output(input_b_voltage)?;
+    }
+
+    builder.output(supply_current)?;
+
+    Ok(())
 }
 
 #[inline]
@@ -1160,9 +1308,7 @@ fn stamp_voltage_controlled_switch(
     builder.update_iteration_latch(mode, next_mode);
     builder.require_iteration_stability(next_mode);
 
-    let conductance_range = builder.sub(g_max, g_min)?;
-    let mode_conductance = builder.mul(next_mode, conductance_range)?;
-    let conductance = builder.add(g_min, mode_conductance)?;
+    let conductance = switched_conductance(builder, next_mode, g_min, g_max)?;
 
     stamp_conductance(builder, output_positive, output_negative, conductance);
 
@@ -1305,6 +1451,7 @@ mod tests {
             PrimitiveElementKind::CurrentSource,
             PrimitiveElementKind::Capacitor,
             PrimitiveElementKind::Inductor,
+            PrimitiveElementKind::Diode,
         ] {
             assert_compiled_primitive_observers(kind, &[&[0, 1]]);
         }
@@ -1314,11 +1461,46 @@ mod tests {
             PrimitiveElementKind::VoltageControlledVoltageSource,
             PrimitiveElementKind::VoltageControlledSwitch,
             PrimitiveElementKind::VoltageControlledConductance,
+            PrimitiveElementKind::Not,
         ] {
             assert_compiled_primitive_observers(kind, &[&[0, 1, 2]]);
         }
 
+        for kind in [
+            PrimitiveElementKind::And2,
+            PrimitiveElementKind::Nand2,
+            PrimitiveElementKind::Or2,
+            PrimitiveElementKind::Nor2,
+        ] {
+            assert_compiled_primitive_observers(kind, &[&[0, 1, 2, 3]]);
+        }
+
         assert_compiled_primitive_observers(PrimitiveElementKind::TickDelay, &[&[0], &[1, 2]]);
+    }
+
+    #[test]
+    fn logic_gate_templates_are_stateless_and_need_no_auxiliary_unknowns() {
+        for kind in [
+            PrimitiveElementKind::Not,
+            PrimitiveElementKind::And2,
+            PrimitiveElementKind::Nand2,
+            PrimitiveElementKind::Or2,
+            PrimitiveElementKind::Nor2,
+        ] {
+            let gate = template(kind);
+
+            assert_eq!(
+                gate.terminal_count(),
+                if kind == PrimitiveElementKind::Not {
+                    4
+                } else {
+                    5
+                },
+            );
+            assert_eq!(gate.allocated_unknown_count(), 0, "{kind:?}");
+            assert_eq!(gate.parameter_count(), 3, "{kind:?}");
+            assert_eq!(gate.state_count(), 0, "{kind:?}");
+        }
     }
 
     #[test]

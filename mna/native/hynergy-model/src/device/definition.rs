@@ -82,6 +82,12 @@ pub enum PrimitiveElementKind {
     VoltageControlledSwitch = 8,
     VoltageControlledConductance = 9,
     TickDelay = 10,
+    Diode = 11,
+    Not = 12,
+    And2 = 13,
+    Nand2 = 14,
+    Or2 = 15,
+    Nor2 = 16,
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +106,7 @@ pub enum PrimitiveParameterError {
 }
 
 impl PrimitiveElementKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 17] = [
         Self::Resistance,
         Self::Conductance,
         Self::VoltageSource,
@@ -112,6 +118,12 @@ impl PrimitiveElementKind {
         Self::VoltageControlledSwitch,
         Self::VoltageControlledConductance,
         Self::TickDelay,
+        Self::Diode,
+        Self::Not,
+        Self::And2,
+        Self::Nand2,
+        Self::Or2,
+        Self::Nor2,
     ];
 
     pub const COUNT: u32 = Self::ALL.len() as u32;
@@ -129,6 +141,8 @@ impl PrimitiveElementKind {
             Self::VoltageControlledSwitch => 4,
             Self::VoltageControlledConductance => 4,
             Self::TickDelay => 1,
+            Self::Diode => 2,
+            Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => 3,
         }
     }
 
@@ -164,7 +178,17 @@ impl PrimitiveElementKind {
             | Self::VoltageSource
             | Self::CurrentSource
             | Self::Capacitor
-            | Self::Inductor => vec![voltage(0, 1, p0), current(0, 1, p0)],
+            | Self::Inductor
+            | Self::Diode => vec![voltage(0, 1, p0), current(0, 1, p0)],
+
+            Self::Not => vec![voltage(0, 2, p0), voltage(3, 2, p0), current(1, 0, p0)],
+
+            Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => vec![
+                voltage(0, 2, p0),
+                voltage(3, 2, p0),
+                voltage(4, 2, p0),
+                current(1, 0, p0),
+            ],
 
             Self::VoltageControlledCurrentSource
             | Self::VoltageControlledVoltageSource
@@ -252,6 +276,19 @@ impl PrimitiveElementKind {
                     .copied()
             }
 
+            Self::Diode => {
+                // 0: G_max
+                // 1: G_min
+                [positive, non_negative].get(index).copied()
+            }
+
+            Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => {
+                // 0: threshold relative to VSS
+                // 1: G_max
+                // 2: G_min
+                [unrestricted, positive, non_negative].get(index).copied()
+            }
+
             Self::TickDelay => {
                 // initial output
                 [unrestricted].get(index).copied()
@@ -266,7 +303,18 @@ impl PrimitiveElementKind {
             | Self::VoltageSource
             | Self::CurrentSource
             | Self::Capacitor
-            | Self::Inductor => (smallvec![0.into(), 1.into()], smallvec![0.into(), 0.into()]),
+            | Self::Inductor
+            | Self::Diode => (smallvec![0.into(), 1.into()], smallvec![0.into(), 0.into()]),
+
+            Self::Not => (
+                smallvec![0.into(), 1.into(), 2.into(), 3.into()],
+                smallvec![0.into(), 0.into(), 0.into(), 0.into()],
+            ),
+
+            Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => (
+                smallvec![0.into(), 1.into(), 2.into(), 3.into(), 4.into()],
+                smallvec![0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+            ),
 
             Self::VoltageControlledCurrentSource
             | Self::VoltageControlledVoltageSource
@@ -366,6 +414,22 @@ impl PrimitiveElementKind {
             Self::VoltageControlledConductance if parameters[3] <= parameters[2] => {
                 return Err(PrimitiveParameterError::ParameterMustBeGreater {
                     greater: 3,
+                    lesser: 2,
+                });
+            }
+
+            Self::Diode if parameters[0] <= parameters[1] => {
+                return Err(PrimitiveParameterError::ParameterMustBeGreater {
+                    greater: 0,
+                    lesser: 1,
+                });
+            }
+
+            Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2
+                if parameters[1] <= parameters[2] =>
+            {
+                return Err(PrimitiveParameterError::ParameterMustBeGreater {
+                    greater: 1,
                     lesser: 2,
                 });
             }
@@ -672,6 +736,7 @@ mod tests {
             PrimitiveElementKind::CurrentSource,
             PrimitiveElementKind::Capacitor,
             PrimitiveElementKind::Inductor,
+            PrimitiveElementKind::Diode,
         ] {
             assert_primitive_observers(
                 kind,
@@ -717,6 +782,79 @@ mod tests {
                 (ObserverQuantity::Current, p0, output_current),
             ],
         );
+
+        assert_primitive_observers(
+            PrimitiveElementKind::Not,
+            &[
+                (
+                    ObserverQuantity::Voltage,
+                    p0,
+                    DefinitionObserverSource::Voltage {
+                        positive: NodeId::new(0),
+                        negative: NodeId::new(2),
+                    },
+                ),
+                (
+                    ObserverQuantity::Voltage,
+                    p0,
+                    DefinitionObserverSource::Voltage {
+                        positive: NodeId::new(3),
+                        negative: NodeId::new(2),
+                    },
+                ),
+                (
+                    ObserverQuantity::Current,
+                    p0,
+                    DefinitionObserverSource::Current {
+                        positive: NodeId::new(1),
+                        negative: NodeId::new(0),
+                    },
+                ),
+            ],
+        );
+
+        let input_b_voltage = DefinitionObserverSource::Voltage {
+            positive: NodeId::new(4),
+            negative: NodeId::new(2),
+        };
+
+        for kind in [
+            PrimitiveElementKind::And2,
+            PrimitiveElementKind::Nand2,
+            PrimitiveElementKind::Or2,
+            PrimitiveElementKind::Nor2,
+        ] {
+            assert_primitive_observers(
+                kind,
+                &[
+                    (
+                        ObserverQuantity::Voltage,
+                        p0,
+                        DefinitionObserverSource::Voltage {
+                            positive: NodeId::new(0),
+                            negative: NodeId::new(2),
+                        },
+                    ),
+                    (
+                        ObserverQuantity::Voltage,
+                        p0,
+                        DefinitionObserverSource::Voltage {
+                            positive: NodeId::new(3),
+                            negative: NodeId::new(2),
+                        },
+                    ),
+                    (ObserverQuantity::Voltage, p0, input_b_voltage),
+                    (
+                        ObserverQuantity::Current,
+                        p0,
+                        DefinitionObserverSource::Current {
+                            positive: NodeId::new(1),
+                            negative: NodeId::new(0),
+                        },
+                    ),
+                ],
+            );
+        }
 
         assert_primitive_observers(
             PrimitiveElementKind::TickDelay,
@@ -767,6 +905,28 @@ mod tests {
                 PrimitiveElementKind::Conductance,
                 &[-1.0],
                 invalid(0, ParameterConstraintError::OutOfRange),
+            ),
+            (PrimitiveElementKind::Diode, &[1.0, 0.0], Ok(())),
+            (
+                PrimitiveElementKind::Diode,
+                &[0.0, 0.0],
+                invalid(0, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::Diode,
+                &[1.0, -1.0],
+                invalid(1, ParameterConstraintError::OutOfRange),
+            ),
+            (PrimitiveElementKind::Not, &[0.0, 1.0, 0.0], Ok(())),
+            (
+                PrimitiveElementKind::Not,
+                &[0.0, 0.0, 0.0],
+                invalid(1, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::Not,
+                &[0.0, 1.0, -1.0],
+                invalid(2, ParameterConstraintError::OutOfRange),
             ),
             (
                 PrimitiveElementKind::Capacitor,
@@ -854,6 +1014,7 @@ mod tests {
                 3,
                 2,
             ),
+            (PrimitiveElementKind::Diode, &[1.0, 1.0][..], 0, 1),
         ];
 
         for (kind, parameters, greater, lesser) in cases {
@@ -873,8 +1034,33 @@ mod tests {
 
         assert_eq!(
             PrimitiveElementKind::COUNT,
-            PrimitiveElementKind::TickDelay as u32 + 1,
+            PrimitiveElementKind::Nor2 as u32 + 1,
         );
+    }
+
+    #[test]
+    fn logic_gate_terminal_and_state_contracts_match() {
+        assert_eq!(PrimitiveElementKind::Not.definition().terminals().len(), 4);
+
+        for kind in [
+            PrimitiveElementKind::And2,
+            PrimitiveElementKind::Nand2,
+            PrimitiveElementKind::Or2,
+            PrimitiveElementKind::Nor2,
+        ] {
+            assert_eq!(kind.definition().terminals().len(), 5, "{kind:?}");
+        }
+
+        for kind in [
+            PrimitiveElementKind::Not,
+            PrimitiveElementKind::And2,
+            PrimitiveElementKind::Nand2,
+            PrimitiveElementKind::Or2,
+            PrimitiveElementKind::Nor2,
+        ] {
+            assert_eq!(kind.parameter_count(), 3, "{kind:?}");
+            assert_eq!(kind.state_count(), 0, "{kind:?}");
+        }
     }
 
     #[test]

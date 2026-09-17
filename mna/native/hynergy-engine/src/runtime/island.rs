@@ -1409,6 +1409,308 @@ mod test {
     }
 
     #[test]
+    fn diode_converges_between_forward_and_reverse_conductance() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let common = WireId::try_from(1).unwrap();
+        let output = WireId::try_from(2).unwrap();
+
+        let diode = DeviceId::try_from(1).unwrap();
+        let current_source = DeviceId::try_from(2).unwrap();
+
+        network.add_wire(common).unwrap();
+        network.add_wire(output).unwrap();
+
+        network
+            .add_device(&definitions, diode, PrimitiveElementKind::Diode.into())
+            .unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                current_source,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        // Anode at output, cathode at common.
+        network
+            .attach_terminal(output, diode, TerminalId::new(0))
+            .unwrap();
+        network
+            .attach_terminal(common, diode, TerminalId::new(1))
+            .unwrap();
+
+        // Inject 8 A from common into the diode anode.
+        network
+            .attach_terminal(common, current_source, TerminalId::new(0))
+            .unwrap();
+        network
+            .attach_terminal(output, current_source, TerminalId::new(1))
+            .unwrap();
+
+        // G_max = 4, G_min = 0.25.
+        network
+            .set_device_parameter(&definitions, diode, ParameterId::new(0), 4.0)
+            .unwrap();
+        network
+            .set_device_parameter(&definitions, diode, ParameterId::new(1), 0.25)
+            .unwrap();
+        network
+            .set_device_parameter(&definitions, current_source, ParameterId::new(0), 8.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+        let island =
+            topology.component_island(DeviceComponent::new(diode, DevicePartitionId::new(0)));
+
+        let output_node = IslandNode::net(topology.wire_net(output));
+        let common_node = IslandNode::net(topology.wire_net(common));
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        let writes = runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert!(writes.is_empty());
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        // Starting from 0 V selects G_min. That first solution is +8 V,
+        // so nonlinear iteration must switch to G_max and settle at 8 / 4 = 2 V.
+        assert!((voltage - 2.0).abs() < 1.0e-9);
+        assert!(runtime.solve_count() > 1);
+        assert!(runtime.matrix_stamp_count() > 1);
+    }
+
+    fn logic_gate_island(
+        kind: PrimitiveElementKind,
+        input_a_voltage: f64,
+        input_b_voltage: Option<f64>,
+    ) -> (
+        Network,
+        crate::compile::island::CompiledIsland,
+        IslandNode,
+        IslandNode,
+    ) {
+        let binary = match kind {
+            PrimitiveElementKind::Not => false,
+            PrimitiveElementKind::And2
+            | PrimitiveElementKind::Nand2
+            | PrimitiveElementKind::Or2
+            | PrimitiveElementKind::Nor2 => true,
+            _ => panic!("logic_gate_island requires a logic gate primitive"),
+        };
+
+        assert_eq!(binary, input_b_voltage.is_some());
+
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let common = WireId::try_from(1).unwrap();
+        let output = WireId::try_from(2).unwrap();
+        let vdd = WireId::try_from(3).unwrap();
+        let input_a = WireId::try_from(4).unwrap();
+        let input_b = binary.then(|| WireId::try_from(5).unwrap());
+
+        for wire in [
+            Some(common),
+            Some(output),
+            Some(vdd),
+            Some(input_a),
+            input_b,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            network.add_wire(wire).unwrap();
+        }
+
+        let gate = DeviceId::try_from(1).unwrap();
+        let vdd_source = DeviceId::try_from(2).unwrap();
+        let input_a_source = DeviceId::try_from(3).unwrap();
+        let input_b_source = binary.then(|| DeviceId::try_from(4).unwrap());
+
+        network.add_device(&definitions, gate, kind.into()).unwrap();
+
+        for source in [Some(vdd_source), Some(input_a_source), input_b_source]
+            .into_iter()
+            .flatten()
+        {
+            network
+                .add_device(
+                    &definitions,
+                    source,
+                    PrimitiveElementKind::VoltageSource.into(),
+                )
+                .unwrap();
+        }
+
+        for (terminal, wire) in [(0, output), (1, vdd), (2, common), (3, input_a)] {
+            network
+                .attach_terminal(wire, gate, TerminalId::new(terminal))
+                .unwrap();
+        }
+
+        if let Some(input_b) = input_b {
+            network
+                .attach_terminal(input_b, gate, TerminalId::new(4))
+                .unwrap();
+        }
+
+        for (source, positive) in [(vdd_source, vdd), (input_a_source, input_a)] {
+            network
+                .attach_terminal(positive, source, TerminalId::new(0))
+                .unwrap();
+            network
+                .attach_terminal(common, source, TerminalId::new(1))
+                .unwrap();
+        }
+
+        if let (Some(source), Some(input_b)) = (input_b_source, input_b) {
+            network
+                .attach_terminal(input_b, source, TerminalId::new(0))
+                .unwrap();
+            network
+                .attach_terminal(common, source, TerminalId::new(1))
+                .unwrap();
+        }
+
+        // Same threshold semantics as the zero-hysteresis controlled switch.
+        // threshold = 2.5 V, G_max = 10 S, G_min = 0.01 S.
+        for (index, value) in [2.5, 10.0, 0.01].into_iter().enumerate() {
+            network
+                .set_device_parameter(&definitions, gate, ParameterId::new(index as u32), value)
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, vdd_source, ParameterId::new(0), 5.0)
+            .unwrap();
+        network
+            .set_device_parameter(
+                &definitions,
+                input_a_source,
+                ParameterId::new(0),
+                input_a_voltage,
+            )
+            .unwrap();
+
+        if let (Some(source), Some(voltage)) = (input_b_source, input_b_voltage) {
+            network
+                .set_device_parameter(&definitions, source, ParameterId::new(0), voltage)
+                .unwrap();
+        }
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+        let island =
+            topology.component_island(DeviceComponent::new(gate, DevicePartitionId::new(0)));
+
+        let output_node = IslandNode::net(topology.wire_net(output));
+        let common_node = IslandNode::net(topology.wire_net(common));
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        (network, compiled, output_node, common_node)
+    }
+
+    fn solve_logic_gate(
+        kind: PrimitiveElementKind,
+        input_a_voltage: f64,
+        input_b_voltage: Option<f64>,
+    ) -> (f64, usize) {
+        let (network, compiled, output_node, common_node) =
+            logic_gate_island(kind, input_a_voltage, input_b_voltage);
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        let voltage =
+            runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
+
+        (voltage, runtime.solve_count())
+    }
+
+    #[test]
+    fn logic_gates_follow_boolean_truth_tables() {
+        let g_max = 10.0;
+        let g_min = 0.01;
+        let vdd = 5.0;
+
+        let high_voltage = vdd * g_max / (g_max + g_min);
+        let low_voltage = vdd * g_min / (g_max + g_min);
+
+        for (input, expected_high) in [(0.0, true), (5.0, false)] {
+            let (voltage, _) = solve_logic_gate(PrimitiveElementKind::Not, input, None);
+            let expected = if expected_high {
+                high_voltage
+            } else {
+                low_voltage
+            };
+
+            assert!((voltage - expected).abs() < 1.0e-9);
+        }
+
+        for (kind, truth_table) in [
+            (PrimitiveElementKind::And2, [false, false, false, true]),
+            (PrimitiveElementKind::Nand2, [true, true, true, false]),
+            (PrimitiveElementKind::Or2, [false, true, true, true]),
+            (PrimitiveElementKind::Nor2, [true, false, false, false]),
+        ] {
+            for (index, expected_high) in truth_table.into_iter().enumerate() {
+                let input_a = if index & 0b10 == 0 { 0.0 } else { 5.0 };
+                let input_b = if index & 0b01 == 0 { 0.0 } else { 5.0 };
+
+                let (voltage, _) = solve_logic_gate(kind, input_a, Some(input_b));
+                let expected = if expected_high {
+                    high_voltage
+                } else {
+                    low_voltage
+                };
+
+                assert!(
+                    (voltage - expected).abs() < 1.0e-9,
+                    "{kind:?} with A={input_a}, B={input_b}: {voltage} != {expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn logic_gate_threshold_is_inclusive() {
+        let (voltage, _) = solve_logic_gate(PrimitiveElementKind::Not, 2.5, None);
+        let expected_low = 5.0 * 0.01 / (10.0 + 0.01);
+
+        assert!((voltage - expected_low).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn settled_logic_gate_island_sleeps() {
+        let (network, compiled, _, _) =
+            logic_gate_island(PrimitiveElementKind::Nand2, 5.0, Some(5.0));
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+        let first_solve_count = runtime.solve_count();
+
+        assert!(
+            first_solve_count > 1,
+            "initial nonlinear solve should iterate"
+        );
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            first_solve_count,
+            "stateless settled logic should sleep until invalidated",
+        );
+    }
+
+    #[test]
     fn iteration_stability_requires_exact_values() {
         assert!(solutions_converged(&[0.0], &[5.0e-10]));
 

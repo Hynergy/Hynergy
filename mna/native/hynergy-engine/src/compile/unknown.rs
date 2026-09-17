@@ -72,6 +72,7 @@ impl UnknownRange {
         self.len as usize
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn is_empty(self) -> bool {
         self.len == 0

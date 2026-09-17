@@ -11,6 +11,26 @@ use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub const ABI_VERSION: u32 = 1;
+pub const ABI_REVISION: u32 = 1;
+
+/// Returns the ABI major version implemented by this library.
+///
+/// The major version changes only when compatibility with the existing ABI is
+/// broken. The caller must check this value before it calls other ABI
+/// functions.
+#[unsafe(no_mangle)]
+pub extern "C" fn hynergy_abi_version() -> u32 {
+    ABI_VERSION
+}
+
+/// Returns the additive revision of ABI major version 1.
+///
+/// The ABI revision increases only when backward-compatible ABI features are
+/// added. Existing callers may continue using an ABI with a newer revision.
+#[unsafe(no_mangle)]
+pub extern "C" fn hynergy_abi_revision() -> u32 {
+    ABI_REVISION
+}
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,20 +107,12 @@ impl DefinitionRegistrationResult {
     }
 }
 
-/// Returns the ABI version that this library implements.
-///
-/// The caller must check this value before it calls other ABI functions.
-#[unsafe(no_mangle)]
-pub extern "C" fn hynergy_abi_version() -> u32 {
-    ABI_VERSION
-}
-
 /// Creates an engine.
 ///
 /// The returned pointer owns the engine. The caller must pass the pointer to
 /// [`hynergy_engine_destroy`] when the engine is no longer necessary.
 #[unsafe(no_mangle)]
-pub extern "C" fn hynergy_engine_create(max_worker_threads: usize) -> *mut Engine {
+pub extern "C" fn hynergy_engine_create(max_worker_threads: u32) -> *mut Engine {
     Box::into_raw(Box::new(Engine::new(EngineConfig::new(max_worker_threads))))
 }
 
@@ -143,7 +155,7 @@ pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut Engine) {
 pub unsafe extern "C" fn hynergy_engine_register_definition(
     engine: *mut Engine,
     input: *const u8,
-    input_len: usize,
+    input_len: u32,
     result: *mut DefinitionRegistrationResult,
 ) -> u32 {
     if result.is_null() {
@@ -162,16 +174,10 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
             u32::MAX,
             u32::MAX,
         )
-    } else if input_len > u32::MAX as usize {
-        DefinitionRegistrationResult::failure(
-            DefinitionRegistrationCode::InputTooLarge,
-            u32::MAX,
-            u32::MAX,
-        )
     } else {
         let registration = catch_unwind(AssertUnwindSafe(|| {
             let engine = unsafe { &mut *engine };
-            let input = unsafe { std::slice::from_raw_parts(input, input_len) };
+            let input = unsafe { std::slice::from_raw_parts(input, input_len as usize) };
             hynergy_protocol::register_definition_buffer(engine, input)
         }));
         match registration {
@@ -492,7 +498,7 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
     engine: *mut Engine,
     world_id: u32,
     input: *const u8,
-    input_len: usize,
+    input_len: u32,
     result: *mut CommandResult,
 ) -> u32 {
     if result.is_null() {
@@ -503,12 +509,10 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
         CommandResult::failure(CommandCode::NullEngine, u32::MAX, u32::MAX)
     } else if input.is_null() {
         CommandResult::failure(CommandCode::NullInput, u32::MAX, u32::MAX)
-    } else if input_len > u32::MAX as usize {
-        CommandResult::failure(CommandCode::InputTooLarge, u32::MAX, u32::MAX)
     } else {
         let application = catch_unwind(AssertUnwindSafe(|| {
             let engine = unsafe { &mut *engine };
-            let input = unsafe { std::slice::from_raw_parts(input, input_len) };
+            let input = unsafe { std::slice::from_raw_parts(input, input_len as usize) };
 
             hynergy_protocol::apply_world_command_buffer(engine, world_id, input)
         }));
@@ -1557,7 +1561,9 @@ mod tests {
         bytes: &[u8],
         result: *mut DefinitionRegistrationResult,
     ) -> u32 {
-        unsafe { hynergy_engine_register_definition(engine, bytes.as_ptr(), bytes.len(), result) }
+        unsafe {
+            hynergy_engine_register_definition(engine, bytes.as_ptr(), bytes.len() as u32, result)
+        }
     }
 
     fn create_world(engine: *mut Engine) -> WorldCreationResult {
@@ -1572,7 +1578,9 @@ mod tests {
     }
 
     fn apply(engine: *mut Engine, world: u32, bytes: &[u8], result: *mut CommandResult) -> u32 {
-        unsafe { hynergy_world_apply_commands(engine, world, bytes.as_ptr(), bytes.len(), result) }
+        unsafe {
+            hynergy_world_apply_commands(engine, world, bytes.as_ptr(), bytes.len() as u32, result)
+        }
     }
 
     fn set_parameter_payload(device_id: u32, parameter_id: u32, value: f64) -> Vec<u8> {
@@ -1718,6 +1726,50 @@ mod tests {
     }
 
     #[test]
+    fn abi_function_signatures_are_stable() {
+        let _: extern "C" fn() -> u32 = hynergy_abi_version;
+
+        let _: extern "C" fn() -> u32 = hynergy_abi_revision;
+
+        let _: extern "C" fn(u32) -> *mut Engine = hynergy_engine_create;
+
+        let _: unsafe extern "C" fn(*mut Engine) = hynergy_engine_destroy;
+
+        let _: unsafe extern "C" fn(
+            *mut Engine,
+            *const u8,
+            u32,
+            *mut DefinitionRegistrationResult,
+        ) -> u32 = hynergy_engine_register_definition;
+
+        let _: unsafe extern "C" fn(*mut Engine, u32, *mut WorldCreationResult) -> u32 =
+            hynergy_engine_create_world;
+
+        let _: unsafe extern "C" fn(*mut Engine, u32) -> u32 = hynergy_engine_destroy_world;
+
+        let _: unsafe extern "C" fn(*mut Engine, u32, *const u8, u32, *mut CommandResult) -> u32 =
+            hynergy_world_apply_commands;
+
+        let _: unsafe extern "C" fn(
+            *mut Engine,
+            u32,
+            *mut SubscriptionRecord,
+            u32,
+            *mut TickResult,
+        ) -> u32 = hynergy_world_tick;
+
+        let _: unsafe extern "C" fn(
+            *mut Engine,
+            u32,
+            u32,
+            u32,
+            *mut SubscriptionCreationResult,
+        ) -> u32 = hynergy_world_subscribe_observer;
+
+        let _: unsafe extern "C" fn(*mut Engine, u32, u32) -> u32 = hynergy_world_unsubscribe;
+    }
+
+    #[test]
     fn subscription_creation_result_layout_is_stable() {
         assert_eq!(size_of::<SubscriptionCreationResult>(), 8,);
 
@@ -1757,12 +1809,6 @@ mod tests {
         assert_eq!(offset_of!(TickResult, parameter_id), 16,);
 
         assert_eq!(offset_of!(TickResult, iterations), 20,);
-    }
-
-    #[test]
-    fn abi_version_is_stable() {
-        assert_eq!(hynergy_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 1);
     }
 
     #[test]
@@ -1814,6 +1860,7 @@ mod tests {
             IncompatibleParameterConstraints = 33,
             UnusedParameter = 34,
             DevicePartitionIdExhausted = 35,
+            StateCountExhausted = 36,
 
             InternalPanic = u32::MAX,
         });
@@ -1824,6 +1871,7 @@ mod tests {
             NullResult = 2,
             UnknownWorld = 3,
             WorldIdExhausted = 4,
+            InvalidTickFrequency = 5,
             InternalPanic = u32::MAX,
         });
 
@@ -1904,6 +1952,47 @@ mod tests {
 
             InternalPanic = u32::MAX,
         });
+    }
+
+    #[test]
+    fn definition_registration_result_layout_is_stable() {
+        assert_eq!(size_of::<DefinitionRegistrationResult>(), 16,);
+
+        assert_eq!(
+            align_of::<DefinitionRegistrationResult>(),
+            align_of::<u32>(),
+        );
+
+        assert_eq!(offset_of!(DefinitionRegistrationResult, code), 0,);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, command_index), 4,);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, byte_offset), 8,);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, definition_id), 12,);
+    }
+    #[test]
+    fn world_creation_result_layout_is_stable() {
+        assert_eq!(size_of::<WorldCreationResult>(), 8);
+        assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>(),);
+        assert_eq!(offset_of!(WorldCreationResult, code), 0,);
+        assert_eq!(offset_of!(WorldCreationResult, world_id), 4,);
+    }
+
+    #[test]
+    fn command_result_layout_is_stable() {
+        assert_eq!(size_of::<CommandResult>(), 16);
+        assert_eq!(align_of::<CommandResult>(), align_of::<u32>(),);
+        assert_eq!(offset_of!(CommandResult, code), 0);
+        assert_eq!(offset_of!(CommandResult, command_index), 4,);
+        assert_eq!(offset_of!(CommandResult, byte_offset), 8,);
+        assert_eq!(offset_of!(CommandResult, reserved), 12,);
+    }
+
+    #[test]
+    fn abi_version_and_revision_are_stable() {
+        assert_eq!(hynergy_abi_version(), ABI_VERSION);
+        assert_eq!(ABI_VERSION, 1);
+
+        assert_eq!(hynergy_abi_revision(), ABI_REVISION);
+        assert_eq!(ABI_REVISION, 1);
     }
 
     #[test]
@@ -2340,31 +2429,6 @@ mod tests {
         unsafe {
             hynergy_engine_destroy(engine);
         }
-    }
-
-    #[test]
-    fn result_layouts_are_stable() {
-        assert_eq!(size_of::<DefinitionRegistrationResult>(), 16);
-        assert_eq!(
-            align_of::<DefinitionRegistrationResult>(),
-            align_of::<u32>()
-        );
-        assert_eq!(offset_of!(DefinitionRegistrationResult, code), 0);
-        assert_eq!(offset_of!(DefinitionRegistrationResult, command_index), 4);
-        assert_eq!(offset_of!(DefinitionRegistrationResult, byte_offset), 8);
-        assert_eq!(offset_of!(DefinitionRegistrationResult, definition_id), 12);
-
-        assert_eq!(size_of::<WorldCreationResult>(), 8);
-        assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>());
-        assert_eq!(offset_of!(WorldCreationResult, code), 0);
-        assert_eq!(offset_of!(WorldCreationResult, world_id), 4);
-
-        assert_eq!(size_of::<CommandResult>(), 16);
-        assert_eq!(align_of::<CommandResult>(), align_of::<u32>());
-        assert_eq!(offset_of!(CommandResult, code), 0);
-        assert_eq!(offset_of!(CommandResult, command_index), 4);
-        assert_eq!(offset_of!(CommandResult, byte_offset), 8);
-        assert_eq!(offset_of!(CommandResult, reserved), 12);
     }
 
     #[test]

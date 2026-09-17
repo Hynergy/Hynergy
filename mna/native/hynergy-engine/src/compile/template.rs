@@ -684,21 +684,6 @@ impl DefinitionTemplateBuilder {
         })
     }
 
-    #[inline]
-    fn push_state_requires_write(&mut self, requires_write: bool) {
-        let index = self.state_writes.len();
-        let word = index / 64;
-        let bit = index % 64;
-
-        if word == self.state_requires_write.len() {
-            self.state_requires_write.push(0);
-        }
-
-        if requires_write {
-            self.state_requires_write[word] |= 1 << bit;
-        }
-    }
-
     fn set_state_requires_write(&mut self, index: usize, requires_write: bool) {
         if !requires_write {
             return;
@@ -1131,16 +1116,19 @@ impl CompiledDefinitionTemplate {
             .is_some_and(|word| word & (1u64 << bit) != 0)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn matrix_entry_count(&self) -> usize {
         self.matrix_entries.len()
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn parameter_count(&self) -> usize {
         self.parameter_count
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn terminal_count(&self) -> usize {
         self.terminal_count
@@ -1229,28 +1217,20 @@ pub(crate) struct BoundDefinitionInputs {
 }
 
 impl BoundDefinitionInputs {
-    #[inline]
-    pub(crate) fn parameters(&self) -> &[InputSlot] {
-        &self.parameters
+    pub(crate) fn into_parts(self) -> (Box<[InputSlot]>, Box<[ValueSlot]>) {
+        (self.parameters, self.outputs)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn parameter(&self, index: usize) -> Option<InputSlot> {
         self.parameters.get(index).copied()
     }
 
-    #[inline]
-    pub(crate) fn outputs(&self) -> &[ValueSlot] {
-        &self.outputs
-    }
-
+    #[cfg(test)]
     #[inline]
     pub(crate) fn output(&self, index: usize) -> Option<ValueSlot> {
         self.outputs.get(index).copied()
-    }
-
-    pub(crate) fn into_parts(self) -> (Box<[InputSlot]>, Box<[ValueSlot]>) {
-        (self.parameters, self.outputs)
     }
 }
 

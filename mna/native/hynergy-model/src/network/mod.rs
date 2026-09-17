@@ -207,17 +207,10 @@ mod tests {
     use super::{Network, NetworkModelError};
     use crate::device::definition::{DefinitionId, DeviceId, PrimitiveElementKind, TerminalId};
     use crate::device::registry::DefinitionRegistry;
-    use crate::network::slot::{DeviceSlot, WireSlot};
     use crate::parameter::{ParameterConstraintError, ParameterId};
 
     fn device_id(raw: u32) -> DeviceId {
         DeviceId::try_from(raw).unwrap()
-    }
-
-    #[test]
-    fn test() {
-        println!("{}", size_of::<Option<WireSlot>>());
-        println!("{}", size_of::<Option<DeviceSlot>>());
     }
 
     #[test]
@@ -294,5 +287,28 @@ mod tests {
                 .iter()
                 .any(|connection| connection.as_terminal() == Some((device, terminal)))
         );
+    }
+
+    #[test]
+    fn detaching_terminal_removes_wire_connection() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let wire = super::WireId::try_from(1).unwrap();
+        let device = device_id(1);
+        let terminal = TerminalId::new(0);
+
+        network.add_wire(wire).unwrap();
+        network
+            .add_device(
+                &definitions,
+                device,
+                DefinitionId::from(PrimitiveElementKind::Conductance),
+            )
+            .unwrap();
+        network.attach_terminal(wire, device, terminal).unwrap();
+
+        network.detach_terminal(wire, device, terminal).unwrap();
+
+        assert!(network.wire_connections(wire).unwrap().is_empty());
     }
 }

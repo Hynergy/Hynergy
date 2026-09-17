@@ -164,15 +164,15 @@ pub enum WorldCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EngineConfig {
-    max_worker_threads: usize,
+    max_worker_threads: u32,
 }
 
 impl EngineConfig {
-    pub fn new(max_worker_threads: usize) -> Self {
+    pub fn new(max_worker_threads: u32) -> Self {
         Self { max_worker_threads }
     }
 
-    pub fn max_worker_threads(&self) -> usize {
+    pub fn max_worker_threads(&self) -> u32 {
         self.max_worker_threads
     }
 }
@@ -335,6 +335,7 @@ impl Engine {
             }
         }
 
+        #[cfg(debug_assertions)]
         world.debug_validate_topology(definitions);
 
         Ok(())
@@ -809,9 +810,9 @@ impl World {
         Ok(())
     }
 
+    #[cfg(debug_assertions)]
     #[inline]
     fn debug_validate_topology(&self, definitions: &DefinitionRegistry) {
-        #[cfg(debug_assertions)]
         self.derived_topology
             .assert_consistent(definitions, &self.network);
     }

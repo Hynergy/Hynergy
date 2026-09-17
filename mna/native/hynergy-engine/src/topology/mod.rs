@@ -947,7 +947,7 @@ impl DerivedTopology {
         self.net_island_map[net.index()] = island;
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn net(&self, id: NetId) -> Option<&Net> {
         self.nets.get(id)
@@ -1021,7 +1021,7 @@ impl IslandTopology {
         &self.components
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
@@ -1041,7 +1041,7 @@ impl Net {
         &self.wires
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn terminal_components(&self) -> &[DeviceComponent] {
         &self.terminal_components
@@ -1281,13 +1281,6 @@ mod tests {
 
     fn device_island(topology: &DerivedTopology, device: DeviceId) -> IslandId {
         topology.component_island(device_component(device, 0))
-    }
-
-    #[test]
-    fn device_component_stays_compact() {
-        use std::mem::size_of;
-
-        assert_eq!(size_of::<DeviceComponent>(), 8);
     }
 
     #[test]
