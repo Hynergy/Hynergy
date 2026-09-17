@@ -29,7 +29,7 @@ TUNE_CPU="${TUNE_CPU:-1}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-3}"
 PROFILE_SECONDS="${PROFILE_SECONDS:-20}"
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${ROOT_DIR}/target/bench-logs"
 FLAMEGRAPH_DIR="${ROOT_DIR}/target/flamegraphs"
 
@@ -357,18 +357,25 @@ if [[ "$MODE" == "profile" ]]; then
 
     mkdir -p "$FLAMEGRAPH_DIR"
     PROFILE_SLUG="$(
-        tr '/ _' '-' <<<"${PROFILE_TARGET}-${PROFILE_CASE}" \
+        sed 's|/|--|g; s/[ _]/-/g' <<<"${PROFILE_CASE}" \
             | tr -cd '[:alnum:]._-'
     )"
-    PROFILE_OUTPUT="${FLAMEGRAPH_DIR}/${PROFILE_SLUG}.svg"
+    RUN_NAME="${TIMESTAMP}--${PROFILE_SLUG}"
+    PROFILE_OUTPUT="${FLAMEGRAPH_DIR}/${RUN_NAME}.svg"
+    PERF_OUTPUT="${FLAMEGRAPH_DIR}/${RUN_NAME}.perf.data"
 
     echo "Profiling ${PROFILE_TARGET}: ${PROFILE_CASE}"
-    HYNERGY_BENCH_SUITE="$SUITE" \
-        taskset -c "$CPU" \
-        cargo flamegraph \
+    # Use a relative recording path because flamegraph splits --cmd on whitespace.
+    (
+        cd "$FLAMEGRAPH_DIR"
+        HYNERGY_BENCH_SUITE="$SUITE" \
+            taskset -c "$CPU" \
+            cargo flamegraph \
+            --manifest-path "${ROOT_DIR}/Cargo.toml" \
             -p hynergy-benchmarks \
             --bench "$PROFILE_TARGET" \
             --output "$PROFILE_OUTPUT" \
+            --cmd "record -F 997 --call-graph dwarf,64000 -g -o ${RUN_NAME}.perf.data" \
             --title "Hynergy ${PROFILE_CASE}" \
             --palette rust \
             --deterministic \
@@ -377,8 +384,10 @@ if [[ "$MODE" == "profile" ]]; then
             --exact \
             --profile-time "$PROFILE_SECONDS" \
             --bench
+    )
 
     echo "Flamegraph: ${PROFILE_OUTPUT}"
+    echo "Perf recording: ${PERF_OUTPUT}"
     exit 0
 fi
 

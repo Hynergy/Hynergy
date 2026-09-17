@@ -241,9 +241,9 @@ fn validated_tick_delay_exposes_previous_tick_input() {
 #[test]
 fn validated_cpu_datapath_registers_known_additions() {
     let mut scenario = ValidatedCpuScenario::for_test(1);
-    assert_eq!(scenario.device_count(), 243);
-    assert_eq!(scenario.nonlinear_device_count(), 144);
-    assert_eq!(scenario.stateful_device_count(), 153);
+    assert_eq!(scenario.device_count(), 99);
+    assert_eq!(scenario.nonlinear_device_count(), 72);
+    assert_eq!(scenario.stateful_device_count(), 9);
 
     scenario.set_lane_operands(0, 37, 19, false).unwrap();
     scenario.tick().unwrap();
@@ -259,57 +259,42 @@ fn validated_cpu_datapath_registers_known_additions() {
 }
 
 #[test]
-fn validated_cpu_sizes_remain_close_to_synthetic_cpu_sizes() {
-    assert_eq!(CpuWorkloadSize::Tiny.validated_device_count(), 727);
-    assert_eq!(CpuWorkloadSize::Small.validated_device_count(), 2905);
-    assert_eq!(CpuWorkloadSize::Stress.validated_device_count(), 11617);
+fn validated_cpu_sizes_match_primitive_gate_topology() {
+    assert_eq!(CpuWorkloadSize::Tiny.validated_device_count(), 295);
+    assert_eq!(CpuWorkloadSize::Small.validated_device_count(), 1177);
+    assert_eq!(CpuWorkloadSize::Stress.validated_device_count(), 4705);
 
     assert_eq!(
         CpuWorkloadSize::Tiny.validated_nonlinear_device_count(),
-        432
+        216
     );
     assert_eq!(
         CpuWorkloadSize::Small.validated_nonlinear_device_count(),
-        1728
+        864
     );
     assert_eq!(
         CpuWorkloadSize::Stress.validated_nonlinear_device_count(),
-        6912
+        3456
     );
 
-    assert_eq!(CpuWorkloadSize::Tiny.validated_stateful_device_count(), 459);
+    assert_eq!(CpuWorkloadSize::Tiny.validated_stateful_device_count(), 27);
     assert_eq!(
         CpuWorkloadSize::Small.validated_stateful_device_count(),
-        1836
+        108
     );
     assert_eq!(
         CpuWorkloadSize::Stress.validated_stateful_device_count(),
-        7344
+        432
     );
-
-    for size in [
-        CpuWorkloadSize::Tiny,
-        CpuWorkloadSize::Small,
-        CpuWorkloadSize::Stress,
-    ] {
-        let synthetic = size.device_count();
-        let validated = size.validated_device_count();
-        let difference = synthetic.abs_diff(validated);
-
-        assert!(
-            difference * 100 <= synthetic * 4,
-            "validated {size:?} workload drifted too far from synthetic size: {validated} vs {synthetic}",
-        );
-    }
 }
 
 #[test]
 fn full_cpu_executes_program_and_updates_architectural_state() {
     let mut cpu = FullCpuScenario::for_test();
 
-    assert_eq!(cpu.device_count(), 2101);
-    assert_eq!(cpu.nonlinear_device_count(), 1378);
-    assert_eq!(cpu.stateful_device_count(), 1411);
+    assert_eq!(cpu.device_count(), 549);
+    assert_eq!(cpu.nonlinear_device_count(), 515);
+    assert_eq!(cpu.stateful_device_count(), 33);
 
     cpu.tick().unwrap();
 

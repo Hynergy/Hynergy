@@ -15,23 +15,22 @@ const SUPPLY_VOLTAGE: f64 = 5.0;
 const LOGIC_LOW_MAX: f64 = 1.0;
 const LOGIC_HIGH_MIN: f64 = 4.0;
 
-const NAND_PULL_UP_OHMS: f64 = 100.0;
-const SWITCH_THRESHOLD: f64 = 2.5;
-const SWITCH_HYSTERESIS: f64 = 0.20;
-const SWITCH_G_MAX: f64 = 1.0;
-const SWITCH_G_MIN: f64 = 1.0e-9;
+const LOGIC_THRESHOLD: f64 = 2.5;
+const LOGIC_G_MAX: f64 = 1.0;
+const LOGIC_G_MIN: f64 = 1.0e-9;
+const LOGIC_GATE_PARAMETERS: [f64; 3] = [LOGIC_THRESHOLD, LOGIC_G_MAX, LOGIC_G_MIN];
 
 const BITS_PER_LANE: usize = 8;
-const NANDS_PER_FULL_ADDER: usize = 9;
-const SWITCHES_PER_NAND: usize = 2;
+const GATES_PER_FULL_ADDER: usize = 9;
+const GATES_PER_XOR: usize = 4;
+const GATES_PER_MUX: usize = 4;
 const INPUT_SOURCES_PER_LANE: usize = BITS_PER_LANE * 2 + 1;
 const REGISTER_DELAYS_PER_LANE: usize = BITS_PER_LANE + 1;
-const DEVICES_PER_NAND: usize = 3;
-const DEVICES_PER_LANE: usize = INPUT_SOURCES_PER_LANE
-    + BITS_PER_LANE * NANDS_PER_FULL_ADDER * DEVICES_PER_NAND
-    + REGISTER_DELAYS_PER_LANE;
-const NONLINEAR_DEVICES_PER_LANE: usize = BITS_PER_LANE * NANDS_PER_FULL_ADDER * SWITCHES_PER_NAND;
-const STATEFUL_DEVICES_PER_LANE: usize = NONLINEAR_DEVICES_PER_LANE + REGISTER_DELAYS_PER_LANE;
+const LOGIC_GATES_PER_LANE: usize = BITS_PER_LANE * GATES_PER_FULL_ADDER;
+const DEVICES_PER_LANE: usize =
+    INPUT_SOURCES_PER_LANE + LOGIC_GATES_PER_LANE + REGISTER_DELAYS_PER_LANE;
+const NONLINEAR_DEVICES_PER_LANE: usize = LOGIC_GATES_PER_LANE;
+const STATEFUL_DEVICES_PER_LANE: usize = REGISTER_DELAYS_PER_LANE;
 
 #[derive(Debug, Clone, Copy)]
 struct InputPin {
@@ -42,7 +41,7 @@ struct InputPin {
 #[derive(Debug, Clone, Copy)]
 struct GateOutput {
     wire: WireId,
-    pull_up: DeviceId,
+    device: DeviceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,25 +52,8 @@ struct RegisterBit {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ProbeTransform {
-    Direct,
-    SupplyMinus,
-}
-
-impl ProbeTransform {
-    #[inline]
-    fn apply(self, value: f64) -> f64 {
-        match self {
-            Self::Direct => value,
-            Self::SupplyMinus => SUPPLY_VOLTAGE - value,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 struct Probe {
     subscription: SubscriptionId,
-    transform: ProbeTransform,
     value: Option<f64>,
 }
 
@@ -144,85 +126,97 @@ impl DigitalHarness {
         )
     }
 
-    fn nand(&mut self, a: WireId, b: WireId) -> GateOutput {
+    fn unary_gate(&mut self, kind: PrimitiveElementKind, input: WireId) -> GateOutput {
         let output = add_wire(&mut self.engine, self.world_id, &mut self.ids);
-        self.nand_into(output, a, b)
+        self.unary_gate_into(kind, output, input)
     }
 
-    fn nand_into(&mut self, output: WireId, a: WireId, b: WireId) -> GateOutput {
-        let middle = add_wire(&mut self.engine, self.world_id, &mut self.ids);
+    fn unary_gate_into(
+        &mut self,
+        kind: PrimitiveElementKind,
+        output: WireId,
+        input: WireId,
+    ) -> GateOutput {
+        debug_assert_eq!(kind, PrimitiveElementKind::Not);
 
-        let pull_up = two_terminal(
+        let device = add_primitive(
             &mut self.engine,
             self.world_id,
             &mut self.ids,
-            PrimitiveElementKind::Resistance,
-            self.supply,
-            output,
-            &[NAND_PULL_UP_OHMS],
-        );
-
-        let upper = add_primitive(
-            &mut self.engine,
-            self.world_id,
-            &mut self.ids,
-            PrimitiveElementKind::VoltageControlledSwitch,
-            &[
-                SWITCH_THRESHOLD,
-                SWITCH_HYSTERESIS,
-                SWITCH_G_MAX,
-                SWITCH_G_MIN,
-            ],
+            kind,
+            &LOGIC_GATE_PARAMETERS,
         );
         attach_all(
             &mut self.engine,
             self.world_id,
-            upper,
-            &[output, middle, a, self.ground],
-        );
-
-        let lower = add_primitive(
-            &mut self.engine,
-            self.world_id,
-            &mut self.ids,
-            PrimitiveElementKind::VoltageControlledSwitch,
-            &[
-                SWITCH_THRESHOLD,
-                SWITCH_HYSTERESIS,
-                SWITCH_G_MAX,
-                SWITCH_G_MIN,
-            ],
-        );
-        attach_all(
-            &mut self.engine,
-            self.world_id,
-            lower,
-            &[middle, self.ground, b, self.ground],
+            device,
+            &[output, self.supply, self.ground, input],
         );
 
         GateOutput {
             wire: output,
-            pull_up,
+            device,
         }
     }
 
+    fn binary_gate(&mut self, kind: PrimitiveElementKind, a: WireId, b: WireId) -> GateOutput {
+        let output = add_wire(&mut self.engine, self.world_id, &mut self.ids);
+        self.binary_gate_into(kind, output, a, b)
+    }
+
+    fn binary_gate_into(
+        &mut self,
+        kind: PrimitiveElementKind,
+        output: WireId,
+        a: WireId,
+        b: WireId,
+    ) -> GateOutput {
+        debug_assert!(matches!(
+            kind,
+            PrimitiveElementKind::And2
+                | PrimitiveElementKind::Nand2
+                | PrimitiveElementKind::Or2
+                | PrimitiveElementKind::Nor2
+        ));
+
+        let device = add_primitive(
+            &mut self.engine,
+            self.world_id,
+            &mut self.ids,
+            kind,
+            &LOGIC_GATE_PARAMETERS,
+        );
+        attach_all(
+            &mut self.engine,
+            self.world_id,
+            device,
+            &[output, self.supply, self.ground, a, b],
+        );
+
+        GateOutput {
+            wire: output,
+            device,
+        }
+    }
+
+    fn nand(&mut self, a: WireId, b: WireId) -> GateOutput {
+        self.binary_gate(PrimitiveElementKind::Nand2, a, b)
+    }
+
     fn inverter(&mut self, input: WireId) -> GateOutput {
-        self.nand(input, input)
+        self.unary_gate(PrimitiveElementKind::Not, input)
     }
 
     fn inverter_into(&mut self, output: WireId, input: WireId) -> GateOutput {
-        self.nand_into(output, input, input)
+        self.unary_gate_into(PrimitiveElementKind::Not, output, input)
     }
 
     fn and_gate(&mut self, a: WireId, b: WireId) -> GateOutput {
-        let nand = self.nand(a, b);
-        self.inverter(nand.wire)
+        self.binary_gate(PrimitiveElementKind::And2, a, b)
     }
 
     fn or_gate(&mut self, a: WireId, b: WireId) -> GateOutput {
-        let not_a = self.inverter(a);
-        let not_b = self.inverter(b);
-        self.nand(not_a.wire, not_b.wire)
+        self.binary_gate(PrimitiveElementKind::Or2, a, b)
     }
 
     fn xor_gate(&mut self, a: WireId, b: WireId) -> GateOutput {
@@ -233,8 +227,7 @@ impl DigitalHarness {
     }
 
     fn nor(&mut self, a: WireId, b: WireId) -> GateOutput {
-        let or = self.or_gate(a, b);
-        self.inverter(or.wire)
+        self.binary_gate(PrimitiveElementKind::Nor2, a, b)
     }
 
     fn mux(&mut self, a: WireId, b: WireId, select: WireId) -> GateOutput {
@@ -244,9 +237,14 @@ impl DigitalHarness {
 
     fn mux_into(&mut self, output: WireId, a: WireId, b: WireId, select: WireId) -> GateOutput {
         let not_select = self.inverter(select);
-        let not_a_selected = self.nand(a, not_select.wire);
-        let not_b_selected = self.nand(b, select);
-        self.nand_into(output, not_a_selected.wire, not_b_selected.wire)
+        let a_selected = self.and_gate(a, not_select.wire);
+        let b_selected = self.and_gate(b, select);
+        self.binary_gate_into(
+            PrimitiveElementKind::Or2,
+            output,
+            a_selected.wire,
+            b_selected.wire,
+        )
     }
 
     fn full_adder(&mut self, a: WireId, b: WireId, carry_in: WireId) -> (GateOutput, GateOutput) {
@@ -313,14 +311,14 @@ impl DigitalHarness {
     }
 
     fn observe_gate(&mut self, output: GateOutput) -> ProbeId {
-        self.observe(output.pull_up, 0, ProbeTransform::SupplyMinus)
+        self.observe(output.device, 0)
     }
 
     fn observe_delay(&mut self, delay: DeviceId) -> ProbeId {
-        self.observe(delay, 1, ProbeTransform::Direct)
+        self.observe(delay, 1)
     }
 
-    fn observe(&mut self, device: DeviceId, observer: u32, transform: ProbeTransform) -> ProbeId {
+    fn observe(&mut self, device: DeviceId, observer: u32) -> ProbeId {
         let subscription = self
             .engine
             .subscribe_observer(
@@ -333,7 +331,6 @@ impl DigitalHarness {
         let id = ProbeId(self.probes.len());
         self.probes.push(Probe {
             subscription,
-            transform,
             value: None,
         });
         id
@@ -348,7 +345,7 @@ impl DigitalHarness {
                 .iter_mut()
                 .find(|probe| probe.subscription == update.subscription())
             {
-                probe.value = Some(probe.transform.apply(update.value()));
+                probe.value = Some(update.value());
             }
         }
 
@@ -768,26 +765,24 @@ const FULL_CPU_INSTRUCTION_BITS: usize = FULL_CPU_OPCODE_BITS + FULL_CPU_REGISTE
 const FULL_CPU_TICK_DELAYS: usize =
     FULL_CPU_PC_BITS + FULL_CPU_REGISTER_BITS * 2 + 1 + FULL_CPU_INSTRUCTION_BITS + 1;
 const FULL_CPU_ROM_OR_GATES: usize = 40;
-const FULL_CPU_NAND_GATES: usize = 1 // phase inverter
-    + 4 + 16 * 6 + FULL_CPU_ROM_OR_GATES * 3 // 16x11 ROM
-    + FULL_CPU_INSTRUCTION_BITS * 4 // IR hold/fetch muxes
-    + 3 + 8 * 4 // opcode decoder
-    + FULL_CPU_REGISTER_BITS * (9 + 4 + 2) // ADD, XOR, AND datapaths
-    + 5 * 2 // phase-gated register write enables
-    + FULL_CPU_REGISTER_BITS * 4 * 4 // four A-result mux stages
-    + FULL_CPU_REGISTER_BITS * 4 // B write muxes
-    + 4 // carry write mux
-    + 7 * 3 + 1 // zero detector
-    + FULL_CPU_PC_BITS * 9 // PC + 1 ripple adder
-    + 2 + 3 // JZ condition + branch OR
-    + FULL_CPU_PC_BITS * 4 // branch target muxes
-    + FULL_CPU_PC_BITS * 4; // PC hold/execute muxes
+const FULL_CPU_LOGIC_GATES: usize = 1 // phase inverter
+    + 4 + 16 * 3 + FULL_CPU_ROM_OR_GATES // 16x11 ROM
+    + FULL_CPU_INSTRUCTION_BITS * GATES_PER_MUX // IR hold/fetch muxes
+    + 3 + 8 * 2 // opcode decoder
+    + FULL_CPU_REGISTER_BITS * (GATES_PER_FULL_ADDER + GATES_PER_XOR + 1) // ADD, XOR, AND datapaths
+    + 5 // phase-gated register write enables
+    + FULL_CPU_REGISTER_BITS * 4 * GATES_PER_MUX // four A-result mux stages
+    + FULL_CPU_REGISTER_BITS * GATES_PER_MUX // B write muxes
+    + GATES_PER_MUX // carry write mux
+    + 7 + 1 // zero detector
+    + FULL_CPU_PC_BITS * GATES_PER_FULL_ADDER // PC + 1 ripple adder
+    + 1 + 1 // JZ condition + branch OR
+    + FULL_CPU_PC_BITS * GATES_PER_MUX // branch target muxes
+    + FULL_CPU_PC_BITS * GATES_PER_MUX; // PC hold/execute muxes
 
-pub const FULL_CPU_DEVICE_COUNT: usize =
-    1 + FULL_CPU_NAND_GATES * DEVICES_PER_NAND + FULL_CPU_TICK_DELAYS;
-pub const FULL_CPU_NONLINEAR_DEVICE_COUNT: usize = FULL_CPU_NAND_GATES * SWITCHES_PER_NAND;
-pub const FULL_CPU_STATEFUL_DEVICE_COUNT: usize =
-    FULL_CPU_NONLINEAR_DEVICE_COUNT + FULL_CPU_TICK_DELAYS;
+pub const FULL_CPU_DEVICE_COUNT: usize = 1 + FULL_CPU_LOGIC_GATES + FULL_CPU_TICK_DELAYS;
+pub const FULL_CPU_NONLINEAR_DEVICE_COUNT: usize = FULL_CPU_LOGIC_GATES;
+pub const FULL_CPU_STATEFUL_DEVICE_COUNT: usize = FULL_CPU_TICK_DELAYS;
 
 const OP_NOP: u8 = 0;
 const OP_LDA: u8 = 1;
