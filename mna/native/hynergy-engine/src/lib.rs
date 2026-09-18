@@ -100,8 +100,7 @@ impl From<WorldTickError> for EngineTickError {
                     Self::MissingParameter { device, parameter }
                 }
 
-                PhysicalStateError::StateNotInitialized { .. }
-                | PhysicalStateError::DuplicateWrite { .. } => Self::InternalInvariant,
+                PhysicalStateError::StateNotInitialized { .. } => Self::InternalInvariant,
             },
         }
     }
@@ -279,6 +278,7 @@ impl Engine {
     }
 
     #[cfg(test)]
+    #[cfg(debug_assertions)]
     #[inline]
     fn world_mut(&mut self, world_id: u32) -> Option<&mut World> {
         self.universe
@@ -875,9 +875,6 @@ pub(crate) enum PhysicalStateError {
 
     #[error("state {state:?} is not initialized")]
     StateNotInitialized { state: DeviceState },
-
-    #[error("state {state:?} has more than one staged write")]
-    DuplicateWrite { state: DeviceState },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -976,15 +973,21 @@ impl PhysicalStateStore {
         &mut self,
         writes: &[StagedStateWrite],
     ) -> Result<(), PhysicalStateError> {
+        #[cfg(debug_assertions)]
         for (index, write) in writes.iter().enumerate() {
             let state = write.state();
 
-            if writes[..index]
-                .iter()
-                .any(|previous| previous.state() == state)
-            {
-                return Err(PhysicalStateError::DuplicateWrite { state });
-            }
+            debug_assert!(
+                !writes[..index]
+                    .iter()
+                    .any(|previous| previous.state() == state),
+                "state {state:?} has more than one staged write despite \
+                 single-writer definition compilation",
+            );
+        }
+
+        for write in writes {
+            let state = write.state();
 
             let exists = self
                 .devices
@@ -1387,6 +1390,38 @@ mod tests {
             engine.unsubscribe(world, subscription),
             Err(SubscriptionError::UnknownSubscription { subscription }),
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(
+        expected = "has more than one staged write despite single-writer definition compilation"
+    )]
+    fn duplicate_staged_write_violates_single_writer_invariant() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let capacitor = device(1);
+
+        world
+            .add_device(
+                &definitions,
+                capacitor,
+                PrimitiveElementKind::Capacitor.into(),
+            )
+            .unwrap();
+
+        world
+            .physical_state
+            .initialize_device(&definitions, &world.network, capacitor)
+            .unwrap();
+
+        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+
+        let _ = world.physical_state.commit_staged(&[
+            StagedStateWrite::new(state, 3.0),
+            StagedStateWrite::new(state, 7.0),
+        ]);
     }
 
     #[test]
@@ -2108,20 +2143,24 @@ mod tests {
             .unwrap();
 
         let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+        let missing = DeviceState::new(capacitor, DefinitionStateId::new(1));
 
-        assert_eq!(world.physical_state.get(state), Some(0.0),);
+        assert_eq!(world.physical_state.get(state), Some(0.0));
 
         let error = world
             .physical_state
             .commit_staged(&[
                 StagedStateWrite::new(state, 3.0),
-                StagedStateWrite::new(state, 7.0),
+                StagedStateWrite::new(missing, 7.0),
             ])
             .unwrap_err();
 
-        assert_eq!(error, PhysicalStateError::DuplicateWrite { state },);
+        assert_eq!(
+            error,
+            PhysicalStateError::StateNotInitialized { state: missing },
+        );
 
-        assert_eq!(world.physical_state.get(state), Some(0.0),);
+        assert_eq!(world.physical_state.get(state), Some(0.0));
     }
 
     #[test]
@@ -2330,7 +2369,9 @@ mod tests {
         ));
 
         assert_eq!(
-            world.physical_state.get(DeviceState::new(switch, DefinitionStateId::new(0))),
+            world
+                .physical_state
+                .get(DeviceState::new(switch, DefinitionStateId::new(0))),
             None,
         );
     }

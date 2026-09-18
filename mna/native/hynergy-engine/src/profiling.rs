@@ -117,11 +117,7 @@ impl SolverIslandProfile {
     }
 
     #[inline]
-    pub(crate) fn record_iteration(
-        &mut self,
-        stability_changes: usize,
-        max_solution_delta: f64,
-    ) {
+    pub(crate) fn record_iteration(&mut self, stability_changes: usize, max_solution_delta: f64) {
         self.iterations.push(SolverIterationProfile {
             stability_changes,
             max_solution_delta,
@@ -148,7 +144,10 @@ impl SolverTickProfile {
 
     #[inline]
     pub fn total_mna_solves(&self) -> usize {
-        self.islands.iter().map(SolverIslandProfile::mna_solves).sum()
+        self.islands
+            .iter()
+            .map(SolverIslandProfile::mna_solves)
+            .sum()
     }
 
     #[inline]

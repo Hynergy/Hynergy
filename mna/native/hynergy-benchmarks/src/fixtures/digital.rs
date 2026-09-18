@@ -1,10 +1,10 @@
 use super::{CpuWorkloadSize, IdAllocator};
+#[cfg(feature = "solver-profiling")]
+use hynergy_engine::SolverTickProfile;
 use hynergy_engine::{
     Engine, EngineConfig, EngineTickError, SubscriptionId, WorldCommand, WorldCommandApplyError,
     WorldConfig,
 };
-#[cfg(feature = "solver-profiling")]
-use hynergy_engine::SolverTickProfile;
 use hynergy_model::device::definition::{DeviceId, PrimitiveElementKind, TerminalId};
 use hynergy_model::network::WireId;
 use hynergy_model::parameter::ParameterId;

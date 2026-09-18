@@ -22,6 +22,47 @@ pub(crate) struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
+    fn new(
+        partitions: Box<[CompiledPartitionTemplate]>,
+        state_count: usize,
+    ) -> Result<Self, DefinitionCompileError> {
+        let mut state_writers = vec![None; state_count];
+
+        for (partition_index, partition) in partitions.iter().enumerate() {
+            let partition_id = DevicePartitionId::new(
+                u16::try_from(partition_index)
+                    .expect("compiled partition index must fit DevicePartitionId"),
+            );
+
+            for &state in partition.definition_state_writes() {
+                let owner = state_writers
+                    .get_mut(state.index())
+                    .expect("compiled state write must reference a definition state");
+
+                match *owner {
+                    None => {
+                        *owner = Some(partition_id);
+                    }
+
+                    Some(first) if first == partition_id => {}
+
+                    Some(first) => {
+                        return Err(DefinitionCompileError::MultipleStateWriterPartitions {
+                            state,
+                            first,
+                            second: partition_id,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            partitions,
+            state_count,
+        })
+    }
+
     pub(crate) fn compile(
         registry: &DefinitionRegistry,
         definition: &DeviceDefinition,
@@ -77,10 +118,7 @@ impl CompiledDefinition {
             "compiled partition count must match definition",
         );
 
-        Ok(Self {
-            partitions,
-            state_count: definition.state_count(),
-        })
+        Self::new(partitions, definition.state_count())
     }
 
     #[inline]
@@ -320,6 +358,13 @@ pub(crate) enum DefinitionCompileError {
 
     #[error(transparent)]
     Template(#[from] DefinitionTemplateBuildError),
+
+    #[error("definition state {state:?} has multiple writer partitions: {first:?} and {second:?}")]
+    MultipleStateWriterPartitions {
+        state: DefinitionStateId,
+        first: DevicePartitionId,
+        second: DevicePartitionId,
+    },
 }
 
 impl CompiledDefinitionTemplate {
@@ -1009,13 +1054,8 @@ fn compile_schmitt_buffer(
 
     let state = builder.state()?;
     let input_voltage = voltage_difference(builder, input, vss)?;
-    let output_high = hysteretic_binary_mode(
-        builder,
-        input_voltage,
-        state.value(),
-        threshold,
-        hysteresis,
-    )?;
+    let output_high =
+        hysteretic_binary_mode(builder, input_voltage, state.value(), threshold, hysteresis)?;
 
     builder.write_state(state, output_high)?;
 
@@ -1483,6 +1523,42 @@ mod tests {
                 "{kind:?} partition {partition_index}",
             );
         }
+    }
+
+    fn partition_with_state_writes(states: &[DefinitionStateId]) -> CompiledPartitionTemplate {
+        CompiledPartitionTemplate {
+            definition_terminals: SmallVec::new(),
+            definition_parameters: SmallVec::new(),
+            definition_states: SmallVec::from_slice(states),
+            definition_state_reads: SmallVec::new(),
+            definition_state_writes: SmallVec::from_slice(states),
+            definition_observers: SmallVec::new(),
+            template: DefinitionTemplateBuilder::default().finish().unwrap(),
+        }
+    }
+
+    #[test]
+    fn compiled_definition_rejects_multiple_writer_partitions_for_state() {
+        let state = DefinitionStateId::new(0);
+
+        let error = CompiledDefinition::new(
+            vec![
+                partition_with_state_writes(&[state]),
+                partition_with_state_writes(&[state]),
+            ]
+            .into_boxed_slice(),
+            1,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            DefinitionCompileError::MultipleStateWriterPartitions {
+                state,
+                first: DevicePartitionId::new(0),
+                second: DevicePartitionId::new(1),
+            },
+        );
     }
 
     #[test]

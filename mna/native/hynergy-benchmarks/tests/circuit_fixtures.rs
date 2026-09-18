@@ -368,9 +368,8 @@ fn full_cpu_32_bit_executes_program_and_updates_architectural_state() {
 #[cfg(feature = "solver-profiling")]
 #[test]
 fn full_cpu_exposes_solver_tick_profile() {
-    let mut cpu = FullCpuScenario::new_with_width(
-        hynergy_benchmarks::fixtures::FullCpuWidth::Bits8,
-    );
+    let mut cpu =
+        FullCpuScenario::new_with_width(hynergy_benchmarks::fixtures::FullCpuWidth::Bits8);
 
     cpu.tick().unwrap();
 
