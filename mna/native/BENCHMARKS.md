@@ -63,7 +63,7 @@ The profile command requires one target and one exact case. It rejects zero or m
 Set `PROFILE_SECONDS` to change the default 20-second profile:
 
 ```bash
-PROFILE_SECONDS=30 ./bench-linux.sh profile \
+PROFILE_SECONDS=60 ./bench-linux.sh profile \
     cpu_validated \
     world/cpu/validated/steady_active/small_lanes12_devices1177
 ```
@@ -87,7 +87,8 @@ cargo test -p hynergy-benchmarks --test circuit_fixtures
 The tests verify circuit construction, dirty mutations, topology changes, subscriptions, digital truth tables,
 registered arithmetic, workload sizes, and the complete CPU program.
 
-The validated CPU tiers use primitive logic gates to build 8-bit ripple-carry adders. Each result and carry output passes
+The validated CPU tiers use primitive logic gates to build 8-bit ripple-carry adders. Each result and carry output
+passes
 through a `TickDelay` register. The test accepts a digital LOW at or below 1.0 V and a digital HIGH at or above 4.0 V.
 It rejects values in the ambiguous range.
 
