@@ -1432,9 +1432,8 @@ mod tests {
                 &[0, 1, 2, 3],
                 &[
                     0.0, // threshold
-                    0.0, // hysteresis
                     1.0, // G_max
-                    1.0, // G_min -- invalid because G_max must be > G_min
+                    1.0, // G_min
                 ],
             ),
         ));

@@ -20,7 +20,7 @@ use {
 
 const NONLINEAR_ABSOLUTE_TOLERANCE: f64 = 1.0e-9;
 const NONLINEAR_RELATIVE_TOLERANCE: f64 = 1.0e-6;
-const NONLINEAR_MAX_ITERATIONS: usize = 32;
+const NONLINEAR_MAX_ITERATIONS: usize = 128;
 
 #[derive(Debug)]
 struct NonlinearScratch {
@@ -1757,7 +1757,7 @@ mod test {
         assert_eq!(workspace.value(update), 0.0);
     }
 
-    fn voltage_controlled_switch_island() -> (
+    fn schmitt_buffer_island() -> (
         DefinitionRegistry,
         Network,
         crate::compile::island::CompiledIsland,
@@ -1771,71 +1771,54 @@ mod test {
 
         let common = WireId::try_from(1).unwrap();
         let output = WireId::try_from(2).unwrap();
-        let control = WireId::try_from(3).unwrap();
+        let input = WireId::try_from(3).unwrap();
+        let supply = WireId::try_from(4).unwrap();
 
-        let switch = DeviceId::try_from(1).unwrap();
-        let control_source = DeviceId::try_from(2).unwrap();
-        let current_source = DeviceId::try_from(3).unwrap();
+        let buffer = DeviceId::try_from(1).unwrap();
+        let input_source = DeviceId::try_from(2).unwrap();
+        let supply_source = DeviceId::try_from(3).unwrap();
 
-        network.add_wire(common).unwrap();
-        network.add_wire(output).unwrap();
-        network.add_wire(control).unwrap();
-
-        network
-            .add_device(
-                &definitions,
-                switch,
-                PrimitiveElementKind::VoltageControlledSwitch.into(),
-            )
-            .unwrap();
+        for wire in [common, output, input, supply] {
+            network.add_wire(wire).unwrap();
+        }
 
         network
             .add_device(
                 &definitions,
-                control_source,
-                PrimitiveElementKind::VoltageSource.into(),
+                buffer,
+                PrimitiveElementKind::SchmittBuffer.into(),
             )
             .unwrap();
 
+        for source in [input_source, supply_source] {
+            network
+                .add_device(
+                    &definitions,
+                    source,
+                    PrimitiveElementKind::VoltageSource.into(),
+                )
+                .unwrap();
+        }
+
+        // SchmittBuffer terminals: Y, VDD, VSS, A.
+        for (wire, terminal) in [(output, 0), (supply, 1), (common, 2), (input, 3)] {
+            network
+                .attach_terminal(wire, buffer, TerminalId::new(terminal))
+                .unwrap();
+        }
+
         network
-            .add_device(
-                &definitions,
-                current_source,
-                PrimitiveElementKind::CurrentSource.into(),
-            )
+            .attach_terminal(input, input_source, TerminalId::new(0))
+            .unwrap();
+        network
+            .attach_terminal(common, input_source, TerminalId::new(1))
             .unwrap();
 
         network
-            .attach_terminal(output, switch, TerminalId::new(0))
+            .attach_terminal(supply, supply_source, TerminalId::new(0))
             .unwrap();
-
         network
-            .attach_terminal(common, switch, TerminalId::new(1))
-            .unwrap();
-
-        network
-            .attach_terminal(control, switch, TerminalId::new(2))
-            .unwrap();
-
-        network
-            .attach_terminal(common, switch, TerminalId::new(3))
-            .unwrap();
-
-        network
-            .attach_terminal(control, control_source, TerminalId::new(0))
-            .unwrap();
-
-        network
-            .attach_terminal(common, control_source, TerminalId::new(1))
-            .unwrap();
-
-        // Inject 8 A into the output.
-        network
-            .attach_terminal(common, current_source, TerminalId::new(0))
-            .unwrap();
-
-        network
-            .attach_terminal(output, current_source, TerminalId::new(1))
+            .attach_terminal(common, supply_source, TerminalId::new(1))
             .unwrap();
 
         // threshold = 2
@@ -1846,22 +1829,22 @@ mod test {
         // G_min = 1
         for (index, value) in [2.0, 2.0, 4.0, 1.0].into_iter().enumerate() {
             network
-                .set_device_parameter(&definitions, switch, ParameterId::new(index as u32), value)
+                .set_device_parameter(&definitions, buffer, ParameterId::new(index as u32), value)
                 .unwrap();
         }
 
         network
-            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 0.0)
+            .set_device_parameter(&definitions, input_source, ParameterId::new(0), 0.0)
             .unwrap();
 
         network
-            .set_device_parameter(&definitions, current_source, ParameterId::new(0), 8.0)
+            .set_device_parameter(&definitions, supply_source, ParameterId::new(0), 5.0)
             .unwrap();
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
         let island =
-            topology.component_island(DeviceComponent::new(switch, DevicePartitionId::new(0)));
+            topology.component_island(DeviceComponent::new(buffer, DevicePartitionId::new(0)));
 
         let output_node = IslandNode::net(topology.wire_net(output));
         let common_node = IslandNode::net(topology.wire_net(common));
@@ -1874,23 +1857,22 @@ mod test {
             compiled,
             output_node,
             common_node,
-            switch,
-            control_source,
+            buffer,
+            input_source,
         )
     }
 
     #[test]
-    fn voltage_controlled_switch_applies_hysteresis() {
-        let (definitions, mut network, compiled, output_node, common_node, switch, control_source) =
-            voltage_controlled_switch_island();
+    fn schmitt_buffer_applies_hysteresis_across_ticks() {
+        let (definitions, mut network, compiled, output_node, common_node, buffer, input_source) =
+            schmitt_buffer_island();
 
         let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
-        let state = DeviceState::new(switch, DefinitionStateId::new(0));
-
+        let state = DeviceState::new(buffer, DefinitionStateId::new(0));
         let mut mode = 0.0;
 
-        // Below lower threshold: remain OFF.
+        // Below lower threshold: remain LOW.
         let writes = runtime
             .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
             .unwrap();
@@ -1902,13 +1884,13 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        assert!((voltage - 8.0).abs() < 1.0e-9);
+        assert!((voltage - 1.0).abs() < 1.0e-9);
 
         mode = writes[0].value();
 
-        // Above upper threshold: turn ON.
+        // Above upper threshold: switch HIGH.
         network
-            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 4.0)
+            .set_device_parameter(&definitions, input_source, ParameterId::new(0), 4.0)
             .unwrap();
 
         runtime.mark_numerical_dirty();
@@ -1922,13 +1904,13 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        assert!((voltage - 2.0).abs() < 1.0e-9);
+        assert!((voltage - 4.0).abs() < 1.0e-9);
 
         mode = writes[0].value();
 
-        // Inside the deadband: retain ON.
+        // Inside the deadband: retain HIGH.
         network
-            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 2.0)
+            .set_device_parameter(&definitions, input_source, ParameterId::new(0), 2.0)
             .unwrap();
 
         runtime.mark_numerical_dirty();
@@ -1942,13 +1924,13 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        assert!((voltage - 2.0).abs() < 1.0e-9);
+        assert!((voltage - 4.0).abs() < 1.0e-9);
 
         mode = writes[0].value();
 
-        // Below lower threshold: turn OFF.
+        // Below lower threshold: switch LOW.
         network
-            .set_device_parameter(&definitions, control_source, ParameterId::new(0), 0.0)
+            .set_device_parameter(&definitions, input_source, ParameterId::new(0), 0.0)
             .unwrap();
 
         runtime.mark_numerical_dirty();
@@ -1962,7 +1944,7 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        assert!((voltage - 8.0).abs() < 1.0e-9);
+        assert!((voltage - 1.0).abs() < 1.0e-9);
     }
 
     #[test]

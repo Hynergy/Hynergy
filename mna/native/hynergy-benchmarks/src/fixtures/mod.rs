@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 pub use digital::{
     FULL_CPU_DEVICE_COUNT, FULL_CPU_NONLINEAR_DEVICE_COUNT, FULL_CPU_STATEFUL_DEVICE_COUNT,
-    FullCpuScenario, ValidatedCpuScenario,
+    FullCpuScenario, FullCpuWidth, ValidatedCpuScenario,
 };
 pub use workloads::{MixedProfile, SubscriptionProfile, TopologyMutation, TopologyScenario};
 
@@ -120,7 +120,7 @@ impl CpuWorkloadSize {
     }
 
     pub const fn stateful_device_count(self) -> usize {
-        self.logic_nodes() + self.logic_nodes().div_ceil(2)
+        self.logic_nodes().div_ceil(2)
     }
 
     pub const fn validated_lanes(self) -> usize {

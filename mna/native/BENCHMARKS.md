@@ -45,7 +45,7 @@ The runner writes environment and result logs to `target/bench-logs`.
 | `subscriptions` | Sparse, dense sleeping, and dense changing subscriptions |
 | `cpu_synthetic` | Synthetic CPU-shaped scaling workload                    |
 | `cpu_validated` | Gate-built adders with registered outputs                |
-| `cpu_full`      | Complete autonomous 8-bit CPU; full suite only           |
+| `cpu_full`      | Complete autonomous 8-/32-bit CPUs; full suite only      |
 | `protocol`      | Definition-buffer registration by command shape          |
 
 Use `./bench-linux.sh list` to get the exact Criterion case names for the active suite.
@@ -65,7 +65,7 @@ Set `PROFILE_SECONDS` to change the default 20-second profile:
 ```bash
 PROFILE_SECONDS=30 ./bench-linux.sh profile \
     cpu_validated \
-    world/cpu/validated/steady_active/small_lanes12_devices2905
+    world/cpu/validated/steady_active/small_lanes12_devices1177
 ```
 
 The runner writes SVG files to `target/flamegraphs`.
@@ -87,11 +87,13 @@ cargo test -p hynergy-benchmarks --test circuit_fixtures
 The tests verify circuit construction, dirty mutations, topology changes, subscriptions, digital truth tables,
 registered arithmetic, workload sizes, and the complete CPU program.
 
-The validated CPU tiers use 8-bit ripple-carry adders built from NAND gates. Each result and carry output passes through
-a `TickDelay` register. The test accepts a digital LOW at or below 1.0 V and a digital HIGH at or above 4.0 V. It
-rejects values in the ambiguous range.
+The validated CPU tiers use primitive logic gates to build 8-bit ripple-carry adders. Each result and carry output passes
+through a `TickDelay` register. The test accepts a digital LOW at or below 1.0 V and a digital HIGH at or above 4.0 V.
+It rejects values in the ambiguous range.
 
-The complete CPU contains a 4-bit program counter, an 11-bit instruction register, two 8-bit registers, a carry flag, a
-two-phase FETCH/EXEC controller, a gate-built ROM, an 8-bit adder, logic operations, and branch control. Its fixture has
-2,101 devices, including 1,378 nonlinear switches and 1,411 stateful devices. The correctness test checks every
-instruction in its validation program, including a taken conditional branch.
+The complete CPU benchmark has 8-bit and 32-bit datapath variants. Both contain a 4-bit program counter, two data
+registers, a carry flag, a two-phase FETCH/EXEC controller, a gate-built 16-word ROM, an adder, logic operations, and
+branch control. The instruction register is the datapath width plus the 3-bit opcode. The 8-bit fixture has 549 devices,
+including 515 nonlinear logic gates and 33 stateful devices. The 32-bit fixture has 1,557 devices, including 1,451
+nonlinear logic gates and 105 stateful devices. The correctness tests execute the same program at both widths, including
+an overflow-to-zero ADD and a taken conditional branch.

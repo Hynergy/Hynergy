@@ -514,7 +514,7 @@ pub(crate) fn build_cpu_workload(
             world_id,
             ids,
             PrimitiveElementKind::VoltageControlledSwitch,
-            &[2.5, 0.20, 0.05, 1.0e-6],
+            &[2.5, 0.05, 1.0e-6],
         );
         attach_all(engine, world_id, switch, &[node, ground, control, ground]);
 
@@ -557,7 +557,7 @@ pub(crate) fn build_cpu_workload(
 
     let device_count = ids.allocated_devices() - before_devices;
     let nonlinear_device_count = logic_nodes * 2;
-    let stateful_device_count = logic_nodes + logic_nodes.div_ceil(2);
+    let stateful_device_count = logic_nodes.div_ceil(2);
     let expected_devices = 2 + logic_nodes * 5 + logic_nodes.div_ceil(2);
 
     assert_eq!(

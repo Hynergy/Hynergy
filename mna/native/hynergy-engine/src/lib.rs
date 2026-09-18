@@ -1014,7 +1014,7 @@ fn initialize_definition_state(
         DeviceBody::Primitive(
             PrimitiveElementKind::Capacitor
             | PrimitiveElementKind::Inductor
-            | PrimitiveElementKind::VoltageControlledSwitch,
+            | PrimitiveElementKind::SchmittBuffer,
         ) => {
             debug_assert_eq!(definition.state_count(), 1,);
 
@@ -2172,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn voltage_controlled_switch_initializes_off() {
+    fn schmitt_buffer_initializes_low() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
 
@@ -2182,7 +2182,7 @@ mod tests {
             .add_device(
                 &definitions,
                 switch,
-                PrimitiveElementKind::VoltageControlledSwitch.into(),
+                PrimitiveElementKind::SchmittBuffer.into(),
             )
             .unwrap();
 
@@ -2210,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn nonconvergent_switch_does_not_commit_physical_state() {
+    fn nonconvergent_stateless_switch_reports_convergence_failure() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::new(world_config());
 
@@ -2269,22 +2269,19 @@ mod tests {
             .unwrap();
 
         // threshold = 5
-        // hysteresis = 2
-        // lower = 4
-        // upper = 6
         // G_max = 4
         // G_min = 1
         //
         // OFF:
         //     Vout = 8 / 1 = 8 V
-        //     8 >= upper -> ON
+        //     8 >= threshold -> ON
         //
         // ON:
         //     Vout = 8 / 4 = 2 V
-        //     2 <= lower -> OFF
+        //     2 < threshold -> OFF
         //
         // Therefore no stable discrete operating point exists.
-        for (index, value) in [5.0, 2.0, 4.0, 1.0].into_iter().enumerate() {
+        for (index, value) in [5.0, 4.0, 1.0].into_iter().enumerate() {
             world
                 .set_device_parameter(&definitions, switch, ParameterId::new(index as u32), value)
                 .unwrap();
@@ -2301,11 +2298,10 @@ mod tests {
             WorldTickError::Runtime(IslandRuntimeError::NonlinearDidNotConverge { .. })
         ));
 
-        let state = DeviceState::new(switch, DefinitionStateId::new(0));
-
-        // initialize_physical_state() ran before the solve, so the
-        // state exists. The failed solve must not have changed OFF -> ON.
-        assert_eq!(world.physical_state.get(state), Some(0.0),);
+        assert_eq!(
+            world.physical_state.get(DeviceState::new(switch, DefinitionStateId::new(0))),
+            None,
+        );
     }
 
     #[test]

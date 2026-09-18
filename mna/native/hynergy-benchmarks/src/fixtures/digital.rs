@@ -759,30 +759,85 @@ impl ValidatedCpuScenario {
 }
 
 const FULL_CPU_PC_BITS: usize = 4;
-const FULL_CPU_REGISTER_BITS: usize = 8;
 const FULL_CPU_OPCODE_BITS: usize = 3;
-const FULL_CPU_INSTRUCTION_BITS: usize = FULL_CPU_OPCODE_BITS + FULL_CPU_REGISTER_BITS;
-const FULL_CPU_TICK_DELAYS: usize =
-    FULL_CPU_PC_BITS + FULL_CPU_REGISTER_BITS * 2 + 1 + FULL_CPU_INSTRUCTION_BITS + 1;
 const FULL_CPU_ROM_OR_GATES: usize = 40;
-const FULL_CPU_LOGIC_GATES: usize = 1 // phase inverter
-    + 4 + 16 * 3 + FULL_CPU_ROM_OR_GATES // 16x11 ROM
-    + FULL_CPU_INSTRUCTION_BITS * GATES_PER_MUX // IR hold/fetch muxes
-    + 3 + 8 * 2 // opcode decoder
-    + FULL_CPU_REGISTER_BITS * (GATES_PER_FULL_ADDER + GATES_PER_XOR + 1) // ADD, XOR, AND datapaths
-    + 5 // phase-gated register write enables
-    + FULL_CPU_REGISTER_BITS * 4 * GATES_PER_MUX // four A-result mux stages
-    + FULL_CPU_REGISTER_BITS * GATES_PER_MUX // B write muxes
-    + GATES_PER_MUX // carry write mux
-    + 7 + 1 // zero detector
-    + FULL_CPU_PC_BITS * GATES_PER_FULL_ADDER // PC + 1 ripple adder
-    + 1 + 1 // JZ condition + branch OR
-    + FULL_CPU_PC_BITS * GATES_PER_MUX // branch target muxes
-    + FULL_CPU_PC_BITS * GATES_PER_MUX; // PC hold/execute muxes
 
-pub const FULL_CPU_DEVICE_COUNT: usize = 1 + FULL_CPU_LOGIC_GATES + FULL_CPU_TICK_DELAYS;
-pub const FULL_CPU_NONLINEAR_DEVICE_COUNT: usize = FULL_CPU_LOGIC_GATES;
-pub const FULL_CPU_STATEFUL_DEVICE_COUNT: usize = FULL_CPU_TICK_DELAYS;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullCpuWidth {
+    Bits8,
+    Bits32,
+}
+
+impl FullCpuWidth {
+    pub const ALL: [Self; 2] = [Self::Bits8, Self::Bits32];
+
+    #[inline]
+    pub const fn bits(self) -> usize {
+        match self {
+            Self::Bits8 => 8,
+            Self::Bits32 => 32,
+        }
+    }
+
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bits8 => "cpu8",
+            Self::Bits32 => "cpu32",
+        }
+    }
+
+    #[inline]
+    pub const fn device_count(self) -> usize {
+        1 + self.nonlinear_device_count() + self.stateful_device_count()
+    }
+
+    #[inline]
+    pub const fn nonlinear_device_count(self) -> usize {
+        full_cpu_logic_gate_count(self.bits())
+    }
+
+    #[inline]
+    pub const fn stateful_device_count(self) -> usize {
+        full_cpu_tick_delay_count(self.bits())
+    }
+
+    #[inline]
+    const fn max_value(self) -> u32 {
+        match self {
+            Self::Bits8 => u8::MAX as u32,
+            Self::Bits32 => u32::MAX,
+        }
+    }
+}
+
+const fn full_cpu_tick_delay_count(register_bits: usize) -> usize {
+    let instruction_bits = FULL_CPU_OPCODE_BITS + register_bits;
+    FULL_CPU_PC_BITS + register_bits * 2 + 1 + instruction_bits + 1
+}
+
+const fn full_cpu_logic_gate_count(register_bits: usize) -> usize {
+    let instruction_bits = FULL_CPU_OPCODE_BITS + register_bits;
+
+    1 // phase inverter
+        + 4 + 16 * 3 + FULL_CPU_ROM_OR_GATES // 16-word ROM
+        + instruction_bits * GATES_PER_MUX // IR hold/fetch muxes
+        + 3 + 8 * 2 // opcode decoder
+        + register_bits * (GATES_PER_FULL_ADDER + GATES_PER_XOR + 1) // ADD, XOR, AND datapaths
+        + 5 // phase-gated register write enables
+        + register_bits * 4 * GATES_PER_MUX // four A-result mux stages
+        + register_bits * GATES_PER_MUX // B write muxes
+        + GATES_PER_MUX // carry write mux
+        + register_bits // zero detector: W-1 OR gates + NOT
+        + FULL_CPU_PC_BITS * GATES_PER_FULL_ADDER // PC + 1 ripple adder
+        + 1 + 1 // JZ condition + branch OR
+        + FULL_CPU_PC_BITS * GATES_PER_MUX // branch target muxes
+        + FULL_CPU_PC_BITS * GATES_PER_MUX // PC hold/execute muxes
+}
+
+pub const FULL_CPU_DEVICE_COUNT: usize = FullCpuWidth::Bits8.device_count();
+pub const FULL_CPU_NONLINEAR_DEVICE_COUNT: usize = FullCpuWidth::Bits8.nonlinear_device_count();
+pub const FULL_CPU_STATEFUL_DEVICE_COUNT: usize = FullCpuWidth::Bits8.stateful_device_count();
 
 const OP_NOP: u8 = 0;
 const OP_LDA: u8 = 1;
@@ -793,47 +848,51 @@ const OP_AND: u8 = 5;
 const OP_JZ: u8 = 6;
 const OP_JMP: u8 = 7;
 
-const fn full_cpu_instruction(opcode: u8, immediate: u8) -> u16 {
-    (opcode as u16) | ((immediate as u16) << FULL_CPU_OPCODE_BITS)
+const fn full_cpu_instruction(opcode: u8, immediate: u32) -> u64 {
+    (opcode as u64) | ((immediate as u64) << FULL_CPU_OPCODE_BITS)
 }
 
-const FULL_CPU_PROGRAM: [u16; 16] = [
-    full_cpu_instruction(OP_LDA, 5),
-    full_cpu_instruction(OP_LDB, 7),
-    full_cpu_instruction(OP_ADD, 0),
-    full_cpu_instruction(OP_LDB, 3),
-    full_cpu_instruction(OP_XOR, 0),
-    full_cpu_instruction(OP_LDB, 15),
-    full_cpu_instruction(OP_AND, 0),
-    full_cpu_instruction(OP_LDB, 241),
-    full_cpu_instruction(OP_ADD, 0),
-    full_cpu_instruction(OP_JZ, 11),
-    full_cpu_instruction(OP_LDA, 0xee),
-    full_cpu_instruction(OP_LDA, 42),
-    full_cpu_instruction(OP_LDB, 1),
-    full_cpu_instruction(OP_ADD, 0),
-    full_cpu_instruction(OP_JMP, 0),
-    full_cpu_instruction(OP_NOP, 0),
-];
+const fn full_cpu_program(width: FullCpuWidth) -> [u64; 16] {
+    let overflow_rhs = width.max_value() - 14;
+
+    [
+        full_cpu_instruction(OP_LDA, 5),
+        full_cpu_instruction(OP_LDB, 7),
+        full_cpu_instruction(OP_ADD, 0),
+        full_cpu_instruction(OP_LDB, 3),
+        full_cpu_instruction(OP_XOR, 0),
+        full_cpu_instruction(OP_LDB, 15),
+        full_cpu_instruction(OP_AND, 0),
+        full_cpu_instruction(OP_LDB, overflow_rhs),
+        full_cpu_instruction(OP_ADD, 0),
+        full_cpu_instruction(OP_JZ, 11),
+        full_cpu_instruction(OP_LDA, 0xee),
+        full_cpu_instruction(OP_LDA, 42),
+        full_cpu_instruction(OP_LDB, 1),
+        full_cpu_instruction(OP_ADD, 0),
+        full_cpu_instruction(OP_JMP, 0),
+        full_cpu_instruction(OP_NOP, 0),
+    ]
+}
 
 #[derive(Debug)]
 struct FullCpuProbes {
     pc: [ProbeId; FULL_CPU_PC_BITS],
-    a: [ProbeId; FULL_CPU_REGISTER_BITS],
-    b: [ProbeId; FULL_CPU_REGISTER_BITS],
+    a: Vec<ProbeId>,
+    b: Vec<ProbeId>,
     carry: ProbeId,
-    instruction: [ProbeId; FULL_CPU_INSTRUCTION_BITS],
+    instruction: Vec<ProbeId>,
     phase: ProbeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FullCpuSnapshot {
     pc: u8,
-    a: u8,
-    b: u8,
+    a: u32,
+    b: u32,
     carry: bool,
     opcode: u8,
-    immediate: u8,
+    immediate: u32,
     execute_phase: bool,
 }
 
@@ -844,12 +903,12 @@ impl FullCpuSnapshot {
     }
 
     #[inline]
-    pub const fn a(self) -> u8 {
+    pub const fn a(self) -> u32 {
         self.a
     }
 
     #[inline]
-    pub const fn b(self) -> u8 {
+    pub const fn b(self) -> u32 {
         self.b
     }
 
@@ -864,7 +923,7 @@ impl FullCpuSnapshot {
     }
 
     #[inline]
-    pub const fn immediate(self) -> u8 {
+    pub const fn immediate(self) -> u32 {
         self.immediate
     }
 
@@ -876,6 +935,7 @@ impl FullCpuSnapshot {
 
 pub struct FullCpuScenario {
     harness: DigitalHarness,
+    width: FullCpuWidth,
     probes: Option<FullCpuProbes>,
     device_count: usize,
     nonlinear_device_count: usize,
@@ -890,32 +950,46 @@ impl Default for FullCpuScenario {
 
 impl FullCpuScenario {
     pub fn new() -> Self {
-        Self::build(false)
+        Self::new_with_width(FullCpuWidth::Bits8)
+    }
+
+    pub fn new_with_width(width: FullCpuWidth) -> Self {
+        Self::build(width, false)
     }
 
     pub fn for_test() -> Self {
-        Self::build(true)
+        Self::for_test_width(FullCpuWidth::Bits8)
     }
 
-    fn build(observe_architecture: bool) -> Self {
+    pub fn for_test_width(width: FullCpuWidth) -> Self {
+        Self::build(width, true)
+    }
+
+    fn build(width: FullCpuWidth, observe_architecture: bool) -> Self {
         let mut harness = DigitalHarness::new();
+        let register_bits = width.bits();
+        let instruction_bits = FULL_CPU_OPCODE_BITS + register_bits;
+        let program = full_cpu_program(width);
 
         let pc: [RegisterBit; FULL_CPU_PC_BITS] =
             std::array::from_fn(|_| harness.register_bit(false));
-        let a: [RegisterBit; FULL_CPU_REGISTER_BITS] =
-            std::array::from_fn(|_| harness.register_bit(false));
-        let b: [RegisterBit; FULL_CPU_REGISTER_BITS] =
-            std::array::from_fn(|_| harness.register_bit(false));
+        let a = (0..register_bits)
+            .map(|_| harness.register_bit(false))
+            .collect::<Vec<_>>();
+        let b = (0..register_bits)
+            .map(|_| harness.register_bit(false))
+            .collect::<Vec<_>>();
         let carry = harness.register_bit(false);
-        let instruction: [RegisterBit; FULL_CPU_INSTRUCTION_BITS] =
-            std::array::from_fn(|_| harness.register_bit(false));
+        let instruction = (0..instruction_bits)
+            .map(|_| harness.register_bit(false))
+            .collect::<Vec<_>>();
         let phase = harness.register_bit(false);
 
         harness.inverter_into(phase.input, phase.output);
 
-        let rom = build_full_cpu_rom(&mut harness, &pc);
+        let rom = build_full_cpu_rom(&mut harness, &pc, &program, instruction_bits);
 
-        for bit in 0..FULL_CPU_INSTRUCTION_BITS {
+        for bit in 0..instruction_bits {
             harness.mux_into(
                 instruction[bit].input,
                 rom[bit],
@@ -926,17 +1000,18 @@ impl FullCpuScenario {
 
         let opcode: [WireId; FULL_CPU_OPCODE_BITS] =
             std::array::from_fn(|bit| instruction[bit].output);
-        let immediate: [WireId; FULL_CPU_REGISTER_BITS] =
-            std::array::from_fn(|bit| instruction[FULL_CPU_OPCODE_BITS + bit].output);
+        let immediate = (0..register_bits)
+            .map(|bit| instruction[FULL_CPU_OPCODE_BITS + bit].output)
+            .collect::<Vec<_>>();
 
         let decoded = decode_opcode(&mut harness, opcode);
 
         let mut add_carry = harness.ground;
-        let mut add_result = Vec::with_capacity(FULL_CPU_REGISTER_BITS);
-        let mut xor_result = Vec::with_capacity(FULL_CPU_REGISTER_BITS);
-        let mut and_result = Vec::with_capacity(FULL_CPU_REGISTER_BITS);
+        let mut add_result = Vec::with_capacity(register_bits);
+        let mut xor_result = Vec::with_capacity(register_bits);
+        let mut and_result = Vec::with_capacity(register_bits);
 
-        for bit in 0..FULL_CPU_REGISTER_BITS {
+        for bit in 0..register_bits {
             let (sum, carry_out) = harness.full_adder(a[bit].output, b[bit].output, add_carry);
             add_result.push(sum.wire);
             add_carry = carry_out.wire;
@@ -961,7 +1036,7 @@ impl FullCpuScenario {
             .and_gate(phase.output, decoded[OP_AND as usize])
             .wire;
 
-        for bit in 0..FULL_CPU_REGISTER_BITS {
+        for bit in 0..register_bits {
             let lda = harness.mux(a[bit].output, immediate[bit], exec_lda);
             let add = harness.mux(lda.wire, add_result[bit], exec_add);
             let xor = harness.mux(add.wire, xor_result[bit], exec_xor);
@@ -997,19 +1072,25 @@ impl FullCpuScenario {
 
         let device_count = harness.ids.allocated_devices();
         assert_eq!(
-            device_count, FULL_CPU_DEVICE_COUNT,
+            device_count,
+            width.device_count(),
             "full CPU device count drifted; update benchmark metadata",
         );
 
         let probes = if observe_architecture {
             Some(FullCpuProbes {
                 pc: std::array::from_fn(|bit| harness.observe_delay(pc[bit].delay)),
-                a: std::array::from_fn(|bit| harness.observe_delay(a[bit].delay)),
-                b: std::array::from_fn(|bit| harness.observe_delay(b[bit].delay)),
+                a: a.iter()
+                    .map(|bit| harness.observe_delay(bit.delay))
+                    .collect(),
+                b: b.iter()
+                    .map(|bit| harness.observe_delay(bit.delay))
+                    .collect(),
                 carry: harness.observe_delay(carry.delay),
-                instruction: std::array::from_fn(|bit| {
-                    harness.observe_delay(instruction[bit].delay)
-                }),
+                instruction: instruction
+                    .iter()
+                    .map(|bit| harness.observe_delay(bit.delay))
+                    .collect(),
                 phase: harness.observe_delay(phase.delay),
             })
         } else {
@@ -1018,11 +1099,17 @@ impl FullCpuScenario {
 
         Self {
             harness,
+            width,
             probes,
             device_count,
-            nonlinear_device_count: FULL_CPU_NONLINEAR_DEVICE_COUNT,
-            stateful_device_count: FULL_CPU_STATEFUL_DEVICE_COUNT,
+            nonlinear_device_count: width.nonlinear_device_count(),
+            stateful_device_count: width.stateful_device_count(),
         }
+    }
+
+    #[inline]
+    pub const fn width(&self) -> FullCpuWidth {
+        self.width
     }
 
     #[inline]
@@ -1064,8 +1151,8 @@ impl FullCpuScenario {
     pub fn snapshot(&self) -> Option<FullCpuSnapshot> {
         let probes = self.probes.as_ref()?;
         let pc = read_probe_bits(&self.harness, &probes.pc)? as u8;
-        let a = read_probe_bits(&self.harness, &probes.a)? as u8;
-        let b = read_probe_bits(&self.harness, &probes.b)? as u8;
+        let a = read_probe_bits(&self.harness, &probes.a)? as u32;
+        let b = read_probe_bits(&self.harness, &probes.b)? as u32;
         let carry = logic_level(self.harness.voltage(probes.carry))?;
         let instruction = read_probe_bits(&self.harness, &probes.instruction)?;
         let execute_phase = logic_level(self.harness.voltage(probes.phase))?;
@@ -1076,7 +1163,8 @@ impl FullCpuScenario {
             b,
             carry,
             opcode: (instruction & 0x7) as u8,
-            immediate: ((instruction >> FULL_CPU_OPCODE_BITS) & 0xff) as u8,
+            immediate: ((instruction >> FULL_CPU_OPCODE_BITS) & u64::from(self.width.max_value()))
+                as u32,
             execute_phase,
         })
     }
@@ -1085,7 +1173,9 @@ impl FullCpuScenario {
 fn build_full_cpu_rom(
     harness: &mut DigitalHarness,
     pc: &[RegisterBit; FULL_CPU_PC_BITS],
-) -> [WireId; FULL_CPU_INSTRUCTION_BITS] {
+    program: &[u64; 16],
+    instruction_bits: usize,
+) -> Vec<WireId> {
     let inverted_pc: [WireId; FULL_CPU_PC_BITS] =
         std::array::from_fn(|bit| harness.inverter(pc[bit].output).wire);
 
@@ -1100,15 +1190,17 @@ fn build_full_cpu_rom(
         and4(harness, terms)
     });
 
-    std::array::from_fn(|bit| {
-        let mut selected = Vec::new();
-        for (address, &word) in FULL_CPU_PROGRAM.iter().enumerate() {
-            if (word & (1 << bit)) != 0 {
-                selected.push(address_lines[address]);
+    (0..instruction_bits)
+        .map(|bit| {
+            let mut selected = Vec::new();
+            for (address, &word) in program.iter().enumerate() {
+                if (word & (1u64 << bit)) != 0 {
+                    selected.push(address_lines[address]);
+                }
             }
-        }
-        or_reduce(harness, &selected)
-    })
+            or_reduce(harness, &selected)
+        })
+        .collect()
 }
 
 fn decode_opcode(
@@ -1151,20 +1243,17 @@ fn or_reduce(harness: &mut DigitalHarness, inputs: &[WireId]) -> WireId {
         .fold(first, |acc, input| harness.or_gate(acc, input).wire)
 }
 
-fn zero_detector(
-    harness: &mut DigitalHarness,
-    register: &[RegisterBit; FULL_CPU_REGISTER_BITS],
-) -> WireId {
-    let wires: [WireId; FULL_CPU_REGISTER_BITS] = std::array::from_fn(|bit| register[bit].output);
+fn zero_detector(harness: &mut DigitalHarness, register: &[RegisterBit]) -> WireId {
+    let wires = register.iter().map(|bit| bit.output).collect::<Vec<_>>();
     let any = or_reduce(harness, &wires);
     harness.inverter(any).wire
 }
 
-fn read_probe_bits<const N: usize>(harness: &DigitalHarness, probes: &[ProbeId; N]) -> Option<u16> {
-    let mut value = 0u16;
+fn read_probe_bits(harness: &DigitalHarness, probes: &[ProbeId]) -> Option<u64> {
+    let mut value = 0u64;
     for (bit, &probe) in probes.iter().enumerate() {
         if logic_level(harness.voltage(probe))? {
-            value |= 1 << bit;
+            value |= 1u64 << bit;
         }
     }
     Some(value)

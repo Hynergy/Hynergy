@@ -88,6 +88,7 @@ pub enum PrimitiveElementKind {
     Nand2 = 14,
     Or2 = 15,
     Nor2 = 16,
+    SchmittBuffer = 17,
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +107,7 @@ pub enum PrimitiveParameterError {
 }
 
 impl PrimitiveElementKind {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Resistance,
         Self::Conductance,
         Self::VoltageSource,
@@ -124,6 +125,7 @@ impl PrimitiveElementKind {
         Self::Nand2,
         Self::Or2,
         Self::Nor2,
+        Self::SchmittBuffer,
     ];
 
     pub const COUNT: u32 = Self::ALL.len() as u32;
@@ -138,11 +140,12 @@ impl PrimitiveElementKind {
             Self::VoltageControlledVoltageSource => 1,
             Self::Capacitor => 1,
             Self::Inductor => 1,
-            Self::VoltageControlledSwitch => 4,
+            Self::VoltageControlledSwitch => 3,
             Self::VoltageControlledConductance => 4,
             Self::TickDelay => 1,
             Self::Diode => 2,
             Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => 3,
+            Self::SchmittBuffer => 4,
         }
     }
 
@@ -181,7 +184,9 @@ impl PrimitiveElementKind {
             | Self::Inductor
             | Self::Diode => vec![voltage(0, 1, p0), current(0, 1, p0)],
 
-            Self::Not => vec![voltage(0, 2, p0), voltage(3, 2, p0), current(1, 0, p0)],
+            Self::Not | Self::SchmittBuffer => {
+                vec![voltage(0, 2, p0), voltage(3, 2, p0), current(1, 0, p0)]
+            }
 
             Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => vec![
                 voltage(0, 2, p0),
@@ -258,7 +263,14 @@ impl PrimitiveElementKind {
 
             Self::VoltageControlledSwitch => {
                 // 0: threshold
-                // 1: hysteresis
+                // 1: G_max
+                // 2: G_min
+                [unrestricted, positive, non_negative].get(index).copied()
+            }
+
+            Self::SchmittBuffer => {
+                // 0: threshold relative to VSS
+                // 1: hysteresis width
                 // 2: G_max
                 // 3: G_min
                 [unrestricted, non_negative, positive, non_negative]
@@ -306,7 +318,7 @@ impl PrimitiveElementKind {
             | Self::Inductor
             | Self::Diode => (smallvec![0.into(), 1.into()], smallvec![0.into(), 0.into()]),
 
-            Self::Not => (
+            Self::Not | Self::SchmittBuffer => (
                 smallvec![0.into(), 1.into(), 2.into(), 3.into()],
                 smallvec![0.into(), 0.into(), 0.into(), 0.into()],
             ),
@@ -402,13 +414,18 @@ impl PrimitiveElementKind {
         debug_assert_eq!(parameters.len(), self.parameter_count());
 
         match self {
-            Self::VoltageControlledSwitch => {
-                if parameters[2] <= parameters[3] {
-                    return Err(PrimitiveParameterError::ParameterMustBeGreater {
-                        greater: 2,
-                        lesser: 3,
-                    });
-                }
+            Self::VoltageControlledSwitch if parameters[1] <= parameters[2] => {
+                return Err(PrimitiveParameterError::ParameterMustBeGreater {
+                    greater: 1,
+                    lesser: 2,
+                });
+            }
+
+            Self::SchmittBuffer if parameters[2] <= parameters[3] => {
+                return Err(PrimitiveParameterError::ParameterMustBeGreater {
+                    greater: 2,
+                    lesser: 3,
+                });
             }
 
             Self::VoltageControlledConductance if parameters[3] <= parameters[2] => {
@@ -442,7 +459,7 @@ impl PrimitiveElementKind {
 
     pub const fn state_count(self) -> usize {
         match self {
-            Self::Capacitor | Self::Inductor | Self::VoltageControlledSwitch | Self::TickDelay => 1,
+            Self::Capacitor | Self::Inductor | Self::TickDelay | Self::SchmittBuffer => 1,
 
             _ => 0,
         }
@@ -940,21 +957,36 @@ mod tests {
             ),
             (
                 PrimitiveElementKind::VoltageControlledSwitch,
-                &[0.0, 0.0, 1.0, 0.0],
+                &[0.0, 1.0, 0.0],
                 Ok(()),
             ),
             (
                 PrimitiveElementKind::VoltageControlledSwitch,
-                &[0.0, -1.0, 1.0, 0.0],
+                &[0.0, 0.0, 0.0],
                 invalid(1, ParameterConstraintError::OutOfRange),
             ),
             (
                 PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, 1.0, -1.0],
+                invalid(2, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::SchmittBuffer,
+                &[0.0, 0.0, 1.0, 0.0],
+                Ok(()),
+            ),
+            (
+                PrimitiveElementKind::SchmittBuffer,
+                &[0.0, -1.0, 1.0, 0.0],
+                invalid(1, ParameterConstraintError::OutOfRange),
+            ),
+            (
+                PrimitiveElementKind::SchmittBuffer,
                 &[0.0, 0.0, 0.0, 0.0],
                 invalid(2, ParameterConstraintError::OutOfRange),
             ),
             (
-                PrimitiveElementKind::VoltageControlledSwitch,
+                PrimitiveElementKind::SchmittBuffer,
                 &[0.0, 0.0, 1.0, -1.0],
                 invalid(3, ParameterConstraintError::OutOfRange),
             ),
@@ -1004,6 +1036,12 @@ mod tests {
         let cases = [
             (
                 PrimitiveElementKind::VoltageControlledSwitch,
+                &[0.0, 1.0, 1.0][..],
+                1,
+                2,
+            ),
+            (
+                PrimitiveElementKind::SchmittBuffer,
                 &[0.0, 0.0, 1.0, 1.0][..],
                 2,
                 3,
@@ -1034,7 +1072,7 @@ mod tests {
 
         assert_eq!(
             PrimitiveElementKind::COUNT,
-            PrimitiveElementKind::Nor2 as u32 + 1,
+            PrimitiveElementKind::SchmittBuffer as u32 + 1,
         );
     }
 
@@ -1061,6 +1099,15 @@ mod tests {
             assert_eq!(kind.parameter_count(), 3, "{kind:?}");
             assert_eq!(kind.state_count(), 0, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn schmitt_buffer_terminal_parameter_and_state_contract_match() {
+        let kind = PrimitiveElementKind::SchmittBuffer;
+
+        assert_eq!(kind.definition().terminals().len(), 4);
+        assert_eq!(kind.parameter_count(), 4);
+        assert_eq!(kind.state_count(), 1);
     }
 
     #[test]
@@ -1125,7 +1172,7 @@ mod tests {
                 PrimitiveElementKind::Capacitor
                 | PrimitiveElementKind::Inductor
                 | PrimitiveElementKind::TickDelay
-                | PrimitiveElementKind::VoltageControlledSwitch => 1,
+                | PrimitiveElementKind::SchmittBuffer => 1,
 
                 _ => 0,
             };

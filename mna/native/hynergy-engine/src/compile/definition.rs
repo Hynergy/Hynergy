@@ -379,6 +379,10 @@ fn compile_primitive(
             builder.output(current)?;
         }
 
+        PrimitiveElementKind::SchmittBuffer => {
+            compile_schmitt_buffer(&mut builder)?;
+        }
+
         PrimitiveElementKind::Not
         | PrimitiveElementKind::And2
         | PrimitiveElementKind::Nand2
@@ -598,12 +602,9 @@ fn compile_primitive(
 
             let parameters = ControlledSwitchParameters {
                 threshold: builder.parameter()?,
-                hysteresis: builder.parameter()?,
                 g_max: builder.parameter()?,
                 g_min: builder.parameter()?,
             };
-
-            let state = builder.state()?;
 
             let values = stamp_voltage_controlled_switch(
                 &mut builder,
@@ -611,11 +612,8 @@ fn compile_primitive(
                 output_negative,
                 control_positive,
                 control_negative,
-                state.value(),
                 parameters,
             )?;
-
-            builder.write_state(state, values.next_mode)?;
 
             builder.output(values.output_voltage)?;
             builder.output(values.control_voltage)?;
@@ -996,6 +994,89 @@ fn switched_conductance(
     builder.add(g_min, mode_conductance)
 }
 
+fn compile_schmitt_buffer(
+    builder: &mut DefinitionTemplateBuilder,
+) -> Result<(), DefinitionTemplateBuildError> {
+    let output = builder.terminal_voltage()?;
+    let vdd = builder.terminal_voltage()?;
+    let vss = builder.terminal_voltage()?;
+    let input = builder.terminal_voltage()?;
+
+    let threshold = builder.parameter()?;
+    let hysteresis = builder.parameter()?;
+    let g_max = builder.parameter()?;
+    let g_min = builder.parameter()?;
+
+    let state = builder.state()?;
+    let input_voltage = voltage_difference(builder, input, vss)?;
+    let output_high = hysteretic_binary_mode(
+        builder,
+        input_voltage,
+        state.value(),
+        threshold,
+        hysteresis,
+    )?;
+
+    builder.write_state(state, output_high)?;
+
+    let conductance_range = builder.sub(g_max, g_min)?;
+    let high_delta = builder.mul(output_high, conductance_range)?;
+    let pull_up = builder.add(g_min, high_delta)?;
+    let pull_down = builder.sub(g_max, high_delta)?;
+
+    stamp_conductance(builder, vdd, output, pull_up);
+    stamp_conductance(builder, output, vss, pull_down);
+
+    let output_voltage = voltage_difference(builder, output, vss)?;
+    let supply_branch_voltage = voltage_difference(builder, vdd, output)?;
+    let supply_current = builder.mul(pull_up, supply_branch_voltage)?;
+
+    builder.output(output_voltage)?;
+    builder.output(input_voltage)?;
+    builder.output(supply_current)?;
+
+    Ok(())
+}
+
+fn hysteretic_binary_mode(
+    builder: &mut DefinitionTemplateBuilder,
+    input_voltage: LocalValueId,
+    initial_mode: LocalValueId,
+    threshold: LocalValueId,
+    hysteresis: LocalValueId,
+) -> Result<LocalValueId, DefinitionTemplateBuildError> {
+    let zero = builder.constant(0.0)?;
+    let half = builder.constant(0.5)?;
+    let one = builder.constant(1.0)?;
+
+    let half_hysteresis = builder.mul(hysteresis, half)?;
+    let lower = builder.sub(threshold, half_hysteresis)?;
+    let upper = builder.add(threshold, half_hysteresis)?;
+
+    let mode = builder.iteration_latch(initial_mode)?;
+    let current_mode = mode.value();
+
+    let turn_on = builder.less_equal(upper, input_voltage)?;
+    let turn_off = builder.less_equal(input_voltage, lower)?;
+    let off = builder.sub(one, current_mode)?;
+    let remain_on = builder.sub(one, turn_off)?;
+    let off_to_on = builder.mul(off, turn_on)?;
+    let on_to_on = builder.mul(current_mode, remain_on)?;
+    let hysteretic_mode = builder.add(off_to_on, on_to_on)?;
+
+    let zero_hysteresis = builder.less_equal(hysteresis, zero)?;
+    let direct_mode = builder.less_equal(threshold, input_voltage)?;
+    let use_hysteresis = builder.sub(one, zero_hysteresis)?;
+    let hysteretic_part = builder.mul(use_hysteresis, hysteretic_mode)?;
+    let direct_part = builder.mul(zero_hysteresis, direct_mode)?;
+    let next_mode = builder.add(hysteretic_part, direct_part)?;
+
+    builder.update_iteration_latch(mode, next_mode);
+    builder.require_iteration_stability(next_mode);
+
+    Ok(next_mode)
+}
+
 fn compile_logic_gate(
     builder: &mut DefinitionTemplateBuilder,
     kind: PrimitiveElementKind,
@@ -1165,7 +1246,6 @@ fn stamp_vcvs(
 #[derive(Debug, Clone, Copy)]
 struct ControlledSwitchParameters {
     threshold: LocalValueId,
-    hysteresis: LocalValueId,
     g_max: LocalValueId,
     g_min: LocalValueId,
 }
@@ -1259,65 +1339,29 @@ fn stamp_voltage_controlled_switch(
     output_negative: LocalUnknownId,
     control_positive: LocalUnknownId,
     control_negative: LocalUnknownId,
-    initial_mode: LocalValueId,
     parameters: ControlledSwitchParameters,
 ) -> Result<ControlledSwitchValues, DefinitionTemplateBuildError> {
     let ControlledSwitchParameters {
         threshold,
-        hysteresis,
         g_max,
         g_min,
     } = parameters;
 
-    let zero = builder.constant(0.0)?;
-    let half = builder.constant(0.5)?;
-    let one = builder.constant(1.0)?;
-
-    let half_hysteresis = builder.mul(hysteresis, half)?;
-
-    let lower = builder.sub(threshold, half_hysteresis)?;
-    let upper = builder.add(threshold, half_hysteresis)?;
-
     let control_positive_voltage = builder.unknown_value(control_positive)?;
     let control_negative_voltage = builder.unknown_value(control_negative)?;
-
     let control_voltage = builder.sub(control_positive_voltage, control_negative_voltage)?;
+    let mode = builder.less_equal(threshold, control_voltage)?;
 
-    let mode = builder.iteration_latch(initial_mode)?;
+    builder.require_iteration_stability(mode);
 
-    let current_mode = mode.value();
-
-    let turn_on = builder.less_equal(upper, control_voltage)?;
-    let turn_off = builder.less_equal(control_voltage, lower)?;
-
-    let off = builder.sub(one, current_mode)?;
-
-    let remain_on = builder.sub(one, turn_off)?;
-
-    let off_to_on = builder.mul(off, turn_on)?;
-    let on_to_on = builder.mul(current_mode, remain_on)?;
-
-    let hysteretic_mode = builder.add(off_to_on, on_to_on)?;
-    let zero_hysteresis = builder.less_equal(hysteresis, zero)?;
-    let direct_mode = builder.less_equal(threshold, control_voltage)?;
-    let use_hysteresis = builder.sub(one, zero_hysteresis)?;
-    let hysteretic_part = builder.mul(use_hysteresis, hysteretic_mode)?;
-    let direct_part = builder.mul(zero_hysteresis, direct_mode)?;
-    let next_mode = builder.add(hysteretic_part, direct_part)?;
-
-    builder.update_iteration_latch(mode, next_mode);
-    builder.require_iteration_stability(next_mode);
-
-    let conductance = switched_conductance(builder, next_mode, g_min, g_max)?;
+    let conductance = switched_conductance(builder, mode, g_min, g_max)?;
 
     stamp_conductance(builder, output_positive, output_negative, conductance);
 
     let output_voltage = voltage_difference(builder, output_positive, output_negative)?;
-
     let output_current = builder.mul(conductance, output_voltage)?;
 
     Ok(ControlledSwitchValues {
-        next_mode,
         output_voltage,
         control_voltage,
         output_current,
@@ -1372,7 +1416,6 @@ fn compile_partition_observers(
 
 #[derive(Debug, Clone, Copy)]
 struct ControlledSwitchValues {
-    next_mode: LocalValueId,
     output_voltage: LocalValueId,
     control_voltage: LocalValueId,
     output_current: LocalValueId,
@@ -1462,6 +1505,7 @@ mod tests {
             PrimitiveElementKind::VoltageControlledSwitch,
             PrimitiveElementKind::VoltageControlledConductance,
             PrimitiveElementKind::Not,
+            PrimitiveElementKind::SchmittBuffer,
         ] {
             assert_compiled_primitive_observers(kind, &[&[0, 1, 2]]);
         }
@@ -1501,6 +1545,26 @@ mod tests {
             assert_eq!(gate.parameter_count(), 3, "{kind:?}");
             assert_eq!(gate.state_count(), 0, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn voltage_controlled_switch_template_is_stateless() {
+        let switch = template(PrimitiveElementKind::VoltageControlledSwitch);
+
+        assert_eq!(switch.terminal_count(), 4);
+        assert_eq!(switch.allocated_unknown_count(), 0);
+        assert_eq!(switch.parameter_count(), 3);
+        assert_eq!(switch.state_count(), 0);
+    }
+
+    #[test]
+    fn schmitt_buffer_template_has_one_persistent_state() {
+        let buffer = template(PrimitiveElementKind::SchmittBuffer);
+
+        assert_eq!(buffer.terminal_count(), 4);
+        assert_eq!(buffer.allocated_unknown_count(), 0);
+        assert_eq!(buffer.parameter_count(), 4);
+        assert_eq!(buffer.state_count(), 1);
     }
 
     #[test]

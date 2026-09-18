@@ -171,9 +171,9 @@ fn cpu_workload_sizes_have_stable_shapes() {
     assert_eq!(CpuWorkloadSize::Small.nonlinear_device_count(), 1024);
     assert_eq!(CpuWorkloadSize::Stress.nonlinear_device_count(), 4096);
 
-    assert_eq!(CpuWorkloadSize::Tiny.stateful_device_count(), 192);
-    assert_eq!(CpuWorkloadSize::Small.stateful_device_count(), 768);
-    assert_eq!(CpuWorkloadSize::Stress.stateful_device_count(), 3072);
+    assert_eq!(CpuWorkloadSize::Tiny.stateful_device_count(), 64);
+    assert_eq!(CpuWorkloadSize::Small.stateful_device_count(), 256);
+    assert_eq!(CpuWorkloadSize::Stress.stateful_device_count(), 1024);
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn cpu_fixture_builds_ticks_and_switches_clock() {
     assert_eq!(scenario.logic_nodes(), 16);
     assert_eq!(scenario.device_count(), 90);
     assert_eq!(scenario.nonlinear_device_count(), 32);
-    assert_eq!(scenario.stateful_device_count(), 24);
+    assert_eq!(scenario.stateful_device_count(), 8);
 
     scenario.tick().unwrap();
 
@@ -288,17 +288,21 @@ fn validated_cpu_sizes_match_primitive_gate_topology() {
     );
 }
 
-#[test]
-fn full_cpu_executes_program_and_updates_architectural_state() {
-    let mut cpu = FullCpuScenario::for_test();
+fn assert_full_cpu_program(
+    width: hynergy_benchmarks::fixtures::FullCpuWidth,
+    counts: (usize, usize, usize),
+    overflow_rhs: u32,
+) {
+    let mut cpu = FullCpuScenario::for_test_width(width);
 
-    assert_eq!(cpu.device_count(), 549);
-    assert_eq!(cpu.nonlinear_device_count(), 515);
-    assert_eq!(cpu.stateful_device_count(), 33);
+    assert_eq!(cpu.width(), width);
+    assert_eq!(cpu.device_count(), counts.0);
+    assert_eq!(cpu.nonlinear_device_count(), counts.1);
+    assert_eq!(cpu.stateful_device_count(), counts.2);
 
     cpu.tick().unwrap();
 
-    let expected = [
+    let expected: [(u8, u8, u32, u8, u32, u32, bool); 14] = [
         // addr, opcode, imm, next_pc, A, B, carry
         (0, 1, 5, 1, 5, 0, false),
         (1, 2, 7, 2, 5, 7, false),
@@ -307,10 +311,10 @@ fn full_cpu_executes_program_and_updates_architectural_state() {
         (4, 4, 0, 5, 15, 3, false),
         (5, 2, 15, 6, 15, 15, false),
         (6, 5, 0, 7, 15, 15, false),
-        (7, 2, 241, 8, 15, 241, false),
-        (8, 3, 0, 9, 0, 241, true),
-        (9, 6, 11, 11, 0, 241, true),
-        (11, 1, 42, 12, 42, 241, true),
+        (7, 2, overflow_rhs, 8, 15, overflow_rhs, false),
+        (8, 3, 0, 9, 0, overflow_rhs, true),
+        (9, 6, 11, 11, 0, overflow_rhs, true),
+        (11, 1, 42, 12, 42, overflow_rhs, true),
         (12, 2, 1, 13, 42, 1, true),
         (13, 3, 0, 14, 43, 1, false),
         (14, 7, 0, 0, 43, 1, false),
@@ -327,7 +331,10 @@ fn full_cpu_executes_program_and_updates_architectural_state() {
         assert_eq!(executing.opcode(), opcode);
         assert_eq!(executing.immediate(), immediate);
 
-        cpu.tick().unwrap();
+        if let Err(error) = cpu.tick() {
+            panic!("initial CPU tick failed for {width:?}: {error:?}");
+        }
+
         let committed = cpu
             .snapshot()
             .expect("full CPU register outputs must be valid after execution");
@@ -338,4 +345,22 @@ fn full_cpu_executes_program_and_updates_architectural_state() {
         assert_eq!(committed.b(), b);
         assert_eq!(committed.carry(), carry);
     }
+}
+
+#[test]
+fn full_cpu_executes_program_and_updates_architectural_state() {
+    assert_full_cpu_program(
+        hynergy_benchmarks::fixtures::FullCpuWidth::Bits8,
+        (549, 515, 33),
+        241,
+    );
+}
+
+#[test]
+fn full_cpu_32_bit_executes_program_and_updates_architectural_state() {
+    assert_full_cpu_program(
+        hynergy_benchmarks::fixtures::FullCpuWidth::Bits32,
+        (1557, 1451, 105),
+        u32::MAX - 14,
+    );
 }
