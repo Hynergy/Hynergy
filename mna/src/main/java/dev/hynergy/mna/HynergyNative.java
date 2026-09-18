@@ -1,10 +1,6 @@
 package dev.hynergy.mna;
 
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SymbolLookup;
-import java.lang.foreign.ValueLayout;
+import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 
 /**
@@ -15,7 +11,7 @@ public final class HynergyNative {
     /**
      * ABI version this Java code was written against.
      *
-     * <p>Must match {@code ABI_VERSION} in the Rust crate. Raise both together whenever an
+     * <p> Must match {@code ABI_VERSION} in the Rust crate. Raise both together whenever an
      * exported signature changes meaning.
      */
     public static final int EXPECTED_ABI_VERSION = 1;
