@@ -33,11 +33,12 @@ fn profile_cpu(width: FullCpuWidth, ticks: usize) {
         let profile = cpu.solver_tick_profile();
 
         println!(
-            "tick={tick:02} islands={} nonlinear_iterations={} solves={} factorizations={} stability_changes={} max_delta={:.6e}",
+            "tick={tick:02} islands={} nonlinear_iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} max_delta={:.6e}",
             profile.islands().len(),
             profile.total_nonlinear_iterations(),
             profile.total_mna_solves(),
             profile.total_matrix_factorizations(),
+            profile.total_matrix_source_changes(),
             profile.total_stability_changes(),
             profile.max_solution_delta(),
         );
@@ -52,19 +53,21 @@ fn profile_cpu(width: FullCpuWidth, ticks: usize) {
         };
 
         println!(
-            "  island={} iterations={} solves={} factorizations={} stability_changes={} max_delta={:.6e}",
+            "  island={} iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} max_delta={:.6e}",
             hottest.island_index(),
             hottest.nonlinear_iterations(),
             hottest.mna_solves(),
             hottest.matrix_factorizations(),
+            hottest.matrix_source_changes(),
             hottest.stability_changes(),
             hottest.max_solution_delta(),
         );
 
         for (iteration, sample) in hottest.iterations().iter().enumerate() {
             println!(
-                "    iter={:03} changes={:04} max_delta={:.6e}",
+                "    iter={:03} matrix_source_changes={:04} stability_changes={:04} max_delta={:.6e}",
                 iteration + 1,
+                sample.matrix_source_changes(),
                 sample.stability_changes(),
                 sample.max_solution_delta(),
             );

@@ -30,6 +30,7 @@ impl IterationStampDependency {
     }
 
     #[inline]
+    #[cfg(test)]
     const fn affects_matrix(self) -> bool {
         matches!(self, Self::Matrix)
     }
@@ -325,6 +326,23 @@ impl<'a> IslandIrBuilder<'a> {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let matrix_program = MatrixProgram::new(self.matrix_ops);
+
+        let mut iteration_matrix_sources = matrix_program
+            .ops()
+            .iter()
+            .map(|op| op.source())
+            .filter(|&source| {
+                self.values
+                    .rate(source)
+                    .expect("island IR matrix source must belong to its value program")
+                    == EvaluationRate::Iteration
+            })
+            .collect::<Vec<_>>();
+
+        iteration_matrix_sources.sort_unstable();
+        iteration_matrix_sources.dedup();
+
         self.matrix_static_inputs.sort_unstable();
         self.matrix_static_inputs.dedup();
 
@@ -333,10 +351,11 @@ impl<'a> IslandIrBuilder<'a> {
 
         Ok(CompiledIslandIr {
             value_program: self.values.finish(),
-            matrix_program: MatrixProgram::new(self.matrix_ops),
+            matrix_program,
             rhs_program: RhsProgram::new(self.rhs_ops),
             state_transition,
             matrix_static_inputs: self.matrix_static_inputs.into_boxed_slice(),
+            iteration_matrix_sources: iteration_matrix_sources.into_boxed_slice(),
             iteration_stamp_dependency: self.iteration_stamp_dependency,
             iteration_stability_values: self.iteration_stability_values.into_boxed_slice(),
             timestep_input: self.timestep_input,
@@ -395,6 +414,7 @@ pub(crate) struct CompiledIslandIr {
     rhs_program: RhsProgram,
     state_transition: StateTransitionProgram,
     matrix_static_inputs: Box<[InputSlot]>,
+    iteration_matrix_sources: Box<[ValueSlot]>,
     iteration_stamp_dependency: IterationStampDependency,
     iteration_stability_values: Box<[ValueSlot]>,
     iteration_latches: Box<[IterationLatch]>,
@@ -450,8 +470,14 @@ impl CompiledIslandIr {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) const fn iteration_affects_matrix(&self) -> bool {
         self.iteration_stamp_dependency.affects_matrix()
+    }
+
+    #[inline]
+    pub(crate) fn iteration_matrix_sources(&self) -> &[ValueSlot] {
+        &self.iteration_matrix_sources
     }
 
     #[inline]
@@ -640,6 +666,29 @@ mod tests {
 
         assert!(ir.requires_nonlinear_iteration());
         assert!(ir.iteration_affects_matrix());
+        assert_eq!(ir.iteration_matrix_sources(), &[solution]);
+    }
+
+    #[test]
+    fn cancelled_iteration_matrix_contributions_are_not_tracked_as_sources() {
+        let unknown = UnknownIndex::new(0);
+
+        let mut pattern_builder = PatternBuilder::new(1).unwrap();
+
+        pattern_builder.request(unknown, unknown).unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+        let mut builder = IslandIrBuilder::new(&pattern);
+
+        let solution = builder.unknown_value(Some(unknown)).unwrap();
+        let destination = pattern.slot(unknown, unknown).unwrap();
+
+        builder.add_matrix(destination, solution, 1.0);
+        builder.add_matrix(destination, solution, -1.0);
+
+        let ir = builder.finish().unwrap();
+
+        assert!(ir.iteration_matrix_sources().is_empty());
     }
 
     #[test]

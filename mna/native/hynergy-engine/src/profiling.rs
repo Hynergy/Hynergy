@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolverIterationProfile {
     stability_changes: usize,
+    matrix_source_changes: usize,
     max_solution_delta: f64,
 }
 
@@ -8,6 +9,11 @@ impl SolverIterationProfile {
     #[inline]
     pub const fn stability_changes(self) -> usize {
         self.stability_changes
+    }
+
+    #[inline]
+    pub const fn matrix_source_changes(self) -> usize {
+        self.matrix_source_changes
     }
 
     #[inline]
@@ -84,6 +90,14 @@ impl SolverIslandProfile {
     }
 
     #[inline]
+    pub fn matrix_source_changes(&self) -> usize {
+        self.iterations
+            .iter()
+            .map(|iteration| iteration.matrix_source_changes)
+            .sum()
+    }
+
+    #[inline]
     pub fn max_solution_delta(&self) -> f64 {
         self.iterations
             .iter()
@@ -117,9 +131,15 @@ impl SolverIslandProfile {
     }
 
     #[inline]
-    pub(crate) fn record_iteration(&mut self, stability_changes: usize, max_solution_delta: f64) {
+    pub(crate) fn record_iteration(
+        &mut self,
+        stability_changes: usize,
+        matrix_source_changes: usize,
+        max_solution_delta: f64,
+    ) {
         self.iterations.push(SolverIterationProfile {
             stability_changes,
+            matrix_source_changes,
             max_solution_delta,
         });
     }
@@ -171,6 +191,14 @@ impl SolverTickProfile {
         self.islands
             .iter()
             .map(SolverIslandProfile::stability_changes)
+            .sum()
+    }
+
+    #[inline]
+    pub fn total_matrix_source_changes(&self) -> usize {
+        self.islands
+            .iter()
+            .map(SolverIslandProfile::matrix_source_changes)
             .sum()
     }
 

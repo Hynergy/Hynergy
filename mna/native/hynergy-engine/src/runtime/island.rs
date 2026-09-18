@@ -82,6 +82,7 @@ pub(crate) struct IslandRuntime {
     solution_valid: bool,
     static_initialized: bool,
     matrix_dirty: bool,
+    factorized_iteration_matrix_sources: Box<[f64]>,
     static_inputs_dirty: bool,
     observer_outputs: Box<[CompiledObserverOutput]>,
     observer_outputs_dirty: bool,
@@ -126,6 +127,8 @@ impl IslandRuntime {
         }
 
         let system = MnaSystem::new(pattern)?;
+        let factorized_iteration_matrix_sources =
+            vec![0.0; ir.iteration_matrix_sources().len()].into_boxed_slice();
 
         let nonlinear_scratch = ir.requires_nonlinear_iteration().then(|| {
             Box::new(NonlinearScratch::new(
@@ -150,6 +153,7 @@ impl IslandRuntime {
             solution_valid: false,
             static_initialized: false,
             matrix_dirty: true,
+            factorized_iteration_matrix_sources,
             static_inputs_dirty: true,
             sleepable,
             needs_solve: true,
@@ -203,6 +207,13 @@ impl IslandRuntime {
             }
 
             self.system.factorize()?;
+
+            capture_iteration_matrix_sources(
+                &self.ir,
+                &self.workspace,
+                &mut self.factorized_iteration_matrix_sources,
+            );
+
             self.matrix_dirty = false;
 
             #[cfg(feature = "solver-profiling")]
@@ -277,20 +288,47 @@ impl IslandRuntime {
         Ok(())
     }
 
+    #[inline]
+    fn update_iteration_matrix_dirty(&mut self) -> usize {
+        if self.ir.iteration_matrix_sources().is_empty() {
+            return 0;
+        }
+
+        #[cfg(not(feature = "solver-profiling"))]
+        if self.matrix_dirty {
+            return 0;
+        }
+
+        if !self.system.is_factorized() {
+            debug_assert!(
+                self.matrix_dirty,
+                "an unfactorized matrix must already be marked dirty",
+            );
+
+            return 0;
+        }
+
+        let source_changes = iteration_matrix_source_change_count(
+            &self.ir,
+            &self.workspace,
+            &self.factorized_iteration_matrix_sources,
+        );
+
+        self.matrix_dirty |= source_changes != 0;
+
+        source_changes
+    }
+
     fn solve_nonlinear(
         &mut self,
         scratch: &mut NonlinearScratch,
     ) -> Result<(), IslandRuntimeError> {
-        let iteration_affects_matrix = self.ir.iteration_affects_matrix();
-
         evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
         capture_iteration_stability(&self.ir, &self.workspace, &mut scratch.stability);
         advance_iteration_latches(&self.ir, &mut self.workspace);
 
-        if iteration_affects_matrix {
-            self.matrix_dirty = true;
-        }
+        let _matrix_source_changes = self.update_iteration_matrix_dirty();
 
         self.solve_nonlinear_candidate(&mut scratch.current)?;
 
@@ -306,8 +344,11 @@ impl IslandRuntime {
                     .map(|&slot| self.workspace.value(slot)),
             );
             let max_solution_delta = maximum_solution_delta(&self.solution, &scratch.current);
-            self.solver_tick_profile
-                .record_iteration(stability_changes, max_solution_delta);
+            self.solver_tick_profile.record_iteration(
+                stability_changes,
+                _matrix_source_changes,
+                max_solution_delta,
+            );
         }
 
         if solutions_converged(&self.solution, &scratch.current)
@@ -324,9 +365,7 @@ impl IslandRuntime {
             capture_iteration_stability(&self.ir, &self.workspace, &mut scratch.stability);
             advance_iteration_latches(&self.ir, &mut self.workspace);
 
-            if iteration_affects_matrix {
-                self.matrix_dirty = true;
-            }
+            let _matrix_source_changes = self.update_iteration_matrix_dirty();
 
             self.solve_nonlinear_candidate(&mut scratch.next)?;
 
@@ -342,8 +381,11 @@ impl IslandRuntime {
                         .map(|&slot| self.workspace.value(slot)),
                 );
                 let max_solution_delta = maximum_solution_delta(&scratch.current, &scratch.next);
-                self.solver_tick_profile
-                    .record_iteration(stability_changes, max_solution_delta);
+                self.solver_tick_profile.record_iteration(
+                    stability_changes,
+                    _matrix_source_changes,
+                    max_solution_delta,
+                );
             }
 
             if solutions_converged(&scratch.current, &scratch.next)
@@ -622,6 +664,57 @@ fn capture_iteration_stability(
 }
 
 #[inline]
+fn capture_iteration_matrix_sources(
+    ir: &CompiledIslandIr,
+    workspace: &ValueWorkspace,
+    target: &mut [f64],
+) {
+    debug_assert_eq!(target.len(), ir.iteration_matrix_sources().len());
+
+    for (target, &slot) in target.iter_mut().zip(ir.iteration_matrix_sources()) {
+        *target = workspace.value(slot);
+    }
+}
+
+#[inline]
+fn iteration_matrix_source_change_count(
+    ir: &CompiledIslandIr,
+    workspace: &ValueWorkspace,
+    expected: &[f64],
+) -> usize {
+    debug_assert_eq!(expected.len(), ir.iteration_matrix_sources().len());
+
+    let actual = ir
+        .iteration_matrix_sources()
+        .iter()
+        .map(|&slot| workspace.value(slot));
+
+    #[cfg(feature = "solver-profiling")]
+    {
+        expected
+            .iter()
+            .copied()
+            .zip(actual)
+            .filter(|(expected, actual)| expected != actual)
+            .count()
+    }
+
+    #[cfg(not(feature = "solver-profiling"))]
+    {
+        if expected
+            .iter()
+            .copied()
+            .zip(actual)
+            .any(|(expected, actual)| expected != actual)
+        {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+#[inline]
 fn iteration_stability_matches(
     expected: &[f64],
     actual: impl ExactSizeIterator<Item = f64>,
@@ -828,6 +921,7 @@ mod test {
         assert!(!profile.slept());
         assert_eq!(profile.mna_solves(), 2);
         assert_eq!(profile.matrix_factorizations(), 1);
+        assert_eq!(profile.matrix_source_changes(), 0);
         assert_eq!(profile.nonlinear_iterations(), 2);
         assert_eq!(profile.iterations().len(), 2);
         assert!(profile.iterations()[0].max_solution_delta() > 0.0);
@@ -923,20 +1017,6 @@ mod test {
 
         assert_eq!(runtime.solve_count(), 2);
         assert_eq!(runtime.matrix_stamp_count(), 1);
-    }
-
-    #[test]
-    fn nonlinear_matrix_iteration_restamps_matrix() {
-        let (network, mut compiled) = voltage_source_island();
-
-        compiled.force_nonlinear_iteration_for_test(true);
-
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
-
-        runtime.solve_tick(&network, |_| None).unwrap();
-
-        assert_eq!(runtime.solve_count(), 2);
-        assert_eq!(runtime.matrix_stamp_count(), 2);
     }
 
     #[test]
@@ -1588,11 +1668,30 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // Starting from 0 V selects G_min. That first solution is +8 V,
+        // Starting from 0 V selects G_min. That first solution is +32 V,
         // so nonlinear iteration must switch to G_max and settle at 8 / 4 = 2 V.
         assert!((voltage - 2.0).abs() < 1.0e-9);
-        assert!(runtime.solve_count() > 1);
-        assert!(runtime.matrix_stamp_count() > 1);
+        assert_eq!(runtime.solve_count(), 3);
+        assert_eq!(
+            runtime.matrix_stamp_count(),
+            2,
+            "diode mode change should refactor once, then reuse the settled matrix",
+        );
+
+        #[cfg(feature = "solver-profiling")]
+        {
+            let profile = runtime.solver_tick_profile();
+
+            assert_eq!(profile.matrix_source_changes(), 1);
+            assert_eq!(
+                profile
+                    .iterations()
+                    .iter()
+                    .map(|iteration| iteration.matrix_source_changes())
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 0],
+            );
+        }
     }
 
     fn logic_gate_island(
@@ -1741,6 +1840,27 @@ mod test {
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
         (voltage, runtime.solve_count())
+    }
+
+    #[test]
+    fn nonlinear_matrix_iteration_reuses_factorization_when_sources_are_unchanged() {
+        let (network, compiled, _, _) =
+            logic_gate_island(PrimitiveElementKind::Not, 0.0, None);
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            2,
+            "initial nonlinear solution still requires convergence confirmation",
+        );
+        assert_eq!(
+            runtime.matrix_stamp_count(),
+            1,
+            "unchanged iteration-dependent matrix sources must reuse numeric LU",
+        );
     }
 
     #[test]
