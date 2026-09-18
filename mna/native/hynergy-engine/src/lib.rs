@@ -1,10 +1,14 @@
 mod compile;
+#[cfg(feature = "solver-profiling")]
+mod profiling;
 mod runtime;
 mod topology;
 
 use crate::compile::island::{
     DeviceObserver, DeviceState, IslandCompileError, compile_topology_island,
 };
+#[cfg(feature = "solver-profiling")]
+pub use crate::profiling::{SolverIslandProfile, SolverIterationProfile, SolverTickProfile};
 use crate::runtime::island::{IslandRuntime, IslandRuntimeError, StagedStateWrite};
 pub use crate::runtime::subscription::{SubscriptionError, SubscriptionId};
 use crate::runtime::subscription::{SubscriptionRegistry, SubscriptionUpdate};
@@ -268,6 +272,12 @@ impl Engine {
             .and_then(Option::as_ref)
     }
 
+    #[cfg(feature = "solver-profiling")]
+    #[inline]
+    pub fn solver_tick_profile(&self, world_id: u32) -> Option<SolverTickProfile> {
+        self.world(world_id).map(World::solver_tick_profile)
+    }
+
     #[cfg(test)]
     #[inline]
     fn world_mut(&mut self, world_id: u32) -> Option<&mut World> {
@@ -480,6 +490,27 @@ impl World {
     #[inline]
     pub fn subscription_updates(&self) -> &[SubscriptionUpdate] {
         &self.subscription_updates
+    }
+
+    #[cfg(feature = "solver-profiling")]
+    pub fn solver_tick_profile(&self) -> SolverTickProfile {
+        let islands = self
+            .derived_topology
+            .islands()
+            .filter_map(|(island, _)| {
+                self.island_runtimes
+                    .get(island.index())
+                    .and_then(Option::as_ref)
+                    .map(|runtime| {
+                        runtime
+                            .solver_tick_profile()
+                            .clone()
+                            .with_island_index(island.index())
+                    })
+            })
+            .collect();
+
+        SolverTickProfile::from_islands(islands)
     }
 
     fn collect_subscription_updates(&mut self) {

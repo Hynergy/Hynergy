@@ -364,3 +364,20 @@ fn full_cpu_32_bit_executes_program_and_updates_architectural_state() {
         u32::MAX - 14,
     );
 }
+
+#[cfg(feature = "solver-profiling")]
+#[test]
+fn full_cpu_exposes_solver_tick_profile() {
+    let mut cpu = FullCpuScenario::new_with_width(
+        hynergy_benchmarks::fixtures::FullCpuWidth::Bits8,
+    );
+
+    cpu.tick().unwrap();
+
+    let profile = cpu.solver_tick_profile();
+
+    assert!(!profile.islands().is_empty());
+    assert!(profile.total_mna_solves() > 0);
+    assert!(profile.total_matrix_factorizations() > 0);
+    assert!(profile.total_nonlinear_iterations() > 0);
+}

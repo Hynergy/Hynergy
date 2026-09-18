@@ -97,3 +97,24 @@ branch control. The instruction register is the datapath width plus the 3-bit op
 including 515 nonlinear logic gates and 33 stateful devices. The 32-bit fixture has 1,557 devices, including 1,451
 nonlinear logic gates and 105 stateful devices. The correctness tests execute the same program at both widths, including
 an overflow-to-zero ADD and a taken conditional branch.
+
+## Solver convergence profiling
+
+Solver profiling is feature-gated and is not enabled by the normal Criterion runner. This keeps profiling counters and
+per-iteration trace storage out of ordinary benchmark builds.
+
+Run the CPU convergence diagnostic from `mna/native`:
+
+```bash
+cargo run --release -p hynergy-benchmarks \
+    --features solver-profiling \
+    --example cpu_solver_profile -- 20
+```
+
+The optional final argument is the number of simulation ticks to run per CPU width. Each tick reports total nonlinear
+iterations, MNA solves, matrix factorizations/restamps, stability-value changes, and the maximum solution delta. It also
+prints the per-iteration trace for the nonlinear island that required the most iterations during that tick.
+
+A steadily decreasing stability-change count usually indicates propagation depth. A repeating or oscillating change
+pattern points instead toward a convergence problem where damping, continuation, or a different nonlinear algorithm may
+help.

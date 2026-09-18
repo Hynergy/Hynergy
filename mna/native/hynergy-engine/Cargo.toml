@@ -3,6 +3,10 @@ name = "hynergy-engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+solver-profiling = []
+
 [dependencies]
 hynergy-model = { path = "../hynergy-model" }
 hynergy-ids = { path = "../hynergy-ids" }

@@ -3,6 +3,8 @@ use hynergy_engine::{
     Engine, EngineConfig, EngineTickError, SubscriptionId, WorldCommand, WorldCommandApplyError,
     WorldConfig,
 };
+#[cfg(feature = "solver-profiling")]
+use hynergy_engine::SolverTickProfile;
 use hynergy_model::device::definition::{DeviceId, PrimitiveElementKind, TerminalId};
 use hynergy_model::network::WireId;
 use hynergy_model::parameter::ParameterId;
@@ -1130,6 +1132,14 @@ impl FullCpuScenario {
     #[inline]
     pub fn tick(&mut self) -> Result<(), EngineTickError> {
         self.harness.tick()
+    }
+
+    #[cfg(feature = "solver-profiling")]
+    pub fn solver_tick_profile(&self) -> SolverTickProfile {
+        self.harness
+            .engine
+            .solver_tick_profile(self.harness.world_id)
+            .expect("full CPU benchmark world must exist")
     }
 
     pub fn warm(&mut self, ticks: usize) -> Result<(), EngineTickError> {

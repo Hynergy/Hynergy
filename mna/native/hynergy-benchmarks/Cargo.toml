@@ -5,6 +5,10 @@ edition.workspace = true
 publish = false
 autobenches = false
 
+[features]
+default = []
+solver-profiling = ["hynergy-engine/solver-profiling"]
+
 [dependencies]
 criterion = "0.8.2"
 hynergy-engine = { path = "../hynergy-engine" }
@@ -38,3 +42,7 @@ harness = false
 [[bench]]
 name = "protocol"
 harness = false
+
+[[example]]
+name = "cpu_solver_profile"
+required-features = ["solver-profiling"]

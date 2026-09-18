@@ -4,6 +4,8 @@ use crate::compile::island::{
     DeviceObserver, DeviceState, IslandStateLayout,
 };
 use crate::compile::island_ir::CompiledIslandIr;
+#[cfg(feature = "solver-profiling")]
+use crate::profiling::SolverIslandProfile;
 use hynergy_ir::ValueWorkspace;
 use hynergy_mna::system::{MnaError, MnaSystem};
 use hynergy_model::device::definition::DeviceId;
@@ -87,6 +89,9 @@ pub(crate) struct IslandRuntime {
     needs_solve: bool,
     nonlinear_scratch: Option<Box<NonlinearScratch>>,
 
+    #[cfg(feature = "solver-profiling")]
+    solver_tick_profile: SolverIslandProfile,
+
     #[cfg(test)]
     observer_read_count: Cell<usize>,
     #[cfg(test)]
@@ -150,6 +155,9 @@ impl IslandRuntime {
             needs_solve: true,
             nonlinear_scratch,
 
+            #[cfg(feature = "solver-profiling")]
+            solver_tick_profile: SolverIslandProfile::default(),
+
             #[cfg(test)]
             observer_read_count: Cell::new(0),
             #[cfg(test)]
@@ -197,6 +205,9 @@ impl IslandRuntime {
             self.system.factorize()?;
             self.matrix_dirty = false;
 
+            #[cfg(feature = "solver-profiling")]
+            self.solver_tick_profile.record_matrix_factorization();
+
             #[cfg(test)]
             {
                 self.matrix_stamp_count += 1;
@@ -219,6 +230,9 @@ impl IslandRuntime {
             .execute(&mut self.solution, self.workspace.values());
 
         self.system.solve_in_place(&mut self.solution)?;
+
+        #[cfg(feature = "solver-profiling")]
+        self.solver_tick_profile.record_mna_solve();
 
         #[cfg(test)]
         {
@@ -247,6 +261,9 @@ impl IslandRuntime {
             .execute(candidate, self.workspace.values());
 
         self.system.solve_in_place(candidate)?;
+
+        #[cfg(feature = "solver-profiling")]
+        self.solver_tick_profile.record_mna_solve();
 
         #[cfg(test)]
         {
@@ -279,6 +296,20 @@ impl IslandRuntime {
 
         evaluate_iteration(&self.ir, &mut self.workspace, &scratch.current);
 
+        #[cfg(feature = "solver-profiling")]
+        {
+            let stability_changes = iteration_stability_change_count(
+                &scratch.stability,
+                self.ir
+                    .iteration_stability_values()
+                    .iter()
+                    .map(|&slot| self.workspace.value(slot)),
+            );
+            let max_solution_delta = maximum_solution_delta(&self.solution, &scratch.current);
+            self.solver_tick_profile
+                .record_iteration(stability_changes, max_solution_delta);
+        }
+
         if solutions_converged(&self.solution, &scratch.current)
             && self.iteration_stability_matches(&scratch.stability)
         {
@@ -300,6 +331,20 @@ impl IslandRuntime {
             self.solve_nonlinear_candidate(&mut scratch.next)?;
 
             evaluate_iteration(&self.ir, &mut self.workspace, &scratch.next);
+
+            #[cfg(feature = "solver-profiling")]
+            {
+                let stability_changes = iteration_stability_change_count(
+                    &scratch.stability,
+                    self.ir
+                        .iteration_stability_values()
+                        .iter()
+                        .map(|&slot| self.workspace.value(slot)),
+                );
+                let max_solution_delta = maximum_solution_delta(&scratch.current, &scratch.next);
+                self.solver_tick_profile
+                    .record_iteration(stability_changes, max_solution_delta);
+            }
 
             if solutions_converged(&scratch.current, &scratch.next)
                 && self.iteration_stability_matches(&scratch.stability)
@@ -327,11 +372,20 @@ impl IslandRuntime {
     where
         F: FnMut(DeviceState) -> Option<f64>,
     {
+        #[cfg(feature = "solver-profiling")]
+        {
+            let nonlinear = self.nonlinear_scratch.is_some();
+            self.solver_tick_profile.begin_tick(nonlinear);
+        }
+
         if self.sleepable && !self.needs_solve {
             debug_assert!(
                 self.solution_valid,
                 "sleeping island must retain a valid solution",
             );
+
+            #[cfg(feature = "solver-profiling")]
+            self.solver_tick_profile.mark_slept();
 
             return Ok(Vec::new());
         }
@@ -479,6 +533,12 @@ impl IslandRuntime {
         )
     }
 
+    #[cfg(feature = "solver-profiling")]
+    #[inline]
+    pub(crate) fn solver_tick_profile(&self) -> &SolverIslandProfile {
+        &self.solver_tick_profile
+    }
+
     #[inline]
     pub(crate) const fn observer_outputs_dirty(&self) -> bool {
         self.observer_outputs_dirty
@@ -573,6 +633,34 @@ fn iteration_stability_matches(
         .copied()
         .zip(actual)
         .all(|(expected, actual)| expected == actual)
+}
+
+#[cfg(feature = "solver-profiling")]
+#[inline]
+fn iteration_stability_change_count(
+    expected: &[f64],
+    actual: impl ExactSizeIterator<Item = f64>,
+) -> usize {
+    debug_assert_eq!(expected.len(), actual.len());
+
+    expected
+        .iter()
+        .copied()
+        .zip(actual)
+        .filter(|(expected, actual)| expected != actual)
+        .count()
+}
+
+#[cfg(feature = "solver-profiling")]
+#[inline]
+fn maximum_solution_delta(previous: &[f64], current: &[f64]) -> f64 {
+    debug_assert_eq!(previous.len(), current.len());
+
+    previous
+        .iter()
+        .zip(current)
+        .map(|(&previous, &current)| (current - previous).abs())
+        .fold(0.0, f64::max)
 }
 
 #[inline]
@@ -721,6 +809,28 @@ mod test {
             3,
             "woken nonlinear island should reuse its previous solution as its initial guess",
         );
+    }
+
+    #[cfg(feature = "solver-profiling")]
+    #[test]
+    fn nonlinear_solver_profile_records_iteration_work() {
+        let (network, mut compiled) = voltage_source_island();
+
+        compiled.force_nonlinear_iteration_for_test(false);
+
+        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        let profile = runtime.solver_tick_profile();
+
+        assert!(profile.is_nonlinear());
+        assert!(!profile.slept());
+        assert_eq!(profile.mna_solves(), 2);
+        assert_eq!(profile.matrix_factorizations(), 1);
+        assert_eq!(profile.nonlinear_iterations(), 2);
+        assert_eq!(profile.iterations().len(), 2);
+        assert!(profile.iterations()[0].max_solution_delta() > 0.0);
     }
 
     #[test]
