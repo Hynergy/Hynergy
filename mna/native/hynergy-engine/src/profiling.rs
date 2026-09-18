@@ -22,7 +22,7 @@ impl SolverIterationProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct SolverIslandProfile {
     island_index: usize,
     nonlinear: bool,
@@ -30,19 +30,6 @@ pub struct SolverIslandProfile {
     mna_solves: usize,
     matrix_factorizations: usize,
     iterations: Vec<SolverIterationProfile>,
-}
-
-impl Default for SolverIslandProfile {
-    fn default() -> Self {
-        Self {
-            island_index: 0,
-            nonlinear: false,
-            slept: false,
-            mna_solves: 0,
-            matrix_factorizations: 0,
-            iterations: Vec::new(),
-        }
-    }
 }
 
 impl SolverIslandProfile {
