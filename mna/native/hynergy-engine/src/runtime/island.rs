@@ -1844,8 +1844,7 @@ mod test {
 
     #[test]
     fn nonlinear_matrix_iteration_reuses_factorization_when_sources_are_unchanged() {
-        let (network, compiled, _, _) =
-            logic_gate_island(PrimitiveElementKind::Not, 0.0, None);
+        let (network, compiled, _, _) = logic_gate_island(PrimitiveElementKind::Not, 0.0, None);
 
         let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
