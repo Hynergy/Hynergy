@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,9 +18,245 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+      mna: ${{ steps.changes.outputs.mna }}
+      gradle: ${{ steps.changes.outputs.gradle }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          write_outputs() {
+            echo "rust=$1" >> "$GITHUB_OUTPUT"
+            echo "mna=$2" >> "$GITHUB_OUTPUT"
+            echo "gradle=$3" >> "$GITHUB_OUTPUT"
+
+            echo "Rust checks: $1"
+            echo "MNA integration: $2"
+            echo "Gradle build: $3"
+          }
+
+          # A manual run explicitly requests complete verification.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            write_outputs true true true
+            exit 0
+          fi
+
+          # For pull requests, compare the entire PR against its base.
+          #
+          # This means an MNA change followed by a docs-only commit still
+          # runs MNA CI, because the MNA change remains part of the PR.
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            rust=false
+            mna=false
+            gradle=false
+
+            while IFS= read -r file; do
+              [[ -z "$file" ]] && continue
+
+              echo "changed: $file"
+
+              case "$file" in
+                # Changing CI verifies everything.
+                .github/workflows/ci.yml)
+                  rust=true
+                  mna=true
+                  gradle=true
+                  ;;
+
+                # Native Rust affects Rust checks, JNI/FFI integration,
+                # and anything built through Gradle.
+                mna/native/*)
+                  rust=true
+                  mna=true
+                  gradle=true
+                  ;;
+
+                # Other MNA changes affect Java/native integration and build.
+                mna/*)
+                  mna=true
+                  gradle=true
+                  ;;
+
+                # Core changes only require the repository Gradle build.
+                core/*)
+                  gradle=true
+                  ;;
+
+                # Shared Gradle configuration can affect both integration
+                # and the full build.
+                build.gradle.kts|settings.gradle.kts|gradle.properties|gradlew|gradlew.bat|gradle/*)
+                  mna=true
+                  gradle=true
+                  ;;
+              esac
+            done < <(
+              git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA"
+            )
+
+            write_outputs "$rust" "$mna" "$gradle"
+            exit 0
+          fi
+
+          # Pushes use an independent known-good baseline for each check.
+          #
+          # A workflow where Rust passed but Gradle failed can still become
+          # Rust's new baseline without incorrectly becoming Gradle's.
+          rust_base=""
+          mna_base=""
+          gradle_base=""
+
+          while IFS=$'\t' read -r run_id head_sha; do
+            [[ -z "$run_id" || -z "$head_sha" ]] && continue
+
+            jobs="$(
+              gh api \
+                --method GET \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" \
+                -f per_page=100 \
+                --jq '.jobs[] | [.name, .conclusion] | @tsv'
+            )"
+
+            if [[ -z "$rust_base" ]] &&
+               grep -Fqx $'Rust checks\tsuccess' <<< "$jobs"; then
+              rust_base="$head_sha"
+            fi
+
+            # Only advance the MNA baseline when integration passed on
+            # all three supported runner operating systems.
+            if [[ -z "$mna_base" ]] &&
+               grep -Fqx $'MNA integration (ubuntu-latest)\tsuccess' <<< "$jobs" &&
+               grep -Fqx $'MNA integration (windows-latest)\tsuccess' <<< "$jobs" &&
+               grep -Fqx $'MNA integration (macos-latest)\tsuccess' <<< "$jobs"; then
+              mna_base="$head_sha"
+            fi
+
+            if [[ -z "$gradle_base" ]] &&
+               grep -Fqx $'Gradle build\tsuccess' <<< "$jobs"; then
+              gradle_base="$head_sha"
+            fi
+
+            if [[ -n "$rust_base" &&
+                  -n "$mna_base" &&
+                  -n "$gradle_base" ]]; then
+              break
+            fi
+          done < <(
+            gh api \
+              --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+              -f branch="$GITHUB_REF_NAME" \
+              -f status=completed \
+              -f event=push \
+              -f per_page=50 \
+              --jq '.workflow_runs[] | [.id, .head_sha] | @tsv'
+          )
+
+          echo "Last successful Rust check: ${rust_base:-none}"
+          echo "Last successful MNA integration: ${mna_base:-none}"
+          echo "Last successful Gradle build: ${gradle_base:-none}"
+
+          has_matching_change() {
+            local base="$1"
+            shift
+
+            # No known successful baseline: run the check.
+            if [[ -z "$base" ]]; then
+              return 0
+            fi
+
+            # Fail safe if the baseline is no longer available locally.
+            if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              echo "Base commit $base is unavailable; forcing check." >&2
+              return 0
+            fi
+
+            local file
+            local pattern
+
+            while IFS= read -r file; do
+              [[ -z "$file" ]] && continue
+
+              for pattern in "$@"; do
+                if [[ "$file" == $pattern ]]; then
+                  echo "relevant change since $base: $file" >&2
+                  return 0
+                fi
+              done
+            done < <(
+              git diff --name-only "$base" "$GITHUB_SHA"
+            )
+
+            return 1
+          }
+
+          rust=false
+          mna=false
+          gradle=false
+
+          if has_matching_change \
+            "$rust_base" \
+            'mna/native/*' \
+            '.github/workflows/ci.yml'
+          then
+            rust=true
+          fi
+
+          if has_matching_change \
+            "$mna_base" \
+            'mna/*' \
+            'build.gradle.kts' \
+            'settings.gradle.kts' \
+            'gradle.properties' \
+            'gradlew' \
+            'gradlew.bat' \
+            'gradle/*' \
+            '.github/workflows/ci.yml'
+          then
+            mna=true
+          fi
+
+          if has_matching_change \
+            "$gradle_base" \
+            'core/*' \
+            'mna/*' \
+            'build.gradle.kts' \
+            'settings.gradle.kts' \
+            'gradle.properties' \
+            'gradlew' \
+            'gradlew.bat' \
+            'gradle/*' \
+            '.github/workflows/ci.yml'
+          then
+            gradle=true
+          fi
+
+          write_outputs "$rust" "$mna" "$gradle"
+
   validate-gradle-wrapper:
     name: Validate Gradle wrapper
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -29,7 +266,10 @@ jobs:
 
   rust:
     name: Rust checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     defaults:
       run:
@@ -41,6 +281,17 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mna/native/target
+          key: cargo-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mna/native/Cargo.lock') }}
+          restore-keys: |
+            cargo-rust-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Check formatting
         run: cargo +stable fmt --all --check
 
@@ -48,12 +299,16 @@ jobs:
         run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings -A dead-code
 
       - name: Run Rust tests
-        run: cargo +stable test --workspace --all-targets --all-features --locked
+        run: cargo +stable test --workspace --all-features --locked
 
   mna-integration:
     name: MNA integration (${{ matrix.os }})
-    needs: validate-gradle-wrapper
+    needs:
+      - changes
+      - validate-gradle-wrapper
+    if: needs.changes.outputs.mna == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
 
     strategy:
       fail-fast: false
@@ -72,19 +327,35 @@ jobs:
           distribution: temurin
           java-version: "26"
 
-      - name: Verify Java
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mna/build/cargo-target
+          key: cargo-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mna/native/Cargo.lock') }}
+          restore-keys: |
+            cargo-native-${{ runner.os }}-${{ runner.arch }}-
+
+      # Wrapper validation already has its own dedicated job.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
+
+      # Keep this after setup-gradle so invoking the wrapper can benefit
+      # from the Gradle cache instead of downloading Gradle beforehand.
+      - name: Verify Java and Gradle
         shell: bash
         run: |
           echo "JAVA_HOME=$JAVA_HOME"
           java -version
           ./gradlew --version
-
-      - name: Install Rust toolchain
-        shell: bash
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
 
       - name: Run MNA integration tests
         shell: bash
@@ -92,8 +363,12 @@ jobs:
 
   gradle-build:
     name: Gradle build
-    needs: validate-gradle-wrapper
+    needs:
+      - changes
+      - validate-gradle-wrapper
+    if: needs.changes.outputs.gradle == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v5
@@ -104,17 +379,30 @@ jobs:
           distribution: temurin
           java-version: "26"
 
-      - name: Verify Java
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mna/build/cargo-target
+          key: cargo-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mna/native/Cargo.lock') }}
+          restore-keys: |
+            cargo-native-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
+
+      - name: Verify Java and Gradle
         run: |
           echo "JAVA_HOME=$JAVA_HOME"
           java -version
           ./gradlew --version
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
 
       - name: Build repository
         run: ./gradlew build --stacktrace
