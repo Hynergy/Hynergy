@@ -1,0 +1,48 @@
+[package]
+name = "hynergy-benchmarks"
+version.workspace = true
+edition.workspace = true
+publish = false
+autobenches = false
+
+[features]
+default = []
+solver-profiling = ["hynergy-engine/solver-profiling"]
+
+[dependencies]
+criterion = "0.8.2"
+hynergy-engine = { path = "../hynergy-engine" }
+hynergy-model = { path = "../hynergy-model" }
+hynergy-protocol = { path = "../hynergy-protocol" }
+
+[[bench]]
+name = "world_tick"
+harness = false
+
+[[bench]]
+name = "topology"
+harness = false
+
+[[bench]]
+name = "subscriptions"
+harness = false
+
+[[bench]]
+name = "cpu_synthetic"
+harness = false
+
+[[bench]]
+name = "cpu_validated"
+harness = false
+
+[[bench]]
+name = "cpu_full"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[example]]
+name = "cpu_solver_profile"
+required-features = ["solver-profiling"]

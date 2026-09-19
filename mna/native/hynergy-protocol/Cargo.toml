@@ -1,0 +1,11 @@
+[package]
+name = "hynergy-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hynergy-engine = { path = "../hynergy-engine" }
+hynergy-model = { path = "../hynergy-model" }
+
+[dev-dependencies]
+hynergy-ffi = { path = "../hynergy-ffi" }

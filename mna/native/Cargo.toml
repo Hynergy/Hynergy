@@ -1,8 +1,25 @@
 [workspace]
 resolver = "3"
-members = ["hynergy-mna-ffi"]
-
+members = [
+    "hynergy-benchmarks",
+    "hynergy-ffi",
+    "hynergy-engine",
+    "hynergy-model",
+    "hynergy-protocol",
+    "hynergy-ids", "hynergy-mna", "hynergy-ir",
+]
 
 [workspace.package]
 version = "0.0.1-dev"
 edition = "2024"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true
+
+[profile.bench]
+debug = 1
+strip = false

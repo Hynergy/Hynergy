@@ -1,0 +1,13 @@
+[package]
+name = "hynergy-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "hynergy_mna"
+crate-type = ["cdylib"]
+
+[dependencies]
+hynergy-engine = { path = "../hynergy-engine" }
+hynergy-model = { path = "../hynergy-model" }
+hynergy-protocol = { path = "../hynergy-protocol" }

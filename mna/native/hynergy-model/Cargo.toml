@@ -1,0 +1,9 @@
+[package]
+name = "hynergy-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+smallvec = { version = "1.16", features = ["union", "const_new"] }
+thiserror = "2.0"
+hynergy-ids = { path = "../hynergy-ids" }

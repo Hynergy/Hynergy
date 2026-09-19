@@ -31,7 +31,7 @@ tasks.test {
     jvmArgs("--enable-native-access=ALL-UNNAMED")
 }
 
-val cargoPackage = "hynergy-mna-ffi"
+val cargoPackage = "hynergy-ffi"
 val nativeLibraryName = "hynergy_mna"
 
 val nativeOs: String = run {

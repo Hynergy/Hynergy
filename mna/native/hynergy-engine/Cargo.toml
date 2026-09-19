@@ -1,0 +1,16 @@
+[package]
+name = "hynergy-engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+solver-profiling = []
+
+[dependencies]
+hynergy-model = { path = "../hynergy-model" }
+hynergy-ids = { path = "../hynergy-ids" }
+smallvec = "1.16.1"
+hynergy-ir = { path = "../hynergy-ir" }
+hynergy-mna = { path = "../hynergy-mna" }
+thiserror = "2.0"

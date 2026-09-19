@@ -1,0 +1,314 @@
+mod connection;
+mod devices;
+mod slot;
+mod terminals;
+mod wires;
+
+pub use connection::ConnectionRef;
+pub use connection::ConnectionType;
+
+use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
+use crate::network::slot::{AttachTerminalError, DeviceSlot, WireSlot};
+use crate::parameter::{ParameterConstraintError, ParameterId};
+use hynergy_ids::define_non_zero_id;
+use std::num::NonZeroU32;
+use thiserror::Error;
+
+define_non_zero_id!(WireId);
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum NetworkModelError {
+    #[error("provided id {id:#?} exceeds max bound {upper_bound:#?}")]
+    IdOutOfBound { id: NonZeroU32, upper_bound: usize },
+
+    #[error("id {id:#?} exceeds the 31-bit ID limit")]
+    IdExceeds31Bit { id: NonZeroU32 },
+
+    #[error("id {id:#?} is already assigned")]
+    IdAlreadyAssigned { id: NonZeroU32 },
+
+    #[error("no {ty:#?} with assigned id {id:#?}")]
+    IdNotAssigned { ty: ConnectionType, id: NonZeroU32 },
+
+    #[error("cannot connect wire to itself")]
+    WireConnectToSelf,
+
+    #[error("elements are already connected")]
+    AlreadyConnected,
+
+    #[error("elements are not connected")]
+    NotConnected,
+
+    #[error("terminal is already connected")]
+    TerminalAlreadyConnected,
+
+    #[error("invalid terminal")]
+    InvalidTerminal,
+
+    #[error("invalid parameter {parameter:#?}")]
+    InvalidParameter { parameter: ParameterId },
+
+    #[error("parameter {parameter:#?} violates its constraints: {source}")]
+    ParameterConstraint {
+        parameter: ParameterId,
+        #[source]
+        source: ParameterConstraintError,
+    },
+
+    #[error("definition {definition:#?} is not registered")]
+    UnknownDefinition { definition: DefinitionId },
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Network {
+    wires: Vec<Option<WireSlot>>,
+    devices: Vec<Option<DeviceSlot>>,
+}
+
+impl Network {
+    pub fn new() -> Self {
+        Self {
+            wires: Vec::new(),
+            devices: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(wires: usize, devices: usize) -> Self {
+        Self {
+            wires: Vec::with_capacity(wires),
+            devices: Vec::with_capacity(devices),
+        }
+    }
+
+    #[inline]
+    fn wire_mut(
+        wires: &mut [Option<WireSlot>],
+        id: WireId,
+    ) -> Result<&mut WireSlot, NetworkModelError> {
+        wires
+            .get_mut(id.index())
+            .and_then(Option::as_mut)
+            .ok_or(NetworkModelError::IdNotAssigned {
+                ty: ConnectionType::Wire,
+                id: id.id(),
+            })
+    }
+
+    #[inline]
+    fn device_mut(
+        devices: &mut [Option<DeviceSlot>],
+        id: DeviceId,
+    ) -> Result<&mut DeviceSlot, NetworkModelError> {
+        devices.get_mut(id.index()).and_then(Option::as_mut).ok_or(
+            NetworkModelError::IdNotAssigned {
+                ty: ConnectionType::Device,
+                id: id.id(),
+            },
+        )
+    }
+
+    #[inline]
+    fn terminal_connection(
+        device: &DeviceSlot,
+        terminal: TerminalId,
+    ) -> Result<Option<ConnectionRef>, NetworkModelError> {
+        device
+            .terminals()
+            .get(terminal.index())
+            .copied()
+            .ok_or(NetworkModelError::InvalidTerminal)
+    }
+
+    #[inline]
+    fn terminal_ref(
+        device: DeviceId,
+        terminal: TerminalId,
+    ) -> Result<ConnectionRef, NetworkModelError> {
+        ConnectionRef::terminal(device, terminal).ok_or(NetworkModelError::InvalidTerminal)
+    }
+
+    #[inline]
+    fn map_attach_error(error: AttachTerminalError) -> NetworkModelError {
+        match error {
+            AttachTerminalError::AlreadyConnected => NetworkModelError::TerminalAlreadyConnected,
+            AttachTerminalError::InvalidTerminal => NetworkModelError::InvalidTerminal,
+        }
+    }
+
+    #[inline]
+    fn unlink_one_way(&mut self, endpoint: ConnectionRef, peer: ConnectionRef) {
+        match endpoint.connection_type() {
+            ConnectionType::Wire => {
+                let removed = self.wires[endpoint.index()]
+                    .as_mut()
+                    .expect("stored wire connection should reference a valid wire")
+                    .remove_connection(peer);
+
+                debug_assert!(removed, "bidirectional wire connection invariant violated");
+            }
+            ConnectionType::Device => {
+                let terminal = TerminalId::from(endpoint.port());
+                let device = self.devices[endpoint.index()]
+                    .as_mut()
+                    .expect("stored terminal connection should reference a valid definition_id");
+                let current = Self::terminal_connection(device, terminal)
+                    .expect("stored terminal connection should reference a valid terminal");
+
+                debug_assert_eq!(
+                    current,
+                    Some(peer),
+                    "bidirectional terminal connection invariant violated"
+                );
+                device.detach_terminal(terminal);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn device_definition_id(
+        &self,
+        device: DeviceId,
+    ) -> Result<DefinitionId, NetworkModelError> {
+        self.devices
+            .get(device.index())
+            .and_then(Option::as_ref)
+            .map(DeviceSlot::definition_id)
+            .ok_or(NetworkModelError::IdNotAssigned {
+                ty: ConnectionType::Device,
+                id: device.id(),
+            })
+    }
+
+    #[inline]
+    pub fn wire_connections(&self, wire: WireId) -> Result<&[ConnectionRef], NetworkModelError> {
+        self.wires
+            .get(wire.index())
+            .and_then(Option::as_ref)
+            .map(WireSlot::connections)
+            .ok_or(NetworkModelError::IdNotAssigned {
+                ty: ConnectionType::Wire,
+                id: wire.id(),
+            })
+    }
+
+    #[inline]
+    pub fn wires(&self) -> &[Option<WireSlot>] {
+        &self.wires
+    }
+
+    #[inline]
+    pub fn devices(&self) -> &[Option<DeviceSlot>] {
+        &self.devices
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Network, NetworkModelError};
+    use crate::device::definition::{DefinitionId, DeviceId, PrimitiveElementKind, TerminalId};
+    use crate::device::registry::DefinitionRegistry;
+    use crate::parameter::{ParameterConstraintError, ParameterId};
+
+    fn device_id(raw: u32) -> DeviceId {
+        DeviceId::try_from(raw).unwrap()
+    }
+
+    #[test]
+    fn device_parameter_validation_preserves_previous_value() {
+        let definitions = DefinitionRegistry::new();
+        let mut model = Network::new();
+        let device = device_id(1);
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance);
+
+        model.add_device(&definitions, device, definition).unwrap();
+        assert_eq!(model.devices[0].as_ref().unwrap().parameters(), &[None]);
+
+        model
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 0.0)
+            .unwrap();
+
+        assert_eq!(
+            model.devices[0].as_ref().unwrap().parameters(),
+            &[Some(0.0)]
+        );
+
+        model
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        for (value, error) in [
+            (-1.0, ParameterConstraintError::OutOfRange),
+            (f64::NAN, ParameterConstraintError::NonFinite),
+        ] {
+            assert_eq!(
+                model.set_device_parameter(&definitions, device, ParameterId::new(0), value,),
+                Err(NetworkModelError::ParameterConstraint {
+                    parameter: ParameterId::new(0),
+                    source: error,
+                })
+            );
+
+            assert_eq!(
+                model.devices[0].as_ref().unwrap().parameters(),
+                &[Some(1.0)]
+            );
+        }
+    }
+
+    #[test]
+    fn wire_connections_exposes_typed_read_only_connections() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let wire_a = super::WireId::try_from(1).unwrap();
+        let wire_b = super::WireId::try_from(2).unwrap();
+        let device = device_id(1);
+        let terminal = TerminalId::new(0);
+
+        network.add_wire(wire_a).unwrap();
+        network.add_wire(wire_b).unwrap();
+        network.connect_wires(wire_a, wire_b).unwrap();
+        network
+            .add_device(
+                &definitions,
+                device,
+                DefinitionId::from(PrimitiveElementKind::Conductance),
+            )
+            .unwrap();
+        network.attach_terminal(wire_a, device, terminal).unwrap();
+
+        let connections = network.wire_connections(wire_a).unwrap();
+        assert!(
+            connections
+                .iter()
+                .any(|connection| connection.as_wire() == Some(wire_b))
+        );
+        assert!(
+            connections
+                .iter()
+                .any(|connection| connection.as_terminal() == Some((device, terminal)))
+        );
+    }
+
+    #[test]
+    fn detaching_terminal_removes_wire_connection() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let wire = super::WireId::try_from(1).unwrap();
+        let device = device_id(1);
+        let terminal = TerminalId::new(0);
+
+        network.add_wire(wire).unwrap();
+        network
+            .add_device(
+                &definitions,
+                device,
+                DefinitionId::from(PrimitiveElementKind::Conductance),
+            )
+            .unwrap();
+        network.attach_terminal(wire, device, terminal).unwrap();
+
+        network.detach_terminal(wire, device, terminal).unwrap();
+
+        assert!(network.wire_connections(wire).unwrap().is_empty());
+    }
+}
