@@ -403,3 +403,85 @@ jobs:
 
       - name: Build repository
         run: ./gradlew build --stacktrace
+
+  required-checks:
+    name: Required checks
+    needs:
+      - changes
+      - validate-gradle-wrapper
+      - rust
+      - mna-integration
+      - gradle-build
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify required jobs
+        shell: bash
+        env:
+          RUST_REQUIRED: ${{ needs.changes.outputs.rust }}
+          MNA_REQUIRED: ${{ needs.changes.outputs.mna }}
+          GRADLE_REQUIRED: ${{ needs.changes.outputs.gradle }}
+
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          WRAPPER_RESULT: ${{ needs.validate-gradle-wrapper.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          MNA_RESULT: ${{ needs.mna-integration.result }}
+          GRADLE_RESULT: ${{ needs.gradle-build.result }}
+        run: |
+          set -euo pipefail
+
+          echo "Change detection:          $CHANGES_RESULT"
+          echo "Gradle wrapper validation: $WRAPPER_RESULT"
+          echo "Rust checks:               $RUST_RESULT (required: $RUST_REQUIRED)"
+          echo "MNA integration:           $MNA_RESULT (required: $MNA_REQUIRED)"
+          echo "Gradle build:              $GRADLE_RESULT (required: $GRADLE_REQUIRED)"
+
+          [[ "$CHANGES_RESULT" == "success" ]] || {
+            echo "::error::Change detection failed: $CHANGES_RESULT"
+            exit 1
+          }
+
+          [[ "$WRAPPER_RESULT" == "success" ]] || {
+            echo "::error::Gradle wrapper validation failed: $WRAPPER_RESULT"
+            exit 1
+          }
+
+          if [[ "$RUST_REQUIRED" == "true" ]]; then
+            [[ "$RUST_RESULT" == "success" ]] || {
+              echo "::error::Rust checks were required but result was: $RUST_RESULT"
+              exit 1
+            }
+          else
+            [[ "$RUST_RESULT" == "skipped" || "$RUST_RESULT" == "success" ]] || {
+              echo "::error::Unexpected Rust checks result: $RUST_RESULT"
+              exit 1
+            }
+          fi
+
+          if [[ "$MNA_REQUIRED" == "true" ]]; then
+            [[ "$MNA_RESULT" == "success" ]] || {
+              echo "::error::MNA integration was required but result was: $MNA_RESULT"
+              exit 1
+            }
+          else
+            [[ "$MNA_RESULT" == "skipped" || "$MNA_RESULT" == "success" ]] || {
+              echo "::error::Unexpected MNA integration result: $MNA_RESULT"
+              exit 1
+            }
+          fi
+
+          if [[ "$GRADLE_REQUIRED" == "true" ]]; then
+            [[ "$GRADLE_RESULT" == "success" ]] || {
+              echo "::error::Gradle build was required but result was: $GRADLE_RESULT"
+              exit 1
+            }
+          else
+            [[ "$GRADLE_RESULT" == "skipped" || "$GRADLE_RESULT" == "success" ]] || {
+              echo "::error::Unexpected Gradle build result: $GRADLE_RESULT"
+              exit 1
+            }
+          fi
+
+          echo "All required CI checks passed."
