@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - 'v*'
+      - 'releases/**'
   pull_request:
   workflow_dispatch:
 
@@ -40,8 +44,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
 
@@ -55,121 +59,101 @@ jobs:
             echo "Gradle build: $3"
           }
 
-          # A manual run explicitly requests complete verification.
+          force_all() {
+            echo "::warning::$1"
+            write_outputs true true true
+            exit 0
+          }
+
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             write_outputs true true true
             exit 0
           fi
 
-          # For pull requests, compare the entire PR against its base.
-          #
-          # This means an MNA change followed by a docs-only commit still
-          # runs MNA CI, because the MNA change remains part of the PR.
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            rust=false
-            mna=false
-            gradle=false
-
-            while IFS= read -r file; do
-              [[ -z "$file" ]] && continue
-
-              echo "changed: $file"
-
-              case "$file" in
-                # Changing CI verifies everything.
-                .github/workflows/ci.yml)
-                  rust=true
-                  mna=true
-                  gradle=true
-                  ;;
-
-                # Native Rust affects Rust checks, JNI/FFI integration,
-                # and anything built through Gradle.
-                mna/native/*)
-                  rust=true
-                  mna=true
-                  gradle=true
-                  ;;
-
-                # Other MNA changes affect Java/native integration and build.
-                mna/*)
-                  mna=true
-                  gradle=true
-                  ;;
-
-                # Core changes only require the repository Gradle build.
-                core/*)
-                  gradle=true
-                  ;;
-
-                # Shared Gradle configuration can affect both integration
-                # and the full build.
-                build.gradle.kts|settings.gradle.kts|gradle.properties|gradlew|gradlew.bat|gradle/*)
-                  mna=true
-                  gradle=true
-                  ;;
-              esac
-            done < <(
-              git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA"
-            )
-
-            write_outputs "$rust" "$mna" "$gradle"
-            exit 0
+            current_sha="$PR_HEAD_SHA"
+            ci_branch="$GITHUB_HEAD_REF"
+          else
+            current_sha="$GITHUB_SHA"
+            ci_branch="$GITHUB_REF_NAME"
           fi
 
-          # Pushes use an independent known-good baseline for each check.
-          #
-          # A workflow where Rust passed but Gradle failed can still become
-          # Rust's new baseline without incorrectly becoming Gradle's.
+          [[ -n "$current_sha" ]] || force_all "Current commit could not be resolved; forcing all checks."
+          [[ -n "$ci_branch" ]] || force_all "Current branch could not be resolved; forcing all checks."
+
+          runs_file="$(mktemp)"
+          jobs_file="$(mktemp)"
+          diff_file="$(mktemp)"
+          trap 'rm -f "$runs_file" "$jobs_file" "$diff_file"' EXIT
+
           rust_base=""
           mna_base=""
           gradle_base=""
 
-          while IFS=$'\t' read -r run_id head_sha; do
-            [[ -z "$run_id" || -z "$head_sha" ]] && continue
+          scan_branch_for_baselines() {
+            local branch="$1"
 
-            jobs="$(
-              gh api \
+            [[ -z "$branch" ]] && return 0
+
+            if ! gh api \
+              --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+              -f branch="$branch" \
+              -f status=completed \
+              -f per_page=100 \
+              --jq '.workflow_runs[] | [.id, .head_sha] | @tsv' \
+              > "$runs_file"
+            then
+              force_all "Could not query previous CI runs for $branch; forcing all checks."
+            fi
+
+            while IFS=$'\t' read -r run_id head_sha; do
+              [[ -z "$run_id" || -z "$head_sha" ]] && continue
+
+              if ! git cat-file -e "${head_sha}^{commit}" 2>/dev/null ||
+                 ! git merge-base --is-ancestor "$head_sha" "$current_sha" 2>/dev/null; then
+                continue
+              fi
+
+              if ! gh api \
                 --method GET \
                 "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" \
                 -f per_page=100 \
-                --jq '.jobs[] | [.name, .conclusion] | @tsv'
-            )"
+                --jq '.jobs[] | [.name, .conclusion] | @tsv' \
+                > "$jobs_file"
+              then
+                force_all "Could not inspect previous CI run ${run_id}; forcing all checks."
+              fi
 
-            if [[ -z "$rust_base" ]] &&
-               grep -Fqx $'Rust checks\tsuccess' <<< "$jobs"; then
-              rust_base="$head_sha"
-            fi
+              if [[ -z "$rust_base" ]] &&
+                 grep -Fqx $'Rust checks\tsuccess' "$jobs_file"; then
+                rust_base="$head_sha"
+              fi
 
-            # Only advance the MNA baseline when integration passed on
-            # all three supported runner operating systems.
-            if [[ -z "$mna_base" ]] &&
-               grep -Fqx $'MNA integration (ubuntu-latest)\tsuccess' <<< "$jobs" &&
-               grep -Fqx $'MNA integration (windows-latest)\tsuccess' <<< "$jobs" &&
-               grep -Fqx $'MNA integration (macos-latest)\tsuccess' <<< "$jobs"; then
-              mna_base="$head_sha"
-            fi
+              if [[ -z "$mna_base" ]] &&
+                 grep -Fqx $'MNA integration (ubuntu-latest)\tsuccess' "$jobs_file" &&
+                 grep -Fqx $'MNA integration (windows-latest)\tsuccess' "$jobs_file" &&
+                 grep -Fqx $'MNA integration (macos-latest)\tsuccess' "$jobs_file"; then
+                mna_base="$head_sha"
+              fi
 
-            if [[ -z "$gradle_base" ]] &&
-               grep -Fqx $'Gradle build\tsuccess' <<< "$jobs"; then
-              gradle_base="$head_sha"
-            fi
+              if [[ -z "$gradle_base" ]] &&
+                 grep -Fqx $'Gradle build\tsuccess' "$jobs_file"; then
+                gradle_base="$head_sha"
+              fi
 
-            if [[ -n "$rust_base" &&
-                  -n "$mna_base" &&
-                  -n "$gradle_base" ]]; then
-              break
-            fi
-          done < <(
-            gh api \
-              --method GET \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
-              -f branch="$GITHUB_REF_NAME" \
-              -f status=completed \
-              -f event=push \
-              -f per_page=50 \
-              --jq '.workflow_runs[] | [.id, .head_sha] | @tsv'
-          )
+              if [[ -n "$rust_base" && -n "$mna_base" && -n "$gradle_base" ]]; then
+                return 0
+              fi
+            done < "$runs_file"
+          }
+
+          scan_branch_for_baselines "$ci_branch"
+
+          if [[ "$EVENT_NAME" == "pull_request" &&
+                ( -z "$rust_base" || -z "$mna_base" || -z "$gradle_base" ) ]]; then
+            scan_branch_for_baselines "$PR_BASE_REF"
+          fi
 
           echo "Last successful Rust check: ${rust_base:-none}"
           echo "Last successful MNA integration: ${mna_base:-none}"
@@ -179,32 +163,40 @@ jobs:
             local base="$1"
             shift
 
-            # No known successful baseline: run the check.
             if [[ -z "$base" ]]; then
               return 0
             fi
 
-            # Fail safe if the baseline is no longer available locally.
             if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-              echo "Base commit $base is unavailable; forcing check." >&2
+              echo "Baseline $base is unavailable; forcing this check." >&2
+              return 0
+            fi
+
+            if ! git merge-base --is-ancestor "$base" "$current_sha" 2>/dev/null; then
+              echo "Baseline $base is not an ancestor of $current_sha; forcing this check." >&2
+              return 0
+            fi
+
+            if ! git diff --name-only -z "$base" "$current_sha" > "$diff_file"; then
+              echo "Could not diff $base..$current_sha; forcing this check." >&2
               return 0
             fi
 
             local file
             local pattern
 
-            while IFS= read -r file; do
+            while IFS= read -r -d '' file; do
               [[ -z "$file" ]] && continue
+
+              [[ "$file" == *.md ]] && continue
 
               for pattern in "$@"; do
                 if [[ "$file" == $pattern ]]; then
-                  echo "relevant change since $base: $file" >&2
+                  echo "Relevant change since $base: $file" >&2
                   return 0
                 fi
               done
-            done < <(
-              git diff --name-only "$base" "$GITHUB_SHA"
-            )
+            done < "$diff_file"
 
             return 1
           }
@@ -412,7 +404,7 @@ jobs:
       - rust
       - mna-integration
       - gradle-build
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -434,9 +426,9 @@ jobs:
 
           echo "Change detection:          $CHANGES_RESULT"
           echo "Gradle wrapper validation: $WRAPPER_RESULT"
-          echo "Rust checks:               $RUST_RESULT (required: $RUST_REQUIRED)"
-          echo "MNA integration:           $MNA_RESULT (required: $MNA_REQUIRED)"
-          echo "Gradle build:              $GRADLE_RESULT (required: $GRADLE_REQUIRED)"
+          echo "Rust checks:               $RUST_RESULT (required: ${RUST_REQUIRED:-unknown})"
+          echo "MNA integration:           $MNA_RESULT (required: ${MNA_REQUIRED:-unknown})"
+          echo "Gradle build:              $GRADLE_RESULT (required: ${GRADLE_REQUIRED:-unknown})"
 
           [[ "$CHANGES_RESULT" == "success" ]] || {
             echo "::error::Change detection failed: $CHANGES_RESULT"
@@ -448,40 +440,33 @@ jobs:
             exit 1
           }
 
-          if [[ "$RUST_REQUIRED" == "true" ]]; then
-            [[ "$RUST_RESULT" == "success" ]] || {
-              echo "::error::Rust checks were required but result was: $RUST_RESULT"
-              exit 1
-            }
-          else
-            [[ "$RUST_RESULT" == "skipped" || "$RUST_RESULT" == "success" ]] || {
-              echo "::error::Unexpected Rust checks result: $RUST_RESULT"
-              exit 1
-            }
-          fi
+          verify_conditional_job() {
+            local label="$1"
+            local required="$2"
+            local result="$3"
 
-          if [[ "$MNA_REQUIRED" == "true" ]]; then
-            [[ "$MNA_RESULT" == "success" ]] || {
-              echo "::error::MNA integration was required but result was: $MNA_RESULT"
-              exit 1
-            }
-          else
-            [[ "$MNA_RESULT" == "skipped" || "$MNA_RESULT" == "success" ]] || {
-              echo "::error::Unexpected MNA integration result: $MNA_RESULT"
-              exit 1
-            }
-          fi
+            case "$required" in
+              true)
+                [[ "$result" == "success" ]] || {
+                  echo "::error::$label was required but result was: $result"
+                  exit 1
+                }
+                ;;
+              false)
+                [[ "$result" == "skipped" || "$result" == "success" ]] || {
+                  echo "::error::$label was not required but result was: $result"
+                  exit 1
+                }
+                ;;
+              *)
+                echo "::error::Could not determine whether $label was required."
+                exit 1
+                ;;
+            esac
+          }
 
-          if [[ "$GRADLE_REQUIRED" == "true" ]]; then
-            [[ "$GRADLE_RESULT" == "success" ]] || {
-              echo "::error::Gradle build was required but result was: $GRADLE_RESULT"
-              exit 1
-            }
-          else
-            [[ "$GRADLE_RESULT" == "skipped" || "$GRADLE_RESULT" == "success" ]] || {
-              echo "::error::Unexpected Gradle build result: $GRADLE_RESULT"
-              exit 1
-            }
-          fi
+          verify_conditional_job "Rust checks" "$RUST_REQUIRED" "$RUST_RESULT"
+          verify_conditional_job "MNA integration" "$MNA_REQUIRED" "$MNA_RESULT"
+          verify_conditional_job "Gradle build" "$GRADLE_REQUIRED" "$GRADLE_RESULT"
 
           echo "All required CI checks passed."
