@@ -175,10 +175,10 @@ impl DigitalHarness {
     ) -> GateOutput {
         debug_assert!(matches!(
             kind,
-            PrimitiveElementKind::And2
-                | PrimitiveElementKind::Nand2
-                | PrimitiveElementKind::Or2
-                | PrimitiveElementKind::Nor2
+            PrimitiveElementKind::And
+                | PrimitiveElementKind::Nand
+                | PrimitiveElementKind::Or
+                | PrimitiveElementKind::Nor
         ));
 
         let device = add_primitive(
@@ -202,7 +202,7 @@ impl DigitalHarness {
     }
 
     fn nand(&mut self, a: WireId, b: WireId) -> GateOutput {
-        self.binary_gate(PrimitiveElementKind::Nand2, a, b)
+        self.binary_gate(PrimitiveElementKind::Nand, a, b)
     }
 
     fn inverter(&mut self, input: WireId) -> GateOutput {
@@ -214,11 +214,11 @@ impl DigitalHarness {
     }
 
     fn and_gate(&mut self, a: WireId, b: WireId) -> GateOutput {
-        self.binary_gate(PrimitiveElementKind::And2, a, b)
+        self.binary_gate(PrimitiveElementKind::And, a, b)
     }
 
     fn or_gate(&mut self, a: WireId, b: WireId) -> GateOutput {
-        self.binary_gate(PrimitiveElementKind::Or2, a, b)
+        self.binary_gate(PrimitiveElementKind::Or, a, b)
     }
 
     fn xor_gate(&mut self, a: WireId, b: WireId) -> GateOutput {
@@ -229,7 +229,7 @@ impl DigitalHarness {
     }
 
     fn nor(&mut self, a: WireId, b: WireId) -> GateOutput {
-        self.binary_gate(PrimitiveElementKind::Nor2, a, b)
+        self.binary_gate(PrimitiveElementKind::Nor, a, b)
     }
 
     fn mux(&mut self, a: WireId, b: WireId, select: WireId) -> GateOutput {
@@ -242,7 +242,7 @@ impl DigitalHarness {
         let a_selected = self.and_gate(a, not_select.wire);
         let b_selected = self.and_gate(b, select);
         self.binary_gate_into(
-            PrimitiveElementKind::Or2,
+            PrimitiveElementKind::Or,
             output,
             a_selected.wire,
             b_selected.wire,

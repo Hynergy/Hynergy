@@ -429,10 +429,10 @@ fn compile_primitive(
         }
 
         PrimitiveElementKind::Not
-        | PrimitiveElementKind::And2
-        | PrimitiveElementKind::Nand2
-        | PrimitiveElementKind::Or2
-        | PrimitiveElementKind::Nor2 => {
+        | PrimitiveElementKind::And
+        | PrimitiveElementKind::Nand
+        | PrimitiveElementKind::Or
+        | PrimitiveElementKind::Nor => {
             compile_logic_gate(&mut builder, kind)?;
         }
 
@@ -1128,10 +1128,10 @@ fn compile_logic_gate(
 
     let input_b = match kind {
         PrimitiveElementKind::Not => None,
-        PrimitiveElementKind::And2
-        | PrimitiveElementKind::Nand2
-        | PrimitiveElementKind::Or2
-        | PrimitiveElementKind::Nor2 => Some(builder.terminal_voltage()?),
+        PrimitiveElementKind::And
+        | PrimitiveElementKind::Nand
+        | PrimitiveElementKind::Or
+        | PrimitiveElementKind::Nor => Some(builder.terminal_voltage()?),
         _ => unreachable!("compile_logic_gate called for a non-logic primitive"),
     };
 
@@ -1156,12 +1156,12 @@ fn compile_logic_gate(
     let output_high = match kind {
         PrimitiveElementKind::Not => builder.sub(one, input_a_high)?,
 
-        PrimitiveElementKind::And2 => builder.mul(
+        PrimitiveElementKind::And => builder.mul(
             input_a_high,
             input_b_high.expect("binary gate must have input B"),
         )?,
 
-        PrimitiveElementKind::Nand2 => {
+        PrimitiveElementKind::Nand => {
             let both = builder.mul(
                 input_a_high,
                 input_b_high.expect("binary gate must have input B"),
@@ -1170,7 +1170,7 @@ fn compile_logic_gate(
             builder.sub(one, both)?
         }
 
-        PrimitiveElementKind::Or2 => {
+        PrimitiveElementKind::Or => {
             let input_b_high = input_b_high.expect("binary gate must have input B");
             let either_sum = builder.add(input_a_high, input_b_high)?;
             let both = builder.mul(input_a_high, input_b_high)?;
@@ -1178,7 +1178,7 @@ fn compile_logic_gate(
             builder.sub(either_sum, both)?
         }
 
-        PrimitiveElementKind::Nor2 => {
+        PrimitiveElementKind::Nor => {
             let input_b_high = input_b_high.expect("binary gate must have input B");
             let input_a_low = builder.sub(one, input_a_high)?;
             let input_b_low = builder.sub(one, input_b_high)?;
@@ -1587,10 +1587,10 @@ mod tests {
         }
 
         for kind in [
-            PrimitiveElementKind::And2,
-            PrimitiveElementKind::Nand2,
-            PrimitiveElementKind::Or2,
-            PrimitiveElementKind::Nor2,
+            PrimitiveElementKind::And,
+            PrimitiveElementKind::Nand,
+            PrimitiveElementKind::Or,
+            PrimitiveElementKind::Nor,
         ] {
             assert_compiled_primitive_observers(kind, &[&[0, 1, 2, 3]]);
         }
@@ -1602,10 +1602,10 @@ mod tests {
     fn logic_gate_templates_are_stateless_and_need_no_auxiliary_unknowns() {
         for kind in [
             PrimitiveElementKind::Not,
-            PrimitiveElementKind::And2,
-            PrimitiveElementKind::Nand2,
-            PrimitiveElementKind::Or2,
-            PrimitiveElementKind::Nor2,
+            PrimitiveElementKind::And,
+            PrimitiveElementKind::Nand,
+            PrimitiveElementKind::Or,
+            PrimitiveElementKind::Nor,
         ] {
             let gate = template(kind);
 

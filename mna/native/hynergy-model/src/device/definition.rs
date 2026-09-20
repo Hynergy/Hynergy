@@ -84,10 +84,10 @@ pub enum PrimitiveElementKind {
     TickDelay = 10,
     Diode = 11,
     Not = 12,
-    And2 = 13,
-    Nand2 = 14,
-    Or2 = 15,
-    Nor2 = 16,
+    And = 13,
+    Nand = 14,
+    Or = 15,
+    Nor = 16,
     SchmittBuffer = 17,
 }
 
@@ -121,10 +121,10 @@ impl PrimitiveElementKind {
         Self::TickDelay,
         Self::Diode,
         Self::Not,
-        Self::And2,
-        Self::Nand2,
-        Self::Or2,
-        Self::Nor2,
+        Self::And,
+        Self::Nand,
+        Self::Or,
+        Self::Nor,
         Self::SchmittBuffer,
     ];
 
@@ -144,7 +144,7 @@ impl PrimitiveElementKind {
             Self::VoltageControlledConductance => 4,
             Self::TickDelay => 1,
             Self::Diode => 2,
-            Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => 3,
+            Self::Not | Self::And | Self::Nand | Self::Or | Self::Nor => 3,
             Self::SchmittBuffer => 4,
         }
     }
@@ -188,7 +188,7 @@ impl PrimitiveElementKind {
                 vec![voltage(0, 2, p0), voltage(3, 2, p0), current(1, 0, p0)]
             }
 
-            Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => vec![
+            Self::And | Self::Nand | Self::Or | Self::Nor => vec![
                 voltage(0, 2, p0),
                 voltage(3, 2, p0),
                 voltage(4, 2, p0),
@@ -294,7 +294,7 @@ impl PrimitiveElementKind {
                 [positive, non_negative].get(index).copied()
             }
 
-            Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => {
+            Self::Not | Self::And | Self::Nand | Self::Or | Self::Nor => {
                 // 0: threshold relative to VSS
                 // 1: G_max
                 // 2: G_min
@@ -323,7 +323,7 @@ impl PrimitiveElementKind {
                 smallvec![0.into(), 0.into(), 0.into(), 0.into()],
             ),
 
-            Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2 => (
+            Self::And | Self::Nand | Self::Or | Self::Nor => (
                 smallvec![0.into(), 1.into(), 2.into(), 3.into(), 4.into()],
                 smallvec![0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
             ),
@@ -442,7 +442,7 @@ impl PrimitiveElementKind {
                 });
             }
 
-            Self::Not | Self::And2 | Self::Nand2 | Self::Or2 | Self::Nor2
+            Self::Not | Self::And | Self::Nand | Self::Or | Self::Nor
                 if parameters[1] <= parameters[2] =>
             {
                 return Err(PrimitiveParameterError::ParameterMustBeGreater {
@@ -836,10 +836,10 @@ mod tests {
         };
 
         for kind in [
-            PrimitiveElementKind::And2,
-            PrimitiveElementKind::Nand2,
-            PrimitiveElementKind::Or2,
-            PrimitiveElementKind::Nor2,
+            PrimitiveElementKind::And,
+            PrimitiveElementKind::Nand,
+            PrimitiveElementKind::Or,
+            PrimitiveElementKind::Nor,
         ] {
             assert_primitive_observers(
                 kind,
@@ -1081,20 +1081,20 @@ mod tests {
         assert_eq!(PrimitiveElementKind::Not.definition().terminals().len(), 4);
 
         for kind in [
-            PrimitiveElementKind::And2,
-            PrimitiveElementKind::Nand2,
-            PrimitiveElementKind::Or2,
-            PrimitiveElementKind::Nor2,
+            PrimitiveElementKind::And,
+            PrimitiveElementKind::Nand,
+            PrimitiveElementKind::Or,
+            PrimitiveElementKind::Nor,
         ] {
             assert_eq!(kind.definition().terminals().len(), 5, "{kind:?}");
         }
 
         for kind in [
             PrimitiveElementKind::Not,
-            PrimitiveElementKind::And2,
-            PrimitiveElementKind::Nand2,
-            PrimitiveElementKind::Or2,
-            PrimitiveElementKind::Nor2,
+            PrimitiveElementKind::And,
+            PrimitiveElementKind::Nand,
+            PrimitiveElementKind::Or,
+            PrimitiveElementKind::Nor,
         ] {
             assert_eq!(kind.parameter_count(), 3, "{kind:?}");
             assert_eq!(kind.state_count(), 0, "{kind:?}");

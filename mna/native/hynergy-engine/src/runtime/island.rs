@@ -1706,10 +1706,10 @@ mod test {
     ) {
         let binary = match kind {
             PrimitiveElementKind::Not => false,
-            PrimitiveElementKind::And2
-            | PrimitiveElementKind::Nand2
-            | PrimitiveElementKind::Or2
-            | PrimitiveElementKind::Nor2 => true,
+            PrimitiveElementKind::And
+            | PrimitiveElementKind::Nand
+            | PrimitiveElementKind::Or
+            | PrimitiveElementKind::Nor => true,
             _ => panic!("logic_gate_island requires a logic gate primitive"),
         };
 
@@ -1883,10 +1883,10 @@ mod test {
         }
 
         for (kind, truth_table) in [
-            (PrimitiveElementKind::And2, [false, false, false, true]),
-            (PrimitiveElementKind::Nand2, [true, true, true, false]),
-            (PrimitiveElementKind::Or2, [false, true, true, true]),
-            (PrimitiveElementKind::Nor2, [true, false, false, false]),
+            (PrimitiveElementKind::And, [false, false, false, true]),
+            (PrimitiveElementKind::Nand, [true, true, true, false]),
+            (PrimitiveElementKind::Or, [false, true, true, true]),
+            (PrimitiveElementKind::Nor, [true, false, false, false]),
         ] {
             for (index, expected_high) in truth_table.into_iter().enumerate() {
                 let input_a = if index & 0b10 == 0 { 0.0 } else { 5.0 };
@@ -1918,7 +1918,7 @@ mod test {
     #[test]
     fn settled_logic_gate_island_sleeps() {
         let (network, compiled, _, _) =
-            logic_gate_island(PrimitiveElementKind::Nand2, 5.0, Some(5.0));
+            logic_gate_island(PrimitiveElementKind::Nand, 5.0, Some(5.0));
 
         let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
 
