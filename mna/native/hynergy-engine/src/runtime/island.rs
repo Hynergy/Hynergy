@@ -14,6 +14,8 @@ use hynergy_model::parameter::ParameterId;
 
 use thiserror::Error;
 
+use crate::runtime::bindings::IslandBindings;
+use crate::state::PhysicalStateAddress;
 #[cfg(test)]
 use {
     crate::compile::island::{IslandNode, IslandUnknownLayout},
@@ -77,6 +79,7 @@ pub(crate) struct IslandRuntime {
     ir: CompiledIslandIr,
     states: IslandStateLayout,
     partition_inputs: Box<[CompiledPartitionInputs]>,
+    bindings: IslandBindings,
     workspace: ValueWorkspace,
     solution: Box<[f64]>,
     solution_valid: bool,
@@ -100,11 +103,19 @@ pub(crate) struct IslandRuntime {
     #[cfg(test)]
     solve_count: usize,
     #[cfg(test)]
+    physical_parameter_read_count: usize,
+    #[cfg(test)]
+    binding_rebind_count: usize,
+    #[cfg(test)]
     unknowns: IslandUnknownLayout,
 }
 
 impl IslandRuntime {
-    pub(crate) fn new(compiled: CompiledIsland, timestep: f64) -> Result<Self, IslandRuntimeError> {
+    pub(crate) fn new(
+        compiled: CompiledIsland,
+        network: &Network,
+        timestep: f64,
+    ) -> Result<Self, IslandRuntimeError> {
         debug_assert!(timestep.is_finite());
         debug_assert!(timestep > 0.0);
 
@@ -117,6 +128,8 @@ impl IslandRuntime {
             partition_inputs,
             observer_outputs,
         } = compiled.into_parts();
+
+        let bindings = IslandBindings::new(network, &states, &partition_inputs, ir.state_inputs())?;
 
         let dimension = pattern.dimension();
 
@@ -146,6 +159,7 @@ impl IslandRuntime {
             ir,
             states,
             partition_inputs,
+            bindings,
             observer_outputs,
             observer_outputs_dirty: false,
             workspace,
@@ -168,6 +182,10 @@ impl IslandRuntime {
             matrix_stamp_count: 0,
             #[cfg(test)]
             solve_count: 0,
+            #[cfg(test)]
+            physical_parameter_read_count: 0,
+            #[cfg(test)]
+            binding_rebind_count: 0,
             #[cfg(test)]
             unknowns,
         })
@@ -412,7 +430,7 @@ impl IslandRuntime {
         mut old_state: F,
     ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError>
     where
-        F: FnMut(DeviceState) -> Option<f64>,
+        F: FnMut(PhysicalStateAddress) -> Option<f64>,
     {
         #[cfg(feature = "solver-profiling")]
         {
@@ -436,18 +454,15 @@ impl IslandRuntime {
 
         self.prepare_static(network)?;
 
-        for &(slot, input) in self.ir.state_inputs() {
-            let state = self
-                .states
-                .device_state(slot)
-                .expect("compiled state input must have a physical state");
+        for binding in self.bindings.state_inputs() {
+            let state = binding.state();
 
-            let value = old_state(state).ok_or(IslandRuntimeError::MissingState {
+            let value = old_state(binding.address()).ok_or(IslandRuntimeError::MissingState {
                 device: state.device(),
                 state: state.state(),
             })?;
 
-            self.workspace.set_input(input, value);
+            self.workspace.set_input(binding.input(), value);
         }
 
         self.ir.value_program().execute_tick(&mut self.workspace);
@@ -500,32 +515,28 @@ impl IslandRuntime {
     fn load_parameters(&mut self, network: &Network) -> Result<StaticChanges, IslandRuntimeError> {
         let mut changes = StaticChanges::default();
 
-        for partition in &self.partition_inputs {
-            let device = partition.device();
-
-            let device_view = network
-                .device(device)
-                .map_err(|_| IslandRuntimeError::MissingDevice { device })?;
-
-            let parameter_ids = partition.definition_parameters();
-            let parameter_inputs = partition.parameter_inputs();
-
-            debug_assert_eq!(parameter_ids.len(), parameter_inputs.len());
-
-            for (&parameter, &input) in parameter_ids.iter().zip(parameter_inputs) {
-                let value = device_view
-                    .parameter(parameter)
-                    .expect("compiled parameter ID must exist in its device definition")
-                    .ok_or(IslandRuntimeError::MissingParameter { device, parameter })?;
-
-                if self.workspace.value(input.value()) == value {
-                    continue;
-                }
-
-                self.workspace.set_input(input, value);
-
-                changes.record(self.ir.static_input_affects_matrix(input));
+        for binding in self.bindings.parameters() {
+            #[cfg(test)]
+            {
+                self.physical_parameter_read_count += 1;
             }
+
+            let device = binding.device();
+            let parameter = binding.parameter();
+            let input = binding.input();
+
+            let value = network
+                .parameter_at_location(binding.location(), parameter)
+                .ok_or(IslandRuntimeError::MissingDevice { device })?
+                .ok_or(IslandRuntimeError::MissingParameter { device, parameter })?;
+
+            if self.workspace.value(input.value()) == value {
+                continue;
+            }
+
+            self.workspace.set_input(input, value);
+
+            changes.record(self.ir.static_input_affects_matrix(input));
         }
 
         Ok(changes)
@@ -568,6 +579,24 @@ impl IslandRuntime {
                 .iter()
                 .map(|&slot| self.workspace.value(slot)),
         )
+    }
+
+    #[inline]
+    pub(crate) fn rebind(&mut self, network: &Network) -> Result<(), IslandRuntimeError> {
+        self.bindings.rebind(network)?;
+
+        #[cfg(test)]
+        {
+            self.binding_rebind_count += 1;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    #[inline]
+    pub(crate) fn debug_assert_bindings_valid(&self, network: &Network) {
+        self.bindings.debug_assert_valid(network);
     }
 
     #[cfg(feature = "solver-profiling")]
@@ -615,6 +644,21 @@ impl IslandRuntime {
 
             Some(unknown) => self.solution[unknown.index()],
         })
+    }
+
+    #[inline]
+    fn reset_parameter_read_count(&mut self) {
+        self.physical_parameter_read_count = 0;
+    }
+
+    #[inline]
+    fn physical_parameter_read_count(&self) -> usize {
+        self.physical_parameter_read_count
+    }
+
+    #[inline]
+    pub(crate) fn binding_rebind_count(&self) -> usize {
+        self.binding_rebind_count
     }
 }
 
@@ -820,6 +864,7 @@ mod test {
         IslandRuntime, advance_iteration_latches, initialize_iteration_latches,
         iteration_stability_matches, solutions_converged,
     };
+    use crate::state::PhysicalStateAddress;
     use crate::topology::{DerivedTopology, DeviceComponent};
     use hynergy_ir::StateSlot;
     use hynergy_mna::pattern::PatternBuilder;
@@ -869,8 +914,10 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(source, DevicePartitionId::new(0)),
+        );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
@@ -883,7 +930,7 @@ mod test {
 
         compiled.force_nonlinear_iteration_for_test(false);
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -906,7 +953,7 @@ mod test {
 
         compiled.force_nonlinear_iteration_for_test(false);
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -926,7 +973,7 @@ mod test {
     fn clean_stateless_island_sleeps_after_first_solve() {
         let (network, compiled) = voltage_source_island();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -945,7 +992,7 @@ mod test {
     fn numerical_invalidation_wakes_sleeping_island() {
         let (network, compiled) = voltage_source_island();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
         runtime.solve_tick(&network, |_| None).unwrap();
@@ -975,7 +1022,7 @@ mod test {
         let (network, compiled) = voltage_source_island();
         let source = DeviceId::try_from(1).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -993,7 +1040,7 @@ mod test {
     fn linear_island_solves_once() {
         let (network, compiled) = voltage_source_island();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1006,7 +1053,7 @@ mod test {
 
         compiled.force_nonlinear_iteration_for_test(false);
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1064,15 +1111,17 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(source, DevicePartitionId::new(0)),
+        );
 
         let positive_node = IslandNode::net(topology.wire_net(positive));
         let negative_node = IslandNode::net(topology.wire_net(negative));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         let writes = runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1134,14 +1183,16 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(capacitor, DevicePartitionId::new(0)),
+        );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, 0.5).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, 0.5).unwrap();
 
-        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+        let state = PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
         runtime
             .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
@@ -1215,7 +1266,6 @@ mod test {
             .attach_terminal(wire_b, capacitor, TerminalId::new(1))
             .unwrap();
 
-        // Current flows from B to A.
         network
             .attach_terminal(wire_b, source, TerminalId::new(0))
             .unwrap();
@@ -1238,17 +1288,20 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(capacitor, DevicePartitionId::new(0)),
+        );
 
         let node_a = IslandNode::net(topology.wire_net(wire_a));
         let node_b = IslandNode::net(topology.wire_net(wire_b));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, 0.5).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, 0.5).unwrap();
 
-        let capacitor_state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+        let capacitor_state =
+            PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
         let writes = runtime
             .solve_tick(&network, |state| (state == capacitor_state).then_some(3.0))
@@ -1259,7 +1312,10 @@ mod test {
         assert!((voltage - 2.8).abs() < 1.0e-12);
 
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].state(), capacitor_state);
+
+        let semantic_state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+
+        assert_eq!(writes[0].state(), semantic_state);
         assert!((writes[0].value() - 2.8).abs() < 1.0e-12);
     }
 
@@ -1313,14 +1369,16 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(capacitor, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(capacitor, DevicePartitionId::new(0)),
+        );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, 0.5).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, 0.5).unwrap();
 
-        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+        let state = PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
         runtime
             .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
@@ -1385,12 +1443,14 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(source, DevicePartitionId::new(0)),
+        );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1405,7 +1465,6 @@ mod test {
             .unwrap();
 
         runtime.mark_numerical_dirty();
-
         runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 2);
@@ -1461,15 +1520,17 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(source, DevicePartitionId::new(0)),
+        );
 
         let positive_node = IslandNode::net(topology.wire_net(positive));
         let negative_node = IslandNode::net(topology.wire_net(negative));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1480,7 +1541,6 @@ mod test {
             .unwrap();
 
         runtime.mark_numerical_dirty();
-
         runtime.solve_tick(&network, |_| None).unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
@@ -1529,12 +1589,10 @@ mod test {
             .attach_terminal(common, controlled, TerminalId::new(1))
             .unwrap();
 
-        // Control voltage is the output voltage.
         network
             .attach_terminal(output, controlled, TerminalId::new(2))
             .unwrap();
 
-        // Inject 6 A from common into output.
         network
             .attach_terminal(common, current_source, TerminalId::new(0))
             .unwrap();
@@ -1543,10 +1601,6 @@ mod test {
             .attach_terminal(output, current_source, TerminalId::new(1))
             .unwrap();
 
-        // threshold = 2
-        // transition = 2
-        // G_min = 1
-        // G_max = 5
         for (index, value) in [2.0, 2.0, 1.0, 5.0].into_iter().enumerate() {
             network
                 .set_device_parameter(
@@ -1564,32 +1618,24 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(controlled, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(controlled, DevicePartitionId::new(0)),
+        );
 
         let output_node = IslandNode::net(topology.wire_net(output));
         let common_node = IslandNode::net(topology.wire_net(common));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // Inside the transition:
-        //
-        // G(V) = 1 + 2 * (V - 1)
-        //      = 2V - 1
-        //
-        // 6 = G(V) * V
-        //   = (2V - 1)V
-        //
-        // V = 2 is the positive operating point.
         assert!((voltage - 2.0).abs() < 1.0e-6);
-
         assert!(runtime.solve_count() > 1);
     }
 
@@ -1618,24 +1664,18 @@ mod test {
                 PrimitiveElementKind::CurrentSource.into(),
             )
             .unwrap();
-
-        // Anode at output, cathode at common.
         network
             .attach_terminal(output, diode, TerminalId::new(0))
             .unwrap();
         network
             .attach_terminal(common, diode, TerminalId::new(1))
             .unwrap();
-
-        // Inject 8 A from common into the diode anode.
         network
             .attach_terminal(common, current_source, TerminalId::new(0))
             .unwrap();
         network
             .attach_terminal(output, current_source, TerminalId::new(1))
             .unwrap();
-
-        // G_max = 4, G_min = 0.25.
         network
             .set_device_parameter(&definitions, diode, ParameterId::new(0), 4.0)
             .unwrap();
@@ -1647,14 +1687,16 @@ mod test {
             .unwrap();
 
         let topology = DerivedTopology::from_network(&network, &definitions);
-        let island =
-            topology.component_island(DeviceComponent::new(diode, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(diode, DevicePartitionId::new(0)),
+        );
 
         let output_node = IslandNode::net(topology.wire_net(output));
         let common_node = IslandNode::net(topology.wire_net(common));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         let writes = runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1663,8 +1705,6 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // Starting from 0 V selects G_min. That first solution is +32 V,
-        // so nonlinear iteration must switch to G_max and settle at 8 / 4 = 2 V.
         assert!((voltage - 2.0).abs() < 1.0e-9);
         assert_eq!(runtime.solve_count(), 3);
         assert_eq!(
@@ -1782,8 +1822,6 @@ mod test {
                 .unwrap();
         }
 
-        // Same threshold semantics as the zero-hysteresis controlled switch.
-        // threshold = 2.5 V, G_max = 10 S, G_min = 0.01 S.
         for (index, value) in [2.5, 10.0, 0.01].into_iter().enumerate() {
             network
                 .set_device_parameter(&definitions, gate, ParameterId::new(index as u32), value)
@@ -1809,8 +1847,10 @@ mod test {
         }
 
         let topology = DerivedTopology::from_network(&network, &definitions);
-        let island =
-            topology.component_island(DeviceComponent::new(gate, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(gate, DevicePartitionId::new(0)),
+        );
 
         let output_node = IslandNode::net(topology.wire_net(output));
         let common_node = IslandNode::net(topology.wire_net(common));
@@ -1827,7 +1867,7 @@ mod test {
         let (network, compiled, output_node, common_node) =
             logic_gate_island(kind, input_a_voltage, input_b_voltage);
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1841,7 +1881,7 @@ mod test {
     fn nonlinear_matrix_iteration_reuses_factorization_when_sources_are_unchanged() {
         let (network, compiled, _, _) = logic_gate_island(PrimitiveElementKind::Not, 0.0, None);
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -1915,7 +1955,7 @@ mod test {
         let (network, compiled, _, _) =
             logic_gate_island(PrimitiveElementKind::Nand, 5.0, Some(5.0));
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         runtime.solve_tick(&network, |_| None).unwrap();
         let first_solve_count = runtime.solve_count();
@@ -2024,7 +2064,6 @@ mod test {
                 .unwrap();
         }
 
-        // SchmittBuffer terminals: Y, VDD, VSS, A.
         for (wire, terminal) in [(output, 0), (supply, 1), (common, 2), (input, 3)] {
             network
                 .attach_terminal(wire, buffer, TerminalId::new(terminal))
@@ -2045,12 +2084,6 @@ mod test {
             .attach_terminal(common, supply_source, TerminalId::new(1))
             .unwrap();
 
-        // threshold = 2
-        // hysteresis = 2
-        // lower = 1
-        // upper = 3
-        // G_max = 4
-        // G_min = 1
         for (index, value) in [2.0, 2.0, 4.0, 1.0].into_iter().enumerate() {
             network
                 .set_device_parameter(&definitions, buffer, ParameterId::new(index as u32), value)
@@ -2067,8 +2100,10 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(buffer, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(buffer, DevicePartitionId::new(0)),
+        );
 
         let output_node = IslandNode::net(topology.wire_net(output));
         let common_node = IslandNode::net(topology.wire_net(common));
@@ -2091,18 +2126,20 @@ mod test {
         let (definitions, mut network, compiled, output_node, common_node, buffer, input_source) =
             schmitt_buffer_island();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let state = DeviceState::new(buffer, DefinitionStateId::new(0));
+        let state = PhysicalStateAddress::new(network.device_location(buffer).unwrap(), 0);
         let mut mode = 0.0;
 
-        // Below lower threshold: remain LOW.
         let writes = runtime
             .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
             .unwrap();
 
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].state(), state);
+
+        let semantic_state = DeviceState::new(buffer, DefinitionStateId::new(0));
+
+        assert_eq!(writes[0].state(), semantic_state);
         assert_eq!(writes[0].value(), 0.0);
 
         let voltage =
@@ -2112,7 +2149,6 @@ mod test {
 
         mode = writes[0].value();
 
-        // Above upper threshold: switch HIGH.
         network
             .set_device_parameter(&definitions, input_source, ParameterId::new(0), 4.0)
             .unwrap();
@@ -2132,7 +2168,6 @@ mod test {
 
         mode = writes[0].value();
 
-        // Inside the deadband: retain HIGH.
         network
             .set_device_parameter(&definitions, input_source, ParameterId::new(0), 2.0)
             .unwrap();
@@ -2152,7 +2187,6 @@ mod test {
 
         mode = writes[0].value();
 
-        // Below lower threshold: switch LOW.
         network
             .set_device_parameter(&definitions, input_source, ParameterId::new(0), 0.0)
             .unwrap();
@@ -2240,7 +2274,6 @@ mod test {
             .attach_terminal(common, composite, TerminalId::new(1))
             .unwrap();
 
-        // Inject current from common into output.
         network
             .attach_terminal(common, source, TerminalId::new(0))
             .unwrap();
@@ -2249,7 +2282,6 @@ mod test {
             .attach_terminal(output, source, TerminalId::new(1))
             .unwrap();
 
-        // R2 = 3 ohm, so total resistance is 5 ohm.
         network
             .set_device_parameter(&definitions, composite, ParameterId::new(0), 3.0)
             .unwrap();
@@ -2260,15 +2292,17 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(composite, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(composite, DevicePartitionId::new(0)),
+        );
 
         let output_node = IslandNode::net(topology.wire_net(output));
         let common_node = IslandNode::net(topology.wire_net(common));
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, DEFAULT_TIMESTEP).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         let writes = runtime.solve_tick(&network, |_| None).unwrap();
 
@@ -2277,12 +2311,9 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // 2 A * (2 + 3) ohm = 10 V.
         assert!((voltage - 10.0).abs() < 1.0e-12);
-
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
-        // R2 = 8 ohm, so total resistance becomes 10 ohm.
         network
             .set_device_parameter(&definitions, composite, ParameterId::new(0), 8.0)
             .unwrap();
@@ -2296,9 +2327,7 @@ mod test {
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
-        // 2 A * (2 + 8) ohm = 20 V.
         assert!((voltage - 20.0).abs() < 1.0e-12);
-
         assert_eq!(runtime.matrix_stamp_count(), 2);
     }
 
@@ -2368,12 +2397,14 @@ mod test {
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
-        let island =
-            topology.component_island(DeviceComponent::new(observed, DevicePartitionId::new(0)));
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(observed, DevicePartitionId::new(0)),
+        );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
-        let mut runtime = IslandRuntime::new(compiled, 1.0).unwrap();
+        let mut runtime = IslandRuntime::new(compiled, &network, 1.0).unwrap();
 
         let observer = DeviceObserver::new(observed, DefinitionObserverId::new(0));
 
@@ -2384,5 +2415,33 @@ mod test {
         let value = runtime.observer_value(observer).unwrap();
 
         assert!((value - 5.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn numerical_dirty_parameter_refresh_uses_physical_bindings() {
+        let (mut network, compiled) = voltage_source_island();
+
+        let source = DeviceId::try_from(1).unwrap();
+
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
+
+        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime.reset_parameter_read_count();
+
+        network
+            .set_device_parameter(&DefinitionRegistry::new(), source, ParameterId::new(0), 9.0)
+            .unwrap();
+
+        runtime.mark_numerical_dirty();
+        runtime.solve_tick(&network, |_| None).unwrap();
+
+        assert!(
+            runtime.physical_parameter_read_count() > 0,
+            "numerical refresh must load parameters through physical bindings",
+        );
+
+        let observer = DeviceObserver::new(source, DefinitionObserverId::new(0));
+
+        assert_eq!(runtime.observer_value(observer), Some(9.0),);
     }
 }

@@ -1,0 +1,872 @@
+use crate::compile::island::DeviceState;
+use crate::runtime::island::StagedStateWrite;
+use hynergy_model::circuit::ValueRef;
+use hynergy_model::device::definition::{
+    DeviceBody, DeviceDefinition, DeviceId, PrimitiveElementKind,
+};
+use hynergy_model::device::registry::DefinitionRegistry;
+use hynergy_model::network::{
+    DeviceInsertResult, DeviceLocation, DeviceRemoveResult, Network, PreparedDeviceInsert,
+};
+use hynergy_model::parameter::ParameterId;
+use thiserror::Error;
+
+const DEVICE_CHUNK_ROWS: usize = 64;
+
+#[derive(Debug, Clone)]
+pub(crate) struct StateChunk {
+    state_count: usize,
+    row_count: u8,
+    values: Vec<f64>,
+    initialized: u64,
+}
+
+impl StateChunk {
+    #[inline]
+    fn new(state_count: usize) -> Self {
+        Self {
+            state_count,
+            row_count: 0,
+            values: Vec::new(),
+            initialized: 0,
+        }
+    }
+
+    #[inline]
+    fn row_count(&self) -> usize {
+        usize::from(self.row_count)
+    }
+
+    #[inline]
+    fn reserve_rows(&mut self, additional: usize) {
+        self.values
+            .reserve(additional.saturating_mul(self.state_count));
+    }
+
+    fn push_row(&mut self) {
+        assert!(self.row_count() < DEVICE_CHUNK_ROWS);
+
+        self.values
+            .extend(std::iter::repeat_n(0.0, self.state_count));
+
+        self.row_count += 1;
+    }
+
+    #[inline]
+    fn row_range(&self, row: usize) -> std::ops::Range<usize> {
+        assert!(row < self.row_count());
+
+        let start = row * self.state_count;
+
+        start..start + self.state_count
+    }
+
+    #[inline]
+    fn row_values(&self, row: usize) -> &[f64] {
+        let range = self.row_range(row);
+        &self.values[range]
+    }
+
+    #[inline]
+    fn row_values_mut(&mut self, row: usize) -> &mut [f64] {
+        let range = self.row_range(row);
+        &mut self.values[range]
+    }
+
+    #[inline]
+    fn is_initialized(&self, row: usize) -> bool {
+        debug_assert!(row < self.row_count());
+
+        self.initialized & (1_u64 << row) != 0
+    }
+
+    #[inline]
+    fn set_initialized(&mut self, row: usize) {
+        debug_assert!(row < self.row_count());
+
+        self.initialized |= 1_u64 << row;
+    }
+
+    fn remove_row(&mut self, row: usize) {
+        let row_count = self.row_count();
+
+        assert!(row < row_count);
+
+        let last = row_count - 1;
+
+        if row != last && self.state_count != 0 {
+            let source = self.row_range(last);
+
+            self.values.copy_within(source, row * self.state_count);
+        }
+
+        if row != last {
+            let last_initialized = self.is_initialized(last);
+            let row_mask = 1_u64 << row;
+
+            if last_initialized {
+                self.initialized |= row_mask;
+            } else {
+                self.initialized &= !row_mask;
+            }
+        }
+
+        self.initialized &= !(1_u64 << last);
+
+        self.values.truncate(last * self.state_count);
+        self.row_count -= 1;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedStateInsert {
+    location: DeviceLocation,
+    new_chunk: Option<StateChunk>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PhysicalStateStore {
+    chunks: Vec<StateChunk>,
+
+    #[cfg(test)]
+    semantic_read_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    physical_read_count: std::cell::Cell<usize>,
+}
+
+impl PhysicalStateStore {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn prepare_add_device(
+        &mut self,
+        definition: &DeviceDefinition,
+        model: &PreparedDeviceInsert,
+    ) -> PreparedStateInsert {
+        let location = model.location();
+
+        let chunk_index = location.chunk_index() as usize;
+        let row = location.row() as usize;
+        let state_count = definition.state_count();
+
+        let new_chunk = if model.created_chunk() {
+            assert_eq!(
+                chunk_index,
+                self.chunks.len(),
+                "model/state chunk arrays must remain positionally aligned",
+            );
+            assert_eq!(row, 0);
+
+            self.chunks.reserve(1);
+
+            let mut chunk = StateChunk::new(state_count);
+            chunk.reserve_rows(1);
+
+            Some(chunk)
+        } else {
+            let chunk = self
+                .chunks
+                .get_mut(chunk_index)
+                .expect("existing model chunk must have an aligned state chunk");
+
+            assert_eq!(
+                chunk.state_count, state_count,
+                "homogeneous model/state chunks must have matching state stride",
+            );
+
+            assert_eq!(
+                chunk.row_count(),
+                row,
+                "prepared model row must append at the aligned state row",
+            );
+
+            chunk.reserve_rows(1);
+
+            None
+        };
+
+        PreparedStateInsert {
+            location,
+            new_chunk,
+        }
+    }
+
+    pub(crate) fn commit_add_device(
+        &mut self,
+        prepared: PreparedStateInsert,
+        insert: DeviceInsertResult,
+    ) {
+        debug_assert_eq!(insert.location(), prepared.location);
+
+        let chunk_index = insert.chunk_index() as usize;
+        let row = insert.row() as usize;
+
+        if let Some(chunk) = prepared.new_chunk {
+            debug_assert!(insert.created_chunk());
+            debug_assert_eq!(chunk_index, self.chunks.len());
+
+            self.chunks.push(chunk);
+        } else {
+            debug_assert!(!insert.created_chunk());
+        }
+
+        let chunk = self
+            .chunks
+            .get_mut(chunk_index)
+            .expect("committed model chunk must have an aligned state chunk");
+
+        debug_assert_eq!(chunk.row_count(), row);
+
+        chunk.push_row();
+    }
+
+    pub(crate) fn initialize_device(
+        &mut self,
+        definitions: &DefinitionRegistry,
+        network: &Network,
+        device: DeviceId,
+    ) -> Result<(), PhysicalStateError> {
+        let location = network
+            .device_location(device)
+            .expect("state initialization device must exist");
+
+        let chunk_index = location.chunk_index() as usize;
+        let row = location.row() as usize;
+
+        {
+            let chunk = self
+                .chunks
+                .get(chunk_index)
+                .expect("live model chunk must have an aligned state chunk");
+
+            debug_assert!(row < chunk.row_count());
+
+            if chunk.is_initialized(row) {
+                return Ok(());
+            }
+        }
+
+        let definition_id = network
+            .device_definition_id(device)
+            .expect("state initialization device must exist");
+
+        let definition = definitions
+            .get(definition_id)
+            .expect("state initialization definition must remain registered");
+
+        let device_view = network
+            .device(device)
+            .expect("state initialization device must exist");
+
+        let parameters = device_view
+            .parameters()
+            .enumerate()
+            .map(|(index, value)| {
+                let parameter = ParameterId::new(
+                    u32::try_from(index).expect("definition parameter index must fit ParameterId"),
+                );
+
+                match value {
+                    Some(value) => InitialParameterValue::Value(value),
+                    None => InitialParameterValue::Unassigned(parameter),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = Vec::with_capacity(definition.state_count());
+
+        initialize_definition_state(definitions, definition, &parameters, device, &mut state)?;
+
+        debug_assert_eq!(
+            state.len(),
+            definition.state_count(),
+            "recursive state initialization must produce exactly the definition state count",
+        );
+
+        let chunk = self
+            .chunks
+            .get_mut(chunk_index)
+            .expect("live model chunk must have an aligned state chunk");
+
+        debug_assert_eq!(chunk.state_count, definition.state_count());
+        debug_assert!(row < chunk.row_count());
+
+        chunk.row_values_mut(row).copy_from_slice(&state);
+
+        if chunk.state_count == 0 {
+            chunk.set_initialized(row);
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, network: &Network, state: DeviceState) -> Option<f64> {
+        #[cfg(test)]
+        self.semantic_read_count
+            .set(self.semantic_read_count.get() + 1);
+
+        let location = network.device_location(state.device()).ok()?;
+
+        let chunk = self.chunks.get(location.chunk_index() as usize)?;
+        let row = location.row() as usize;
+
+        if row >= chunk.row_count() {
+            return None;
+        }
+
+        chunk.row_values(row).get(state.state().index()).copied()
+    }
+
+    #[inline]
+    pub(crate) fn get_at(&self, address: PhysicalStateAddress) -> Option<f64> {
+        #[cfg(test)]
+        self.physical_read_count
+            .set(self.physical_read_count.get() + 1);
+
+        let chunk = self.chunks.get(address.location.chunk_index() as usize)?;
+        let row = address.location.row() as usize;
+
+        if row >= chunk.row_count() {
+            return None;
+        }
+
+        chunk.row_values(row).get(address.state_index).copied()
+    }
+
+    pub(crate) fn remove_device(&mut self, removal: DeviceRemoveResult) {
+        let chunk_index = removal.removed_chunk() as usize;
+        let row = removal.removed_row() as usize;
+
+        let chunk = self
+            .chunks
+            .get_mut(chunk_index)
+            .expect("removed model chunk must have an aligned state chunk");
+
+        chunk.remove_row(row);
+
+        if chunk.row_count() != 0 {
+            debug_assert!(
+                removal.chunk_relocation().is_none(),
+                "model chunk relocation is only valid when the removed chunk became empty",
+            );
+
+            return;
+        }
+
+        match removal.chunk_relocation() {
+            Some(relocation) => {
+                let from = relocation.from_chunk() as usize;
+                let to = relocation.to_chunk() as usize;
+
+                assert_eq!(to, chunk_index);
+                assert_eq!(
+                    from,
+                    self.chunks.len() - 1,
+                    "model chunk swap-remove must move the final chunk",
+                );
+
+                self.chunks.swap_remove(chunk_index);
+            }
+
+            None => {
+                assert_eq!(
+                    chunk_index,
+                    self.chunks.len() - 1,
+                    "empty non-final model chunk must report its relocation",
+                );
+
+                self.chunks.pop();
+            }
+        }
+    }
+
+    pub(crate) fn commit_staged(
+        &mut self,
+        network: &Network,
+        writes: &[StagedStateWrite],
+    ) -> Result<(), PhysicalStateError> {
+        #[cfg(debug_assertions)]
+        for (index, write) in writes.iter().enumerate() {
+            let state = write.state();
+
+            debug_assert!(
+                !writes[..index]
+                    .iter()
+                    .any(|previous| previous.state() == state),
+                "state {state:?} has more than one staged write despite single-writer definition compilation",
+            );
+        }
+
+        for write in writes {
+            let state = write.state();
+
+            let location = network
+                .device_location(state.device())
+                .map_err(|_| PhysicalStateError::StateNotInitialized { state })?;
+
+            let Some(chunk) = self.chunks.get(location.chunk_index() as usize) else {
+                return Err(PhysicalStateError::StateNotInitialized { state });
+            };
+
+            let row = location.row() as usize;
+
+            let exists = row < chunk.row_count()
+                && chunk.row_values(row).get(state.state().index()).is_some();
+
+            if !exists {
+                return Err(PhysicalStateError::StateNotInitialized { state });
+            }
+        }
+
+        for write in writes {
+            let state = write.state();
+
+            let location = network
+                .device_location(state.device())
+                .expect("validated state device must remain resident");
+
+            let chunk = &mut self.chunks[location.chunk_index() as usize];
+            let row = location.row() as usize;
+            let state_index = state.state().index();
+
+            chunk.row_values_mut(row)[state_index] = write.value();
+            chunk.set_initialized(row);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn assert_aligned(&self, definitions: &DefinitionRegistry, network: &Network) {
+        let mut expected_rows = Vec::<usize>::new();
+
+        for device in network.iter_device_ids() {
+            let location = network
+                .device_location(device)
+                .expect("iterated resident device must have a physical location");
+
+            let chunk_index = location.chunk_index() as usize;
+            let row = location.row() as usize;
+
+            if expected_rows.len() <= chunk_index {
+                expected_rows.resize(chunk_index + 1, 0);
+            }
+
+            expected_rows[chunk_index] += 1;
+
+            let definition_id = network
+                .device_definition_id(device)
+                .expect("iterated resident device must have a definition");
+
+            let definition = definitions
+                .get(definition_id)
+                .expect("resident device definition must remain registered");
+
+            let chunk = self
+                .chunks
+                .get(chunk_index)
+                .expect("resident model chunk must have a state sidecar chunk");
+
+            assert_eq!(
+                chunk.state_count,
+                definition.state_count(),
+                "state sidecar stride disagrees with model definition",
+            );
+
+            assert!(
+                row < chunk.row_count(),
+                "resident model row is outside state sidecar chunk",
+            );
+
+            assert_eq!(
+                chunk.row_values(row).len(),
+                definition.state_count(),
+                "state row payload width disagrees with model definition",
+            );
+        }
+
+        assert_eq!(
+            self.chunks.len(),
+            expected_rows.len(),
+            "state sidecar chunk count disagrees with resident model chunks",
+        );
+
+        for (chunk_index, chunk) in self.chunks.iter().enumerate() {
+            let row_count = chunk.row_count();
+
+            assert!(
+                (1..=DEVICE_CHUNK_ROWS).contains(&row_count),
+                "resident state chunks must contain between 1 and 64 rows",
+            );
+
+            assert_eq!(
+                row_count, expected_rows[chunk_index],
+                "state sidecar row count disagrees with model chunk",
+            );
+
+            assert_eq!(
+                chunk.values.len(),
+                row_count * chunk.state_count,
+                "state payload length disagrees with row count and stride",
+            );
+
+            assert!(
+                chunk.values.iter().all(|value| value.is_finite()),
+                "physical state must remain finite",
+            );
+
+            let live_mask = if row_count == DEVICE_CHUNK_ROWS {
+                u64::MAX
+            } else {
+                (1_u64 << row_count) - 1
+            };
+
+            assert_eq!(
+                chunk.initialized & !live_mask,
+                0,
+                "initialized bits must not exist outside live rows",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+impl PhysicalStateStore {
+    #[inline]
+    pub(crate) fn reset_read_counts(&self) {
+        self.semantic_read_count.set(0);
+        self.physical_read_count.set(0);
+    }
+
+    #[inline]
+    pub(crate) fn semantic_read_count(&self) -> usize {
+        self.semantic_read_count.get()
+    }
+
+    #[inline]
+    pub(crate) fn physical_read_count(&self) -> usize {
+        self.physical_read_count.get()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhysicalStateAddress {
+    location: DeviceLocation,
+    state_index: usize,
+}
+
+impl PhysicalStateAddress {
+    #[inline]
+    pub(crate) const fn new(location: DeviceLocation, state_index: usize) -> Self {
+        Self {
+            location,
+            state_index,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn location(self) -> DeviceLocation {
+        self.location
+    }
+
+    #[inline]
+    pub(crate) const fn state_index(self) -> usize {
+        self.state_index
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InitialParameterValue {
+    Value(f64),
+    Unassigned(ParameterId),
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhysicalStateError {
+    #[error("device {device:?} initial parameter {parameter:?} is not assigned")]
+    MissingInitialParameter {
+        device: DeviceId,
+        parameter: ParameterId,
+    },
+
+    #[error("state {state:?} is not initialized")]
+    StateNotInitialized { state: DeviceState },
+}
+
+fn initialize_definition_state(
+    definitions: &DefinitionRegistry,
+    definition: &DeviceDefinition,
+    parameters: &[InitialParameterValue],
+    device: DeviceId,
+    state: &mut Vec<f64>,
+) -> Result<(), PhysicalStateError> {
+    debug_assert_eq!(
+        parameters.len(),
+        definition.parameters().len(),
+        "initial parameter mapping must match definition",
+    );
+
+    match definition.body() {
+        DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
+            debug_assert_eq!(definition.state_count(), 1);
+
+            let initial = match parameters[0] {
+                InitialParameterValue::Value(value) => value,
+
+                InitialParameterValue::Unassigned(parameter) => {
+                    return Err(PhysicalStateError::MissingInitialParameter { device, parameter });
+                }
+            };
+
+            state.push(initial);
+        }
+
+        DeviceBody::Primitive(
+            PrimitiveElementKind::Capacitor
+            | PrimitiveElementKind::Inductor
+            | PrimitiveElementKind::SchmittBuffer,
+        ) => {
+            debug_assert_eq!(definition.state_count(), 1);
+
+            state.push(0.0);
+        }
+
+        DeviceBody::Primitive(_) => {
+            debug_assert_eq!(definition.state_count(), 0);
+        }
+
+        DeviceBody::Composite(circuit) => {
+            for element in circuit.elements() {
+                let child = definitions
+                    .get(element.definition())
+                    .expect("registered composite child must remain registered");
+
+                let mut child_parameters = Vec::with_capacity(element.parameters().len());
+
+                for value in element.parameters() {
+                    let value = match *value {
+                        ValueRef::Literal(value) => InitialParameterValue::Value(value),
+
+                        ValueRef::Parameter(parameter) => parameters[parameter.index()],
+                    };
+
+                    child_parameters.push(value);
+                }
+
+                let before = state.len();
+
+                initialize_definition_state(definitions, child, &child_parameters, device, state)?;
+
+                debug_assert_eq!(
+                    state.len() - before,
+                    child.state_count(),
+                    "child state initialization must match child definition state count",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compile::definition::DefinitionStateId;
+    use hynergy_model::device::definition::{DefinitionId, DeviceId, PrimitiveElementKind};
+    use hynergy_model::device::registry::DefinitionRegistry;
+    use hynergy_model::network::Network;
+
+    fn device(raw: u32) -> DeviceId {
+        DeviceId::try_from(raw).unwrap()
+    }
+
+    fn state_key(device: DeviceId) -> DeviceState {
+        DeviceState::new(device, DefinitionStateId::new(0))
+    }
+
+    fn add_stateful_device(
+        definitions: &DefinitionRegistry,
+        network: &mut Network,
+        state: &mut PhysicalStateStore,
+        device: DeviceId,
+        kind: PrimitiveElementKind,
+    ) {
+        let definition_id = DefinitionId::from(kind);
+        let definition = definitions.get(definition_id).unwrap();
+
+        let model_insert = network
+            .prepare_add_device(definitions, device, definition_id)
+            .unwrap();
+
+        let state_insert = state.prepare_add_device(definition, &model_insert);
+
+        let insert = network.commit_add_device(model_insert);
+
+        state.commit_add_device(state_insert, insert);
+    }
+
+    #[test]
+    fn state_chunk_middle_row_removal_moves_values_and_initialized_bit() {
+        let mut chunk = StateChunk::new(2);
+
+        chunk.push_row();
+        chunk.push_row();
+        chunk.push_row();
+
+        chunk.row_values_mut(0).copy_from_slice(&[10.0, 11.0]);
+        chunk.row_values_mut(1).copy_from_slice(&[20.0, 21.0]);
+        chunk.row_values_mut(2).copy_from_slice(&[30.0, 31.0]);
+
+        chunk.set_initialized(0);
+        chunk.set_initialized(2);
+
+        chunk.remove_row(1);
+
+        assert_eq!(chunk.row_count(), 2);
+        assert_eq!(chunk.row_values(0), &[10.0, 11.0]);
+        assert_eq!(chunk.row_values(1), &[30.0, 31.0]);
+
+        assert!(chunk.is_initialized(0));
+        assert!(chunk.is_initialized(1));
+    }
+
+    #[test]
+    fn stateless_state_chunk_tracks_rows_without_value_payload() {
+        let mut chunk = StateChunk::new(0);
+
+        for _ in 0..3 {
+            chunk.push_row();
+        }
+
+        assert_eq!(chunk.row_count(), 3);
+        assert!(chunk.values.is_empty());
+
+        chunk.remove_row(1);
+
+        assert_eq!(chunk.row_count(), 2);
+        assert!(chunk.values.is_empty());
+    }
+
+    #[test]
+    fn physical_state_row_swap_preserves_moved_device_history() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut state = PhysicalStateStore::new();
+
+        for raw in 1..=3 {
+            add_stateful_device(
+                &definitions,
+                &mut network,
+                &mut state,
+                device(raw),
+                PrimitiveElementKind::TickDelay,
+            );
+        }
+
+        state
+            .commit_staged(
+                &network,
+                &[
+                    StagedStateWrite::new(state_key(device(1)), 10.0),
+                    StagedStateWrite::new(state_key(device(2)), 20.0),
+                    StagedStateWrite::new(state_key(device(3)), 30.0),
+                ],
+            )
+            .unwrap();
+
+        let removal = network.remove_device(device(2)).unwrap();
+
+        assert_eq!(removal.moved_device(), Some(device(3)));
+
+        state.remove_device(removal);
+
+        assert_eq!(state.get(&network, state_key(device(3))), Some(30.0),);
+
+        let location = network.device_location(device(3)).unwrap();
+
+        assert!(
+            state.chunks[location.chunk_index() as usize].is_initialized(location.row() as usize),
+        );
+    }
+
+    #[test]
+    fn physical_state_chunk_swap_preserves_all_moved_rows() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut state = PhysicalStateStore::new();
+
+        add_stateful_device(
+            &definitions,
+            &mut network,
+            &mut state,
+            device(1),
+            PrimitiveElementKind::TickDelay,
+        );
+
+        for raw in 2..=3 {
+            add_stateful_device(
+                &definitions,
+                &mut network,
+                &mut state,
+                device(raw),
+                PrimitiveElementKind::SchmittBuffer,
+            );
+        }
+
+        state
+            .commit_staged(
+                &network,
+                &[
+                    StagedStateWrite::new(state_key(device(1)), 10.0),
+                    StagedStateWrite::new(state_key(device(2)), 20.0),
+                    StagedStateWrite::new(state_key(device(3)), 30.0),
+                ],
+            )
+            .unwrap();
+
+        let removal = network.remove_device(device(1)).unwrap();
+
+        assert!(removal.chunk_relocation().is_some());
+
+        state.remove_device(removal);
+
+        assert_eq!(state.get(&network, state_key(device(2))), Some(20.0),);
+        assert_eq!(state.get(&network, state_key(device(3))), Some(30.0),);
+    }
+
+    #[test]
+    fn physical_state_address_reads_bound_chunk_row_directly() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut state = PhysicalStateStore::new();
+
+        let device = device(1);
+        let definition_id = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        let definition = definitions.get(definition_id).unwrap();
+
+        let model_insert = network
+            .prepare_add_device(&definitions, device, definition_id)
+            .unwrap();
+
+        let state_insert = state.prepare_add_device(definition, &model_insert);
+
+        let insert = network.commit_add_device(model_insert);
+
+        state.commit_add_device(state_insert, insert);
+
+        let semantic = DeviceState::new(device, DefinitionStateId::new(0));
+
+        state
+            .commit_staged(&network, &[StagedStateWrite::new(semantic, 12.5)])
+            .unwrap();
+
+        let address = PhysicalStateAddress::new(network.device_location(device).unwrap(), 0);
+
+        assert_eq!(state.get_at(address), Some(12.5),);
+    }
+}

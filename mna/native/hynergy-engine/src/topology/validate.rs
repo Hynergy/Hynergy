@@ -1,5 +1,6 @@
+use crate::topology::device_topology::DeviceTopologyChunk;
 use crate::topology::{DerivedTopology, DeviceComponent, NetId, terminal_component};
-use hynergy_model::device::definition::{DeviceId, DevicePartitionId};
+use hynergy_model::device::definition::DevicePartitionId;
 use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{Network, WireId};
 
@@ -23,18 +24,83 @@ impl DerivedTopology {
             "net -> island map must mirror the stable NetId slot space"
         );
 
-        for device in network.iter_device_ids() {
-            assert!(
-                self.device_component_spans
-                    .get(device.index())
-                    .is_some_and(Option::is_some),
-                "live Network device must have a derived component span",
-            );
-        }
-
+        self.assert_device_chunks_match_network(definitions, network);
         self.assert_membership_maps(definitions, network);
         self.assert_net_partition_matches_network(network);
         self.assert_island_partition_matches_network(definitions, network);
+    }
+
+    fn assert_device_chunks_match_network(
+        &self,
+        definitions: &DefinitionRegistry,
+        network: &Network,
+    ) {
+        let mut seen_rows = self
+            .device_chunks
+            .iter()
+            .map(|chunk| vec![false; chunk.row_count()])
+            .collect::<Vec<_>>();
+
+        let mut live_devices = 0usize;
+
+        for (device, device_view) in network.iter_devices() {
+            let location = network
+                .device_location(device)
+                .expect("iterated live device must have a location");
+
+            let chunk_index = location.chunk_index() as usize;
+            let row = location.row() as usize;
+
+            let chunk = self
+                .device_chunks
+                .get(chunk_index)
+                .expect("live model chunk must have a topology chunk");
+
+            let definition = definitions
+                .get(device_view.definition_id())
+                .expect("live device definition must remain registered");
+
+            assert_eq!(
+                chunk.partition_count(),
+                definition.partition_count(),
+                "topology chunk partition stride disagrees with model definition",
+            );
+
+            assert!(
+                row < chunk.row_count(),
+                "live model row is outside topology chunk",
+            );
+
+            assert!(
+                !seen_rows[chunk_index][row],
+                "two live devices resolve to one physical topology row",
+            );
+
+            seen_rows[chunk_index][row] = true;
+            live_devices += 1;
+        }
+
+        assert_eq!(
+            self.device_chunks
+                .iter()
+                .map(DeviceTopologyChunk::row_count)
+                .sum::<usize>(),
+            live_devices,
+            "topology row count must equal live model device count",
+        );
+
+        for (chunk_index, chunk) in self.device_chunks.iter().enumerate() {
+            assert_ne!(
+                chunk.row_count(),
+                0,
+                "resident topology chunks must not be empty"
+            );
+
+            assert!(
+                seen_rows[chunk_index].iter().all(|seen| *seen),
+                "topology chunk contains an orphaned physical row",
+            );
+        }
     }
 
     fn assert_membership_maps(&self, definitions: &DefinitionRegistry, network: &Network) {
@@ -147,7 +213,11 @@ impl DerivedTopology {
             }
         }
 
-        let mut seen_components = vec![false; self.component_island_map.len()];
+        let mut seen_components = self
+            .device_chunks
+            .iter()
+            .map(|chunk| vec![false; chunk.row_count() * chunk.partition_count()])
+            .collect::<Vec<_>>();
 
         for (island_id, island) in self.islands.iter() {
             assert!(
@@ -156,84 +226,64 @@ impl DerivedTopology {
             );
 
             for &component in &island.components {
-                let device = component.device();
-
                 assert!(
-                    network.device(device).is_ok(),
-                    "island references a removed or out-of-range device",
+                    network.device(component.device()).is_ok(),
+                    "island references a removed device",
                 );
 
-                let span = self.device_component_spans[device.index()]
-                    .expect("island component device must have a component span");
-
-                assert!(
-                    component.partition().index() < span.len(),
-                    "island contains an out-of-range device component",
-                );
-
-                let component_index = self.component_index(component);
+                let (chunk_index, component_index) =
+                    self.component_storage_index(network, component);
 
                 assert_eq!(
-                    self.component_island_map[component_index],
-                    Some(island_id),
-                    "component -> island map disagrees with IslandTopology::components",
+                    self.component_island(network, component),
+                    island_id,
+                    "component -> island sidecar disagrees with IslandTopology",
                 );
 
                 assert!(
-                    !seen_components[component_index],
+                    !seen_components[chunk_index][component_index],
                     "device component appears in more than one island",
                 );
 
-                seen_components[component_index] = true;
+                seen_components[chunk_index][component_index] = true;
             }
         }
 
-        for device_index in 0..self.device_component_spans.len() {
-            let device = device_id(device_index);
+        for (device, device_view) in network.iter_devices() {
+            let definition = definitions
+                .get(device_view.definition_id())
+                .expect("live device definition must remain registered");
 
-            if network.device(device).is_ok() {
-                let span = self.device_component_spans[device_index]
-                    .expect("live device must have a component span");
-
-                let end = span
-                    .start()
-                    .checked_add(span.len())
-                    .expect("device component index overflow");
-
-                for (component_index, seen_component) in seen_components
-                    .iter()
-                    .enumerate()
-                    .take(end)
-                    .skip(span.start())
-                {
-                    assert!(
-                        *seen_component,
-                        "live device component is missing from derived islands",
-                    );
-
-                    let island_id = self.component_island_map[component_index]
-                        .expect("live device component must have a derived IslandId");
-
-                    assert!(
-                        self.islands.get(island_id).is_some(),
-                        "live device component references a retired IslandId",
-                    );
-                }
-            } else {
-                assert_eq!(
-                    self.device_component_spans[device_index], None,
-                    "removed device still has a component span",
+            for partition_index in 0..definition.partition_count() {
+                let partition = DevicePartitionId::new(
+                    u16::try_from(partition_index)
+                        .expect("partition index must fit DevicePartitionId"),
                 );
-            }
-        }
 
-        for (component_index, island) in self.component_island_map.iter().enumerate() {
-            if island.is_some() {
+                let component = DeviceComponent::new(device, partition);
+
+                let (chunk_index, component_index) =
+                    self.component_storage_index(network, component);
+
                 assert!(
-                    seen_components[component_index],
-                    "component -> island map contains an orphaned live entry",
+                    seen_components[chunk_index][component_index],
+                    "live device component is missing from islands",
+                );
+
+                let island = self.component_island(network, component);
+
+                assert!(
+                    self.islands.get(island).is_some(),
+                    "device component references a retired island",
                 );
             }
+        }
+
+        for chunk in seen_components {
+            assert!(
+                chunk.into_iter().all(|seen| seen),
+                "topology component sidecar contains an orphaned component",
+            );
         }
     }
 
@@ -304,51 +354,51 @@ impl DerivedTopology {
         network: &Network,
     ) {
         let mut visited_wires = vec![false; network.wires().len()];
-        let mut visited_components = vec![false; self.component_island_map.len()];
+
+        let mut visited_components = self
+            .device_chunks
+            .iter()
+            .map(|chunk| vec![false; chunk.row_count() * chunk.partition_count()])
+            .collect::<Vec<_>>();
+
         let mut seen_islands = vec![false; self.islands.slot_count()];
         let mut stack = Vec::new();
         let mut connected_component_count = 0usize;
 
-        for device in network.iter_device_ids() {
-            let device_index = device.index();
+        for (device, device_view) in network.iter_devices() {
+            let definition = definitions
+                .get(device_view.definition_id())
+                .expect("live definition must remain registered");
 
-            let span = self.device_component_spans[device_index]
-                .expect("live device must have a component span");
-
-            for partition_index in 0..span.len() {
-                let flat_index = span
-                    .start()
-                    .checked_add(partition_index)
-                    .expect("device component index overflow");
-
-                if visited_components[flat_index] {
-                    continue;
-                }
-
+            for partition_index in 0..definition.partition_count() {
                 let partition = DevicePartitionId::new(
                     u16::try_from(partition_index)
-                        .expect("device partition index must fit DevicePartitionId"),
+                        .expect("partition index must fit DevicePartitionId"),
                 );
 
                 let component = DeviceComponent::new(device, partition);
 
-                let expected_island = self.component_island_map[flat_index]
-                    .expect("live component must have a derived IslandId");
+                let (chunk_index, component_index) =
+                    self.component_storage_index(network, component);
 
-                assert!(
-                    self.islands.get(expected_island).is_some(),
-                    "component references a retired IslandId"
-                );
+                if visited_components[chunk_index][component_index] {
+                    continue;
+                }
+
+                let expected_island = self.component_island(network, component);
+
+                assert!(self.islands.get(expected_island).is_some(),);
 
                 assert!(
                     !seen_islands[expected_island.index()],
-                    "one IslandId represents multiple disconnected electrical components"
+                    "one IslandId represents multiple disconnected electrical components",
                 );
 
                 seen_islands[expected_island.index()] = true;
                 connected_component_count += 1;
 
-                visited_components[flat_index] = true;
+                visited_components[chunk_index][component_index] = true;
+
                 stack.push(PrimitiveVertex::Component(component));
 
                 while let Some(vertex) = stack.pop() {
@@ -391,10 +441,12 @@ impl DerivedTopology {
                                         neighbor_terminal,
                                     );
 
-                                    let neighbor_index = self.component_index(neighbor);
+                                    let (neighbor_chunk, neighbor_index) =
+                                        self.component_storage_index(network, neighbor);
 
-                                    if !visited_components[neighbor_index] {
-                                        visited_components[neighbor_index] = true;
+                                    if !visited_components[neighbor_chunk][neighbor_index] {
+                                        visited_components[neighbor_chunk][neighbor_index] = true;
+
                                         stack.push(PrimitiveVertex::Component(neighbor));
                                     }
                                 }
@@ -402,12 +454,10 @@ impl DerivedTopology {
                         }
 
                         PrimitiveVertex::Component(component) => {
-                            let component_index = self.component_index(component);
-
                             assert_eq!(
-                                self.component_island_map[component_index],
-                                Some(expected_island),
-                                "connected components disagree on IslandId"
+                                self.component_island(network, component,),
+                                expected_island,
+                                "connected components disagree on IslandId",
                             );
 
                             let device = component.device();
@@ -452,10 +502,12 @@ impl DerivedTopology {
                                         neighbor_terminal,
                                     );
 
-                                    let neighbor_index = self.component_index(neighbor);
+                                    let (neighbor_chunk, neighbor_index) =
+                                        self.component_storage_index(network, neighbor);
 
-                                    if !visited_components[neighbor_index] {
-                                        visited_components[neighbor_index] = true;
+                                    if !visited_components[neighbor_chunk][neighbor_index] {
+                                        visited_components[neighbor_chunk][neighbor_index] = true;
+
                                         stack.push(PrimitiveVertex::Component(neighbor));
                                     }
                                 }
@@ -497,12 +549,6 @@ impl DerivedTopology {
 fn wire_id(index: usize) -> WireId {
     WireId::try_from(u32::try_from(index + 1).expect("wire index must fit WireId"))
         .expect("wire IDs are one-based")
-}
-
-#[inline]
-fn device_id(index: usize) -> DeviceId {
-    DeviceId::try_from(u32::try_from(index + 1).expect("device index must fit DeviceId"))
-        .expect("device IDs are one-based")
 }
 
 #[inline]

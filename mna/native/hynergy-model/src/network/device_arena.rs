@@ -1,8 +1,11 @@
 use crate::device::definition::{DefinitionId, DeviceDefinition, DeviceId, TerminalId};
-use crate::device::registry::DefinitionRegistry;
 use crate::network::{ConnectionRef, ConnectionType, NetworkModelError};
 use crate::parameter::ParameterId;
 use std::fmt;
+use std::fmt::Debug;
+
+#[cfg(test)]
+use crate::device::registry::DefinitionRegistry;
 
 pub(super) const DEVICE_CHUNK_CAPACITY: usize = 64;
 
@@ -38,13 +41,42 @@ impl DeviceLocator {
     }
 }
 
-impl fmt::Debug for DeviceLocator {
+impl Debug for DeviceLocator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeviceLocator")
             .field("chunk", &self.chunk_index())
             .field("row", &self.row())
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceLocation {
+    chunk_index: u32,
+    row: u8,
+}
+
+impl DeviceLocation {
+    #[inline]
+    pub const fn chunk_index(self) -> u32 {
+        self.chunk_index
+    }
+
+    #[inline]
+    pub const fn row(self) -> u8 {
+        self.row
+    }
+}
+
+impl From<DeviceLocator> for DeviceLocation {
+    #[inline]
+    fn from(locator: DeviceLocator) -> Self {
+        Self {
+            chunk_index: u32::try_from(locator.chunk_index())
+                .expect("packed device chunk index must fit u32"),
+            row: u8::try_from(locator.row()).expect("device chunk row must fit u8"),
+        }
     }
 }
 
@@ -87,6 +119,7 @@ impl DeviceDirectoryEntry {
     }
 
     #[inline]
+    #[cfg(test)]
     const fn unloaded_record_index(self) -> Option<u32> {
         if self.0 < FIRST_UNLOADED_ENTRY {
             return None;
@@ -121,22 +154,6 @@ impl DeviceChunk {
     }
 
     #[inline]
-    pub(super) fn len(&self) -> usize {
-        self.device_ids.len()
-    }
-
-    #[inline]
-    pub(super) fn is_full(&self) -> bool {
-        self.len() == DEVICE_CHUNK_CAPACITY
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(super) fn device_ids(&self) -> &[DeviceId] {
-        &self.device_ids
-    }
-
-    #[inline]
     fn reserve_rows(&mut self, additional: usize) {
         self.device_ids.reserve(additional);
         self.terminals
@@ -145,17 +162,10 @@ impl DeviceChunk {
             .reserve(additional.saturating_mul(self.parameter_count));
     }
 
-    pub(super) fn push_empty_row(
-        &mut self,
-        device: DeviceId,
-        definition: &DeviceDefinition,
-    ) -> bool {
+    pub(super) fn push_empty_row(&mut self, device: DeviceId) -> bool {
         if self.is_full() {
             return false;
         }
-
-        debug_assert_eq!(self.terminal_count, definition.terminals().len());
-        debug_assert_eq!(self.parameter_count, definition.parameters().len());
 
         self.device_ids.push(device);
 
@@ -210,6 +220,32 @@ impl DeviceChunk {
         self.device_ids.pop();
 
         moved_device
+    }
+
+    #[inline]
+    pub(super) fn parameter_at(&self, row: usize, parameter: usize) -> Option<f64> {
+        if row >= self.len() || parameter >= self.parameter_count {
+            return None;
+        }
+
+        let value = self.parameters[row * self.parameter_count + parameter];
+
+        (value != UNASSIGNED_PARAMETER).then_some(value)
+    }
+
+    #[inline]
+    pub(super) fn device_ids(&self) -> &[DeviceId] {
+        &self.device_ids
+    }
+
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        self.device_ids.len()
+    }
+
+    #[inline]
+    pub(super) fn is_full(&self) -> bool {
+        self.len() == DEVICE_CHUNK_CAPACITY
     }
 }
 
@@ -272,6 +308,36 @@ impl DeviceInsertResult {
 
     #[inline]
     pub const fn created_chunk(self) -> bool {
+        self.created_chunk
+    }
+
+    #[inline]
+    pub const fn location(self) -> DeviceLocation {
+        DeviceLocation {
+            chunk_index: self.chunk_index,
+            row: self.row,
+        }
+    }
+}
+
+#[must_use = "prepared device insertion must be committed or deliberately discarded"]
+#[derive(Debug)]
+pub struct PreparedDeviceInsert {
+    device: DeviceId,
+    definition_id: DefinitionId,
+    location: DeviceLocation,
+    created_chunk: bool,
+    new_chunk: Option<DeviceChunk>,
+}
+
+impl PreparedDeviceInsert {
+    #[inline]
+    pub const fn location(&self) -> DeviceLocation {
+        self.location
+    }
+
+    #[inline]
+    pub const fn created_chunk(&self) -> bool {
         self.created_chunk
     }
 }
@@ -347,6 +413,30 @@ impl DeviceArena {
     }
 
     #[inline]
+    pub(super) fn parameter_at_location(
+        &self,
+        location: DeviceLocation,
+        parameter: ParameterId,
+    ) -> Option<Option<f64>> {
+        let chunk = self.chunks.get(location.chunk_index() as usize)?;
+        let row = location.row() as usize;
+        let parameter = parameter.index();
+
+        if row >= chunk.len() || parameter >= chunk.parameter_count {
+            return None;
+        }
+
+        Some(chunk.parameter_at(row, parameter))
+    }
+
+    #[inline]
+    pub(super) fn device_ids_in_chunk(&self, chunk_index: u32) -> Option<&[DeviceId]> {
+        self.chunks
+            .get(chunk_index as usize)
+            .map(DeviceChunk::device_ids)
+    }
+
+    #[inline]
     pub(super) fn is_assigned(&self, device: DeviceId) -> bool {
         self.directory
             .get(device.index())
@@ -366,6 +456,11 @@ impl DeviceArena {
                 ty: ConnectionType::Device,
                 id: device.id(),
             })
+    }
+
+    #[inline]
+    pub(super) fn location(&self, device: DeviceId) -> Result<DeviceLocation, NetworkModelError> {
+        self.resident_locator(device).map(DeviceLocation::from)
     }
 
     fn ensure_active_slot(&mut self, definition: DefinitionId) {
@@ -401,12 +496,12 @@ impl DeviceArena {
         found
     }
 
-    pub(super) fn insert(
+    pub(super) fn prepare_insert(
         &mut self,
         device: DeviceId,
         definition_id: DefinitionId,
         definition: &DeviceDefinition,
-    ) -> Result<DeviceInsertResult, NetworkModelError> {
+    ) -> Result<PreparedDeviceInsert, NetworkModelError> {
         let device_index = device.index();
 
         debug_assert!(device_index <= self.directory.len());
@@ -414,61 +509,147 @@ impl DeviceArena {
             device_index == self.directory.len() || self.directory[device_index].is_unassigned()
         );
 
-        let mut created_chunk = false;
+        let (chunk_index, row, created_chunk, new_chunk) =
+            if let Some(chunk_index) = self.insertion_chunk(definition_id) {
+                let chunk = &mut self.chunks[chunk_index];
 
-        let chunk_index = if let Some(index) = self.insertion_chunk(definition_id) {
-            self.chunks[index].reserve_rows(1);
-            index
-        } else {
-            if self.chunks.len() >= MAX_DEVICE_CHUNKS {
-                return Err(NetworkModelError::DeviceArenaExhausted);
-            }
+                debug_assert_eq!(chunk.definition_id, definition_id);
+                debug_assert_eq!(chunk.terminal_count, definition.terminals().len());
+                debug_assert_eq!(chunk.parameter_count, definition.parameters().len());
+                debug_assert!(!chunk.is_full());
 
-            let mut chunk = DeviceChunk::new(definition_id, definition);
-            chunk.reserve_rows(1);
+                let row = chunk.len();
 
-            self.chunks.reserve(1);
+                chunk.reserve_rows(1);
 
-            let index = self.chunks.len();
-            self.chunks.push(chunk);
+                (chunk_index, row, false, None)
+            } else {
+                if self.chunks.len() >= MAX_DEVICE_CHUNKS {
+                    return Err(NetworkModelError::DeviceArenaExhausted);
+                }
 
-            created_chunk = true;
-            index
-        };
+                self.chunks.reserve(1);
+
+                let chunk_index = self.chunks.len();
+
+                let mut chunk = DeviceChunk::new(definition_id, definition);
+                chunk.reserve_rows(1);
+
+                (chunk_index, 0, true, Some(chunk))
+            };
 
         if device_index == self.directory.len() {
             self.directory.reserve(1);
         }
 
-        let row = self.chunks[chunk_index].len();
+        let locator = DeviceLocator::new(chunk_index, row)
+            .expect("prepared chunk and row must fit packed device locator");
 
-        let inserted = self.chunks[chunk_index].push_empty_row(device, definition);
+        Ok(PreparedDeviceInsert {
+            device,
+            definition_id,
+            location: DeviceLocation::from(locator),
+            created_chunk,
+            new_chunk,
+        })
+    }
+
+    pub(super) fn commit_insert(
+        &mut self,
+        mut prepared: PreparedDeviceInsert,
+    ) -> DeviceInsertResult {
+        let device_index = prepared.device.index();
+        let chunk_index = prepared.location.chunk_index() as usize;
+        let row = prepared.location.row() as usize;
+
+        debug_assert!(device_index <= self.directory.len());
+        debug_assert!(
+            device_index == self.directory.len() || self.directory[device_index].is_unassigned(),
+            "prepared device slot changed before insertion commit",
+        );
+
+        debug_assert!(
+            self.active_chunks.len() > prepared.definition_id.index(),
+            "prepared definition must already have an active-chunk slot",
+        );
+
+        if prepared.created_chunk {
+            debug_assert_eq!(
+                chunk_index,
+                self.chunks.len(),
+                "structural device mutation occurred after insertion preparation",
+            );
+            debug_assert_eq!(row, 0);
+
+            let chunk = prepared
+                .new_chunk
+                .take()
+                .expect("new-chunk insertion must carry its prepared chunk");
+
+            debug_assert_eq!(chunk.definition_id, prepared.definition_id);
+            debug_assert_eq!(chunk.len(), 0);
+            debug_assert!(
+                self.chunks.len() < self.chunks.capacity(),
+                "new device chunk capacity must be reserved during preparation",
+            );
+
+            self.chunks.push(chunk);
+        } else {
+            debug_assert!(
+                prepared.new_chunk.is_none(),
+                "existing-chunk insertion must not carry a new chunk",
+            );
+
+            let chunk = self
+                .chunks
+                .get(chunk_index)
+                .expect("prepared device chunk must still exist");
+
+            debug_assert_eq!(
+                chunk.definition_id, prepared.definition_id,
+                "prepared chunk definition changed before insertion commit",
+            );
+            debug_assert_eq!(
+                chunk.len(),
+                row,
+                "structural device mutation occurred after insertion preparation",
+            );
+            debug_assert!(!chunk.is_full());
+        }
+
+        let chunk = &mut self.chunks[chunk_index];
+
+        debug_assert_eq!(chunk.len(), row);
+
+        let inserted = chunk.push_empty_row(prepared.device);
         debug_assert!(inserted);
 
         let locator = DeviceLocator::new(chunk_index, row)
-            .expect("selected chunk and row must fit packed device locator");
-
+            .expect("committed chunk and row must fit packed device locator");
         let entry = DeviceDirectoryEntry::resident(locator);
 
         if device_index == self.directory.len() {
+            debug_assert!(
+                self.directory.len() < self.directory.capacity(),
+                "directory capacity must be reserved during insertion preparation",
+            );
+
             self.directory.push(entry);
         } else {
             self.directory[device_index] = entry;
         }
 
-        self.ensure_active_slot(definition_id);
-
-        self.active_chunks[definition_id.index()] = if self.chunks[chunk_index].is_full() {
+        self.active_chunks[prepared.definition_id.index()] = if chunk.is_full() {
             None
         } else {
-            Some(chunk_index as u32)
+            Some(u32::try_from(chunk_index).expect("packed device chunk index must fit u32"))
         };
 
-        Ok(DeviceInsertResult {
-            chunk_index: u32::try_from(chunk_index).expect("packed chunk index must fit u32"),
-            row: u8::try_from(row).expect("device row must fit u8"),
-            created_chunk,
-        })
+        DeviceInsertResult {
+            chunk_index: prepared.location.chunk_index(),
+            row: prepared.location.row(),
+            created_chunk: prepared.created_chunk,
+        }
     }
 
     #[inline]
@@ -641,7 +822,7 @@ impl DeviceArena {
         })
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) fn assert_consistent(&self, definitions: &DefinitionRegistry) {
         for (chunk_index, chunk) in self.chunks.iter().enumerate() {
             assert!(!chunk.device_ids.is_empty());
@@ -819,8 +1000,8 @@ mod tests {
         let definition = definitions.get(definition_id).unwrap();
         let mut chunk = DeviceChunk::new(definition_id, definition);
 
-        chunk.push_empty_row(device(1), definition);
-        chunk.push_empty_row(device(2), definition);
+        chunk.push_empty_row(device(1));
+        chunk.push_empty_row(device(2));
 
         assert_eq!(chunk.len(), 2);
         assert_eq!(chunk.device_ids(), &[device(1), device(2)]);
@@ -843,7 +1024,7 @@ mod tests {
         let definition = definitions.get(definition_id).unwrap();
         let mut chunk = DeviceChunk::new(definition_id, definition);
 
-        chunk.push_empty_row(device(1), definition);
+        chunk.push_empty_row(device(1));
 
         let view = chunk.device_view(0);
 
@@ -860,9 +1041,9 @@ mod tests {
         let mut chunk = DeviceChunk::new(definition_id, definition);
 
         for raw in 1..=DEVICE_CHUNK_CAPACITY as u32 {
-            assert!(chunk.push_empty_row(device(raw), definition));
+            assert!(chunk.push_empty_row(device(raw)));
         }
 
-        assert!(!chunk.push_empty_row(device(65), definition));
+        assert!(!chunk.push_empty_row(device(65)));
     }
 }

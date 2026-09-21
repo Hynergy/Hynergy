@@ -1,16 +1,17 @@
 use super::{ConnectionType, DeviceInsertResult, DeviceRemoveResult, Network, NetworkModelError};
 use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
 use crate::device::registry::DefinitionRegistry;
+use crate::network::device_arena::PreparedDeviceInsert;
 use crate::parameter::ParameterId;
 use hynergy_ids::MAX_PACKED_ID;
 
 impl Network {
-    pub fn add_device(
+    pub fn prepare_add_device(
         &mut self,
         definition_registry: &DefinitionRegistry,
         id: DeviceId,
         definition_id: DefinitionId,
-    ) -> Result<DeviceInsertResult, NetworkModelError> {
+    ) -> Result<PreparedDeviceInsert, NetworkModelError> {
         if id.get() > MAX_PACKED_ID {
             return Err(NetworkModelError::IdExceeds31Bit { id: id.id() });
         }
@@ -36,7 +37,24 @@ impl Network {
                     definition: definition_id,
                 })?;
 
-        self.device_arena.insert(id, definition_id, definition)
+        self.device_arena
+            .prepare_insert(id, definition_id, definition)
+    }
+
+    #[inline]
+    pub fn commit_add_device(&mut self, prepared: PreparedDeviceInsert) -> DeviceInsertResult {
+        self.device_arena.commit_insert(prepared)
+    }
+
+    pub fn add_device(
+        &mut self,
+        definition_registry: &DefinitionRegistry,
+        id: DeviceId,
+        definition_id: DefinitionId,
+    ) -> Result<DeviceInsertResult, NetworkModelError> {
+        let prepared = self.prepare_add_device(definition_registry, id, definition_id)?;
+
+        Ok(self.commit_add_device(prepared))
     }
 
     pub fn remove_device(&mut self, id: DeviceId) -> Result<DeviceRemoveResult, NetworkModelError> {

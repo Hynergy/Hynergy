@@ -2,22 +2,20 @@ mod compile;
 #[cfg(feature = "solver-profiling")]
 mod profiling;
 mod runtime;
+mod state;
 mod topology;
 
-use crate::compile::island::{
-    DeviceObserver, DeviceState, IslandCompileError, compile_topology_island,
-};
+use crate::compile::island::{DeviceObserver, IslandCompileError, compile_topology_island};
 #[cfg(feature = "solver-profiling")]
 pub use crate::profiling::{SolverIslandProfile, SolverIterationProfile, SolverTickProfile};
 use crate::runtime::island::{IslandRuntime, IslandRuntimeError, StagedStateWrite};
 pub use crate::runtime::subscription::{SubscriptionError, SubscriptionId};
 use crate::runtime::subscription::{SubscriptionRegistry, SubscriptionUpdate};
+use crate::state::{PhysicalStateError, PhysicalStateStore};
 use crate::topology::{DerivedTopology, TraversalScratch};
 use hynergy_mna::system::MnaError;
-use hynergy_model::circuit::ValueRef;
 use hynergy_model::device::definition::{
-    DefinitionId, DefinitionObserverId, DeviceBody, DeviceDefinition, DeviceId,
-    PrimitiveElementKind, TerminalId,
+    DefinitionId, DefinitionObserverId, DeviceDefinition, DeviceId, TerminalId,
 };
 use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
 use hynergy_model::network::{Network, NetworkModelError, WireId};
@@ -346,7 +344,7 @@ impl Engine {
         }
 
         #[cfg(debug_assertions)]
-        world.debug_validate_topology(definitions);
+        world.debug_validate_storage(definitions);
 
         Ok(())
     }
@@ -475,12 +473,12 @@ impl World {
                 .and_then(Option::as_mut)
                 .expect("live island must have a runtime after synchronization");
 
-            let writes = runtime.solve_tick(network, |state| old_state.get(state))?;
+            let writes = runtime.solve_tick(network, |address| old_state.get_at(address))?;
 
             staged.extend(writes);
         }
 
-        self.physical_state.commit_staged(&staged)?;
+        self.physical_state.commit_staged(network, &staged)?;
 
         self.collect_subscription_updates();
 
@@ -517,12 +515,13 @@ impl World {
         self.subscription_updates.clear();
 
         {
+            let network = &self.network;
             let topology = &self.derived_topology;
             let runtimes = &self.island_runtimes;
             let updates = &mut self.subscription_updates;
 
             for subscription in self.subscriptions.subscriptions_mut() {
-                let island = topology.component_island(subscription.component());
+                let island = topology.component_island(network, subscription.component());
 
                 let runtime = runtimes
                     .get(island.index())
@@ -654,13 +653,27 @@ impl World {
         device: DeviceId,
         definition: DefinitionId,
     ) -> Result<(), NetworkModelError> {
-        self.network.add_device(definitions, device, definition)?;
+        let model_insert = self
+            .network
+            .prepare_add_device(definitions, device, definition)?;
 
         let definition = definitions
             .get(definition)
-            .expect("successfully added device definition must remain registered");
+            .expect("prepared device definition must remain registered");
 
-        self.derived_topology.add_device(device, definition);
+        let state_insert = self
+            .physical_state
+            .prepare_add_device(definition, &model_insert);
+
+        let topology_insert = self
+            .derived_topology
+            .prepare_add_device(definition, &model_insert);
+
+        let insert = self.network.commit_add_device(model_insert);
+
+        self.physical_state.commit_add_device(state_insert, insert);
+        self.derived_topology
+            .commit_add_device(device, definition, topology_insert, insert);
 
         Ok(())
     }
@@ -671,19 +684,40 @@ impl World {
         definitions: &DefinitionRegistry,
         device: DeviceId,
     ) -> Result<(), NetworkModelError> {
-        let affected_nets = self.derived_topology.device_nets(&self.network, device);
+        let topology_removal = self
+            .derived_topology
+            .prepare_device_removal(&self.network, device);
 
-        self.network.remove_device(device)?;
+        let removal = self.network.remove_device(device)?;
+
+        self.physical_state.remove_device(removal);
 
         self.derived_topology.remove_device(
             definitions,
             &self.network,
             &mut self.topology_scratch,
             device,
-            &affected_nets,
+            topology_removal,
+            removal,
         );
 
-        self.physical_state.remove_device(device);
+        if let Some(moved) = removal.moved_device() {
+            self.derived_topology
+                .mark_device_binding_dirty(&self.network, moved);
+        }
+
+        if let Some(relocation) = removal.chunk_relocation() {
+            let moved_devices = self
+                .network
+                .device_ids_in_chunk(relocation.to_chunk())
+                .expect("relocated model chunk must remain resident");
+
+            for &moved in moved_devices {
+                self.derived_topology
+                    .mark_device_binding_dirty(&self.network, moved);
+            }
+        }
+
         self.subscriptions.remove_device(device);
 
         Ok(())
@@ -738,7 +772,8 @@ impl World {
         self.network
             .set_device_parameter(definitions, device, parameter, value)?;
 
-        self.derived_topology.mark_device_numerical_dirty(device);
+        self.derived_topology
+            .mark_device_numerical_dirty(&self.network, device);
 
         Ok(())
     }
@@ -776,6 +811,12 @@ impl World {
             .topology_dirty_islands()
             .to_vec();
 
+        let binding_dirty = self
+            .derived_topology
+            .invalidation()
+            .binding_dirty_islands()
+            .to_vec();
+
         let retired = self
             .derived_topology
             .invalidation()
@@ -787,6 +828,27 @@ impl World {
             .invalidation()
             .numerical_dirty_islands()
             .to_vec();
+
+        #[cfg(test)]
+        for &island in &binding_dirty {
+            assert!(
+                !topology_dirty.contains(&island),
+                "binding-dirty island must not also be topology-dirty",
+            );
+
+            assert!(
+                !retired.contains(&island),
+                "binding-dirty island must not also be retired",
+            );
+
+            assert!(
+                self.island_runtimes
+                    .get(island.index())
+                    .and_then(Option::as_ref)
+                    .is_some(),
+                "binding-dirty island must already have a runtime",
+            );
+        }
 
         for island in retired {
             if let Some(runtime) = self.island_runtimes.get_mut(island.index()) {
@@ -814,9 +876,25 @@ impl World {
                 island,
             )?;
 
-            let runtime = IslandRuntime::new(compiled, timestep)?;
+            let runtime = IslandRuntime::new(compiled, &self.network, timestep)?;
 
             self.island_runtimes[island.index()] = Some(runtime);
+        }
+
+        for island in binding_dirty {
+            if topology_dirty.contains(&island) {
+                continue;
+            }
+
+            let Some(runtime) = self
+                .island_runtimes
+                .get_mut(island.index())
+                .and_then(Option::as_mut)
+            else {
+                continue;
+            };
+
+            runtime.rebind(&self.network)?;
         }
 
         for island in numerical_dirty {
@@ -831,13 +909,18 @@ impl World {
             runtime.mark_numerical_dirty();
         }
 
-        debug_assert!(
-            self.derived_topology
-                .invalidation()
-                .binding_dirty_islands()
-                .is_empty(),
-            "binding invalidation was produced before a runtime binding-refresh consumer exists",
-        );
+        #[cfg(debug_assertions)]
+        {
+            for (island, _) in self.derived_topology.islands() {
+                let runtime = self
+                    .island_runtimes
+                    .get(island.index())
+                    .and_then(Option::as_ref)
+                    .expect("live island must have a runtime after synchronization");
+
+                runtime.debug_assert_bindings_valid(&self.network);
+            }
+        }
 
         self.derived_topology.clear_invalidation();
 
@@ -846,9 +929,11 @@ impl World {
 
     #[cfg(debug_assertions)]
     #[inline]
-    fn debug_validate_topology(&self, definitions: &DefinitionRegistry) {
+    fn debug_validate_storage(&self, definitions: &DefinitionRegistry) {
         self.derived_topology
             .assert_consistent(definitions, &self.network);
+        self.physical_state
+            .assert_aligned(definitions, &self.network);
     }
 
     #[inline]
@@ -860,250 +945,6 @@ impl World {
     pub const fn config(&self) -> WorldConfig {
         self.config
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum InitialParameterValue {
-    Value(f64),
-    Unassigned(ParameterId),
-}
-
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PhysicalStateError {
-    #[error("device {device:?} initial parameter {parameter:?} is not assigned")]
-    MissingInitialParameter {
-        device: DeviceId,
-        parameter: ParameterId,
-    },
-
-    #[error("state {state:?} is not initialized")]
-    StateNotInitialized { state: DeviceState },
-}
-
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PhysicalStateStore {
-    devices: Vec<Option<Box<[f64]>>>,
-    initialized: Vec<bool>,
-}
-
-impl PhysicalStateStore {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn initialize_device(
-        &mut self,
-        definitions: &DefinitionRegistry,
-        network: &Network,
-        device: DeviceId,
-    ) -> Result<(), PhysicalStateError> {
-        let device_index = device.index();
-
-        if self.initialized.get(device_index).copied().unwrap_or(false) {
-            return Ok(());
-        }
-
-        if self.devices.len() <= device_index {
-            self.devices.resize_with(device_index + 1, || None);
-        }
-
-        if self.initialized.len() <= device_index {
-            self.initialized.resize(device_index + 1, false);
-        }
-
-        let definition_id = network
-            .device_definition_id(device)
-            .expect("state initialization device must exist");
-
-        let definition = definitions
-            .get(definition_id)
-            .expect("state initialization definition must remain registered");
-
-        let device_view = network
-            .device(device)
-            .expect("state initialization device must exist");
-
-        let parameters = device_view
-            .parameters()
-            .enumerate()
-            .map(|(index, value)| {
-                let parameter = ParameterId::new(
-                    u32::try_from(index).expect("definition parameter index must fit ParameterId"),
-                );
-
-                match value {
-                    Some(value) => InitialParameterValue::Value(value),
-                    None => InitialParameterValue::Unassigned(parameter),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut state = Vec::with_capacity(definition.state_count());
-
-        initialize_definition_state(definitions, definition, &parameters, device, &mut state)?;
-
-        debug_assert_eq!(
-            state.len(),
-            definition.state_count(),
-            "recursive state initialization must produce exactly \
-            the definition state count",
-        );
-
-        self.devices[device_index] = Some(state.into_boxed_slice());
-
-        self.initialized[device_index] = definition.state_count() == 0;
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn get(&self, state: DeviceState) -> Option<f64> {
-        self.devices
-            .get(state.device().index())
-            .and_then(Option::as_ref)
-            .and_then(|values| values.get(state.state().index()))
-            .copied()
-    }
-
-    #[inline]
-    pub(crate) fn remove_device(&mut self, device: DeviceId) {
-        let device_index = device.index();
-
-        if let Some(slot) = self.devices.get_mut(device_index) {
-            *slot = None;
-        }
-
-        if let Some(initialized) = self.initialized.get_mut(device_index) {
-            *initialized = false;
-        }
-    }
-
-    pub(crate) fn commit_staged(
-        &mut self,
-        writes: &[StagedStateWrite],
-    ) -> Result<(), PhysicalStateError> {
-        #[cfg(debug_assertions)]
-        for (index, write) in writes.iter().enumerate() {
-            let state = write.state();
-
-            debug_assert!(
-                !writes[..index]
-                    .iter()
-                    .any(|previous| previous.state() == state),
-                "state {state:?} has more than one staged write despite \
-             single-writer definition compilation",
-            );
-        }
-
-        for write in writes {
-            let state = write.state();
-
-            let exists = self
-                .devices
-                .get(state.device().index())
-                .and_then(Option::as_ref)
-                .and_then(|values| values.get(state.state().index()))
-                .is_some();
-
-            if !exists {
-                return Err(PhysicalStateError::StateNotInitialized { state });
-            }
-        }
-
-        for write in writes {
-            let state = write.state();
-            let device_index = state.device().index();
-
-            let value = self.devices[device_index]
-                .as_mut()
-                .expect("validated state device must remain materialized")
-                .get_mut(state.state().index())
-                .expect("validated state slot must remain materialized");
-
-            *value = write.value();
-
-            self.initialized[device_index] = true;
-        }
-
-        Ok(())
-    }
-}
-
-fn initialize_definition_state(
-    definitions: &DefinitionRegistry,
-    definition: &DeviceDefinition,
-    parameters: &[InitialParameterValue],
-    device: DeviceId,
-    state: &mut Vec<f64>,
-) -> Result<(), PhysicalStateError> {
-    debug_assert_eq!(
-        parameters.len(),
-        definition.parameters().len(),
-        "initial parameter mapping must match definition",
-    );
-
-    match definition.body() {
-        DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
-            debug_assert_eq!(definition.state_count(), 1,);
-
-            let initial = match parameters[0] {
-                InitialParameterValue::Value(value) => value,
-
-                InitialParameterValue::Unassigned(parameter) => {
-                    return Err(PhysicalStateError::MissingInitialParameter { device, parameter });
-                }
-            };
-
-            state.push(initial);
-        }
-
-        DeviceBody::Primitive(
-            PrimitiveElementKind::Capacitor
-            | PrimitiveElementKind::Inductor
-            | PrimitiveElementKind::SchmittBuffer,
-        ) => {
-            debug_assert_eq!(definition.state_count(), 1,);
-
-            state.push(0.0);
-        }
-
-        DeviceBody::Primitive(_) => {
-            debug_assert_eq!(definition.state_count(), 0,);
-        }
-
-        DeviceBody::Composite(circuit) => {
-            for element in circuit.elements() {
-                let child = definitions
-                    .get(element.definition())
-                    .expect("registered composite child must remain registered");
-
-                let mut child_parameters = Vec::with_capacity(element.parameters().len());
-
-                for value in element.parameters() {
-                    let value = match *value {
-                        ValueRef::Literal(value) => InitialParameterValue::Value(value),
-
-                        ValueRef::Parameter(parameter) => parameters[parameter.index()],
-                    };
-
-                    child_parameters.push(value);
-                }
-
-                let before = state.len();
-
-                initialize_definition_state(definitions, child, &child_parameters, device, state)?;
-
-                debug_assert_eq!(
-                    state.len() - before,
-                    child.state_count(),
-                    "child state initialization must match \
-                     child definition state count",
-                );
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -1122,8 +963,9 @@ pub(crate) enum WorldTickError {
 mod tests {
     use super::*;
     use crate::compile::definition::DefinitionStateId;
-    use crate::compile::island::IslandNode;
+    use crate::compile::island::{DeviceState, IslandNode};
     use crate::runtime::island::StagedStateWrite;
+    use crate::state::PhysicalStateStore;
     use crate::topology::DeviceComponent;
     use hynergy_model::circuit::{Element, ValueRef};
     use hynergy_model::device::builder::DeviceDefinitionBuilder;
@@ -1276,39 +1118,58 @@ mod tests {
         )
     }
 
+    fn add_device_with_physical_state(
+        definitions: &DefinitionRegistry,
+        network: &mut Network,
+        state: &mut PhysicalStateStore,
+        device: DeviceId,
+        definition_id: DefinitionId,
+    ) {
+        let definition = definitions.get(definition_id).unwrap();
+
+        let model_insert = network
+            .prepare_add_device(definitions, device, definition_id)
+            .unwrap();
+
+        let state_insert = state.prepare_add_device(definition, &model_insert);
+        let insert = network.commit_add_device(model_insert);
+
+        state.commit_add_device(state_insert, insert);
+    }
+
     #[test]
     fn sleeping_island_does_not_reevaluate_existing_subscription() {
-        let (mut engine, world, observed, _, observer) = observed_voltage_world();
+        let (mut engine, world_id, observed, _, observer) = observed_voltage_world();
 
         engine
-            .subscribe_observer(world, observed, observer)
+            .subscribe_observer(world_id, observed, observer)
             .unwrap();
 
         let component = DeviceComponent::new(observed, DevicePartitionId::new(0));
 
-        let island = engine
-            .world(world)
-            .unwrap()
-            .derived_topology
-            .component_island(component);
+        let world = engine.world(world_id).unwrap();
 
-        engine.tick_world(world).unwrap();
+        let island = world
+            .derived_topology
+            .component_island(world.network(), component);
+
+        engine.tick_world(world_id).unwrap();
 
         {
-            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
                 .as_ref()
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
         }
 
-        assert_eq!(engine.subscription_updates(world).unwrap().len(), 1,);
+        assert_eq!(engine.subscription_updates(world_id).unwrap().len(), 1,);
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
-        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+        assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
-        let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+        let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
             .as_ref()
             .unwrap();
 
@@ -1430,10 +1291,13 @@ mod tests {
 
         let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
 
-        let _ = world.physical_state.commit_staged(&[
-            StagedStateWrite::new(state, 3.0),
-            StagedStateWrite::new(state, 7.0),
-        ]);
+        let _ = world.physical_state.commit_staged(
+            &world.network,
+            &[
+                StagedStateWrite::new(state, 3.0),
+                StagedStateWrite::new(state, 7.0),
+            ],
+        );
     }
 
     #[test]
@@ -1695,7 +1559,9 @@ mod tests {
         world.add_device(&definitions, d, admittance()).unwrap();
 
         let component = DeviceComponent::new(d, DevicePartitionId::new(0));
-        let island = world.derived_topology.component_island(component);
+        let island = world
+            .derived_topology
+            .component_island(world.network(), component);
 
         let revision = world.derived_topology.island(island).unwrap().revision();
 
@@ -1880,8 +1746,12 @@ mod tests {
         let input_component = DeviceComponent::new(delay, DevicePartitionId::new(0));
         let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
 
-        let input_island = world.derived_topology.component_island(input_component);
-        let output_island = world.derived_topology.component_island(output_component);
+        let input_island = world
+            .derived_topology
+            .component_island(world.network(), input_component);
+        let output_island = world
+            .derived_topology
+            .component_island(world.network(), output_component);
 
         assert_ne!(input_island, output_island);
 
@@ -1961,7 +1831,7 @@ mod tests {
 
         let state = DeviceState::new(delay, DefinitionStateId::new(0));
 
-        assert_eq!(world.physical_state.get(state), Some(4.25));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(4.25));
 
         world
             .set_device_parameter(&definitions, delay, ParameterId::new(0), 9.0)
@@ -1972,14 +1842,14 @@ mod tests {
             .initialize_device(&definitions, &world.network, delay)
             .unwrap();
 
-        assert_eq!(world.physical_state.get(state), Some(9.0));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(9.0));
 
         world
             .physical_state
-            .commit_staged(&[StagedStateWrite::new(state, 7.5)])
+            .commit_staged(&world.network, &[StagedStateWrite::new(state, 7.5)])
             .unwrap();
 
-        assert_eq!(world.physical_state.get(state), Some(7.5));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(7.5));
 
         world
             .set_device_parameter(&definitions, delay, ParameterId::new(0), 12.0)
@@ -1990,7 +1860,7 @@ mod tests {
             .initialize_device(&definitions, &world.network, delay)
             .unwrap();
 
-        assert_eq!(world.physical_state.get(state), Some(7.5));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(7.5));
     }
 
     #[test]
@@ -2015,11 +1885,11 @@ mod tests {
 
         let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
 
-        assert_eq!(world.physical_state.get(state), Some(0.0),);
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0),);
 
         world.remove_device(&definitions, capacitor).unwrap();
 
-        assert_eq!(world.physical_state.get(state), None,);
+        assert_eq!(world.physical_state.get(&world.network, state), None,);
     }
 
     #[test]
@@ -2105,13 +1975,15 @@ mod tests {
             .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
             .unwrap();
 
-        let input_island = world
-            .derived_topology
-            .component_island(DeviceComponent::new(delay, DevicePartitionId::new(0)));
+        let input_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(0)),
+        );
 
-        let output_island = world
-            .derived_topology
-            .component_island(DeviceComponent::new(delay, DevicePartitionId::new(1)));
+        let output_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(1)),
+        );
 
         assert_ne!(input_island, output_island,);
 
@@ -2131,7 +2003,10 @@ mod tests {
 
         assert!((first_output - 4.0).abs() < 1.0e-12);
 
-        assert_eq!(world.physical_state.get(physical_state), Some(9.0),);
+        assert_eq!(
+            world.physical_state.get(&world.network, physical_state),
+            Some(9.0),
+        );
 
         world.tick(&definitions).unwrap();
 
@@ -2181,7 +2056,7 @@ mod tests {
 
         let state = DeviceState::new(delay, DefinitionStateId::new(0));
 
-        assert_eq!(world.physical_state.get(state), Some(4.25));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(4.25));
 
         world
             .set_device_parameter(&definitions, delay, ParameterId::new(0), 9.0)
@@ -2193,7 +2068,7 @@ mod tests {
 
         world.initialize_physical_state(&definitions).unwrap();
 
-        assert_eq!(world.physical_state.get(state), Some(9.0));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(9.0));
     }
 
     #[test]
@@ -2219,14 +2094,17 @@ mod tests {
         let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
         let missing = DeviceState::new(capacitor, DefinitionStateId::new(1));
 
-        assert_eq!(world.physical_state.get(state), Some(0.0));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0));
 
         let error = world
             .physical_state
-            .commit_staged(&[
-                StagedStateWrite::new(state, 3.0),
-                StagedStateWrite::new(missing, 7.0),
-            ])
+            .commit_staged(
+                &world.network,
+                &[
+                    StagedStateWrite::new(state, 3.0),
+                    StagedStateWrite::new(missing, 7.0),
+                ],
+            )
             .unwrap_err();
 
         assert_eq!(
@@ -2234,7 +2112,7 @@ mod tests {
             PhysicalStateError::StateNotInitialized { state: missing },
         );
 
-        assert_eq!(world.physical_state.get(state), Some(0.0));
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0));
     }
 
     #[test]
@@ -2287,9 +2165,10 @@ mod tests {
 
         world.tick(&definitions).unwrap();
 
-        let island = world
-            .derived_topology
-            .component_island(DeviceComponent::new(source, DevicePartitionId::new(0)));
+        let island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(source, DevicePartitionId::new(0)),
+        );
 
         let positive_node = IslandNode::net(world.derived_topology.wire_net(positive));
         let negative_node = IslandNode::net(world.derived_topology.wire_net(negative));
@@ -2322,22 +2201,25 @@ mod tests {
 
         let switch = device(1);
 
-        network
-            .add_device(
-                &definitions,
-                switch,
-                PrimitiveElementKind::SchmittBuffer.into(),
-            )
-            .unwrap();
-
         let mut states = PhysicalStateStore::new();
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut states,
+            switch,
+            PrimitiveElementKind::SchmittBuffer.into(),
+        );
 
         states
             .initialize_device(&definitions, &network, switch)
             .unwrap();
 
         assert_eq!(
-            states.get(DeviceState::new(switch, DefinitionStateId::new(0),)),
+            states.get(
+                &network,
+                DeviceState::new(switch, DefinitionStateId::new(0),)
+            ),
             Some(0.0),
         );
     }
@@ -2383,7 +2265,6 @@ mod tests {
             )
             .unwrap();
 
-        // Switch output.
         world
             .attach_terminal(&definitions, output, switch, TerminalId::new(0))
             .unwrap();
@@ -2392,9 +2273,6 @@ mod tests {
             .attach_terminal(&definitions, common, switch, TerminalId::new(1))
             .unwrap();
 
-        // Self-control:
-        //
-        // Vc = Vout.
         world
             .attach_terminal(&definitions, output, switch, TerminalId::new(2))
             .unwrap();
@@ -2403,7 +2281,6 @@ mod tests {
             .attach_terminal(&definitions, common, switch, TerminalId::new(3))
             .unwrap();
 
-        // Inject 8 A into output.
         world
             .attach_terminal(&definitions, common, source, TerminalId::new(0))
             .unwrap();
@@ -2412,19 +2289,6 @@ mod tests {
             .attach_terminal(&definitions, output, source, TerminalId::new(1))
             .unwrap();
 
-        // threshold = 5
-        // G_max = 4
-        // G_min = 1
-        //
-        // OFF:
-        //     Vout = 8 / 1 = 8 V
-        //     8 >= threshold -> ON
-        //
-        // ON:
-        //     Vout = 8 / 4 = 2 V
-        //     2 < threshold -> OFF
-        //
-        // Therefore no stable discrete operating point exists.
         for (index, value) in [5.0, 4.0, 1.0].into_iter().enumerate() {
             world
                 .set_device_parameter(&definitions, switch, ParameterId::new(index as u32), value)
@@ -2443,9 +2307,10 @@ mod tests {
         ));
 
         assert_eq!(
-            world
-                .physical_state
-                .get(DeviceState::new(switch, DefinitionStateId::new(0))),
+            world.physical_state.get(
+                &world.network,
+                DeviceState::new(switch, DefinitionStateId::new(0))
+            ),
             None,
         );
     }
@@ -2484,13 +2349,6 @@ mod tests {
 
         let delay_parameter_constraint = definitions.get(tick_delay).unwrap().parameters()[0];
 
-        /*
-         * Inner composite:
-         *
-         * parameter 0
-         *     ↓
-         * TickDelay initial value
-         */
         let inner = {
             let mut builder = DeviceDefinitionBuilder::new(&definitions);
 
@@ -2521,13 +2379,6 @@ mod tests {
 
         let inner_parameter_constraint = definitions.get(inner).unwrap().parameters()[0];
 
-        /*
-         * Outer state order:
-         *
-         * state 0 = capacitor
-         * state 1 = inner TickDelay using outer parameter
-         * state 2 = inner TickDelay using literal
-         */
         let outer = {
             let mut builder = DeviceDefinitionBuilder::new(&definitions);
 
@@ -2580,33 +2431,41 @@ mod tests {
         let outer = definitions.register(outer).unwrap();
 
         let mut network = Network::new();
+        let mut store = PhysicalStateStore::new();
 
         let device = DeviceId::try_from(1).unwrap();
 
-        network.add_device(&definitions, device, outer).unwrap();
+        add_device_with_physical_state(&definitions, &mut network, &mut store, device, outer);
 
         network
             .set_device_parameter(&definitions, device, ParameterId::new(0), 7.25)
             .unwrap();
-
-        let mut store = PhysicalStateStore::new();
 
         store
             .initialize_device(&definitions, &network, device)
             .unwrap();
 
         assert_eq!(
-            store.get(DeviceState::new(device, DefinitionStateId::new(0),)),
+            store.get(
+                &network,
+                DeviceState::new(device, DefinitionStateId::new(0),)
+            ),
             Some(0.0),
         );
 
         assert_eq!(
-            store.get(DeviceState::new(device, DefinitionStateId::new(1),)),
+            store.get(
+                &network,
+                DeviceState::new(device, DefinitionStateId::new(1),)
+            ),
             Some(7.25),
         );
 
         assert_eq!(
-            store.get(DeviceState::new(device, DefinitionStateId::new(2),)),
+            store.get(
+                &network,
+                DeviceState::new(device, DefinitionStateId::new(2),)
+            ),
             Some(1.5),
         );
     }
@@ -2668,12 +2527,11 @@ mod tests {
         let outer = definitions.register(outer).unwrap();
 
         let mut network = Network::new();
+        let mut store = PhysicalStateStore::new();
 
         let device = DeviceId::try_from(1).unwrap();
 
-        network.add_device(&definitions, device, outer).unwrap();
-
-        let mut store = PhysicalStateStore::new();
+        add_device_with_physical_state(&definitions, &mut network, &mut store, device, outer);
 
         assert_eq!(
             store.initialize_device(&definitions, &network, device,),
@@ -2755,12 +2613,6 @@ mod tests {
             )
             .unwrap();
 
-        /*
-         * Composite TickDelay:
-         *
-         * terminals 0,1 = input partition
-         * terminals 2,3 = output partition
-         */
         world
             .attach_terminal(&definitions, input_positive, delay, TerminalId::new(0))
             .unwrap();
@@ -2777,9 +2629,6 @@ mod tests {
             .attach_terminal(&definitions, output_negative, delay, TerminalId::new(3))
             .unwrap();
 
-        /*
-         * Drive the input to 5 V.
-         */
         world
             .attach_terminal(&definitions, input_positive, source, TerminalId::new(0))
             .unwrap();
@@ -2792,16 +2641,15 @@ mod tests {
             .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
             .unwrap();
 
-        /*
-         * Initial TickDelay output = 1.5 V.
-         */
         world
             .set_device_parameter(&definitions, delay, ParameterId::new(0), 1.5)
             .unwrap();
 
         let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
 
-        let output_island = world.derived_topology.component_island(output_component);
+        let output_island = world
+            .derived_topology
+            .component_island(world.network(), output_component);
 
         let output_positive_node =
             IslandNode::net(world.derived_topology.wire_net(output_positive));
@@ -2811,15 +2659,6 @@ mod tests {
 
         let state = DeviceState::new(delay, DefinitionStateId::new(0));
 
-        /*
-         * Tick 1:
-         *
-         * output partition must read initial old state = 1.5 V.
-         *
-         * input partition sees 5 V and stages state = 5 V.
-         *
-         * Only after every island succeeds may 5 V be committed.
-         */
         world.tick(&definitions).unwrap();
 
         let output_runtime = world
@@ -2832,17 +2671,8 @@ mod tests {
             - output_runtime.node_voltage(output_negative_node).unwrap();
 
         assert!((voltage - 1.5).abs() < 1.0e-12);
+        assert_eq!(world.physical_state.get(&world.network, state), Some(5.0),);
 
-        /*
-         * The staged 5 V input has now committed to physical state.
-         */
-        assert_eq!(world.physical_state.get(state), Some(5.0),);
-
-        /*
-         * Tick 2:
-         *
-         * output now reads the state committed by tick 1.
-         */
         world.tick(&definitions).unwrap();
 
         let output_runtime = world
@@ -2856,7 +2686,7 @@ mod tests {
 
         assert!((voltage - 5.0).abs() < 1.0e-12);
 
-        assert_eq!(world.physical_state.get(state), Some(5.0),);
+        assert_eq!(world.physical_state.get(&world.network, state), Some(5.0),);
     }
 
     #[test]
@@ -2878,20 +2708,20 @@ mod tests {
 
     #[test]
     fn new_subscription_on_sleeping_island_publishes_cached_value_once() {
-        let (mut engine, world, observed, _, observer) = observed_voltage_world();
+        let (mut engine, world_id, observed, _, observer) = observed_voltage_world();
 
         let component = DeviceComponent::new(observed, DevicePartitionId::new(0));
 
-        let island = engine
-            .world(world)
-            .unwrap()
-            .derived_topology
-            .component_island(component);
+        let world = engine.world(world_id).unwrap();
 
-        engine.tick_world(world).unwrap();
+        let island = world
+            .derived_topology
+            .component_island(world.network(), component);
+
+        engine.tick_world(world_id).unwrap();
 
         {
-            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
                 .as_ref()
                 .unwrap();
 
@@ -2899,13 +2729,13 @@ mod tests {
         }
 
         let subscription = engine
-            .subscribe_observer(world, observed, observer)
+            .subscribe_observer(world_id, observed, observer)
             .unwrap();
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
         {
-            let updates = engine.subscription_updates(world).unwrap();
+            let updates = engine.subscription_updates(world_id).unwrap();
 
             assert_eq!(updates.len(), 1);
             assert_eq!(updates[0].subscription(), subscription);
@@ -2913,18 +2743,18 @@ mod tests {
         }
 
         {
-            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
                 .as_ref()
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
         }
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
-        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+        assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
-        let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+        let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
             .as_ref()
             .unwrap();
 
@@ -3093,24 +2923,24 @@ mod tests {
 
     #[test]
     fn parameter_change_wakes_sleeping_island_and_it_sleeps_again() {
-        let (mut engine, world, observed, source, observer) = observed_voltage_world();
+        let (mut engine, world_id, observed, source, observer) = observed_voltage_world();
 
         let component = DeviceComponent::new(observed, DevicePartitionId::new(0));
 
-        let island = engine
-            .world(world)
-            .unwrap()
+        let world = engine.world(world_id).unwrap();
+
+        let island = world
             .derived_topology
-            .component_island(component);
+            .component_island(world.network(), component);
 
         let subscription = engine
-            .subscribe_observer(world, observed, observer)
+            .subscribe_observer(world_id, observed, observer)
             .unwrap();
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
         {
-            let updates = engine.subscription_updates(world).unwrap();
+            let updates = engine.subscription_updates(world_id).unwrap();
 
             assert_eq!(updates.len(), 1);
             assert_eq!(updates[0].subscription(), subscription);
@@ -3118,19 +2948,19 @@ mod tests {
         }
 
         {
-            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
                 .as_ref()
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
         }
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
-        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+        assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
         {
-            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
                 .as_ref()
                 .unwrap();
 
@@ -3139,7 +2969,7 @@ mod tests {
 
         engine
             .apply_world_command(
-                world,
+                world_id,
                 WorldCommand::SetDeviceParameter {
                     device: source,
                     parameter: ParameterId::new(0),
@@ -3148,10 +2978,10 @@ mod tests {
             )
             .unwrap();
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
         {
-            let updates = engine.subscription_updates(world).unwrap();
+            let updates = engine.subscription_updates(world_id).unwrap();
 
             assert_eq!(updates.len(), 1);
             assert_eq!(updates[0].subscription(), subscription);
@@ -3159,21 +2989,380 @@ mod tests {
         }
 
         {
-            let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
                 .as_ref()
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 2);
         }
 
-        engine.tick_world(world).unwrap();
+        engine.tick_world(world_id).unwrap();
 
-        assert!(engine.subscription_updates(world).unwrap().is_empty(),);
+        assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
-        let runtime = engine.world(world).unwrap().island_runtimes[island.index()]
+        let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
             .as_ref()
             .unwrap();
 
         assert_eq!(runtime.observer_read_count(), 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn state_and_topology_sidecars_stay_aligned_through_row_and_chunk_relocation() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let stateless = device(1);
+
+        world
+            .add_device(
+                &definitions,
+                stateless,
+                DefinitionId::from(PrimitiveElementKind::Conductance),
+            )
+            .unwrap();
+
+        world.debug_validate_storage(&definitions);
+
+        for raw in 2..=66 {
+            world
+                .add_device(
+                    &definitions,
+                    device(raw),
+                    DefinitionId::from(PrimitiveElementKind::TickDelay),
+                )
+                .unwrap();
+
+            world.debug_validate_storage(&definitions);
+        }
+
+        let middle = device(10);
+
+        world.remove_device(&definitions, middle).unwrap();
+        world.debug_validate_storage(&definitions);
+
+        world.remove_device(&definitions, stateless).unwrap();
+        world.debug_validate_storage(&definitions);
+
+        assert_eq!(world.network().iter_device_ids().count(), 64);
+        assert!(world.network().device(middle).is_err());
+
+        let relocated = world.network().device_location(device(66)).unwrap();
+
+        assert_eq!(relocated.chunk_index(), 0);
+        assert_eq!(relocated.row(), 0);
+    }
+
+    #[test]
+    fn warmed_stateful_tick_reads_committed_state_only_through_physical_bindings() {
+        let definitions = DefinitionRegistry::new();
+
+        let mut world = World::new(WorldConfig::new(NonZeroU32::new(30).unwrap()));
+
+        let ground = WireId::try_from(1).unwrap();
+        let node = WireId::try_from(2).unwrap();
+        let device = DeviceId::try_from(1).unwrap();
+
+        world.add_wire(ground).unwrap();
+        world.add_wire(node).unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                device,
+                DefinitionId::from(PrimitiveElementKind::Capacitor),
+            )
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0e-6)
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, ground, device, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, node, device, TerminalId::new(1))
+            .unwrap();
+
+        world.tick(&definitions).unwrap();
+
+        world.physical_state.reset_read_counts();
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.physical_state.semantic_read_count(),
+            0,
+            "warmed runtime must not resolve committed state through DeviceId",
+        );
+
+        assert!(
+            world.physical_state.physical_read_count() > 0,
+            "stateful runtime must read committed state through a physical binding",
+        );
+    }
+
+    #[test]
+    fn row_relocation_rebinds_survivor_runtime_without_topology_recompile() {
+        let definitions = DefinitionRegistry::new();
+
+        let mut world = World::new(WorldConfig::new(NonZeroU32::new(30).unwrap()));
+
+        let definition = DefinitionId::from(PrimitiveElementKind::VoltageSource);
+
+        let first = DeviceId::try_from(1).unwrap();
+        let removed = DeviceId::try_from(2).unwrap();
+        let moved = DeviceId::try_from(3).unwrap();
+
+        for (index, device) in [first, removed, moved].into_iter().enumerate() {
+            world.add_device(&definitions, device, definition).unwrap();
+
+            world
+                .set_device_parameter(
+                    &definitions,
+                    device,
+                    ParameterId::new(0),
+                    (index + 1) as f64,
+                )
+                .unwrap();
+        }
+
+        let moved_component = DeviceComponent::new(moved, DevicePartitionId::new(0));
+
+        let moved_island = world
+            .derived_topology
+            .component_island(&world.network, moved_component);
+
+        world.tick(&definitions).unwrap();
+
+        let revision_before = world
+            .derived_topology
+            .island(moved_island)
+            .unwrap()
+            .revision();
+
+        let rebinds_before = world.island_runtimes[moved_island.index()]
+            .as_ref()
+            .unwrap()
+            .binding_rebind_count();
+
+        assert_eq!(world.network.device_location(moved).unwrap().row(), 2,);
+
+        world.remove_device(&definitions, removed).unwrap();
+
+        assert_eq!(
+            world.network.device_location(moved).unwrap().row(),
+            1,
+            "removing the middle physical row must swap-move the final device",
+        );
+
+        assert_eq!(
+            world
+                .derived_topology
+                .island(moved_island)
+                .unwrap()
+                .revision(),
+            revision_before,
+            "physical row relocation must not alter topology",
+        );
+
+        assert!(
+            world
+                .derived_topology
+                .invalidation()
+                .binding_dirty_islands()
+                .contains(&moved_island),
+            "the moved survivor's runtime binding must be invalidated",
+        );
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world
+                .derived_topology
+                .island(moved_island)
+                .unwrap()
+                .revision(),
+            revision_before,
+            "binding repair must not recompile topology",
+        );
+
+        assert_eq!(
+            world.island_runtimes[moved_island.index()]
+                .as_ref()
+                .unwrap()
+                .binding_rebind_count(),
+            rebinds_before + 1,
+            "the existing runtime must be rebound exactly once",
+        );
+    }
+
+    #[test]
+    fn chunk_relocation_rebinds_every_survivor_runtime_without_topology_recompile() {
+        let definitions = DefinitionRegistry::new();
+
+        let mut world = World::new(WorldConfig::new(NonZeroU32::new(30).unwrap()));
+
+        let removed = DeviceId::try_from(1).unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                removed,
+                DefinitionId::from(PrimitiveElementKind::Conductance),
+            )
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, removed, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let moved = [
+            DeviceId::try_from(2).unwrap(),
+            DeviceId::try_from(3).unwrap(),
+            DeviceId::try_from(4).unwrap(),
+        ];
+
+        for (index, device) in moved.into_iter().enumerate() {
+            world
+                .add_device(
+                    &definitions,
+                    device,
+                    DefinitionId::from(PrimitiveElementKind::VoltageSource),
+                )
+                .unwrap();
+
+            world
+                .set_device_parameter(
+                    &definitions,
+                    device,
+                    ParameterId::new(0),
+                    (index + 1) as f64,
+                )
+                .unwrap();
+
+            assert_eq!(
+                world.network.device_location(device).unwrap().chunk_index(),
+                1,
+            );
+        }
+
+        let components =
+            moved.map(|device| DeviceComponent::new(device, DevicePartitionId::new(0)));
+
+        let islands = components.map(|component| {
+            world
+                .derived_topology
+                .component_island(&world.network, component)
+        });
+
+        assert_ne!(islands[0], islands[1]);
+        assert_ne!(islands[1], islands[2]);
+        assert_ne!(islands[0], islands[2]);
+
+        world.tick(&definitions).unwrap();
+
+        let revisions =
+            islands.map(|island| world.derived_topology.island(island).unwrap().revision());
+
+        let rebinds = islands.map(|island| {
+            world.island_runtimes[island.index()]
+                .as_ref()
+                .unwrap()
+                .binding_rebind_count()
+        });
+
+        world.remove_device(&definitions, removed).unwrap();
+
+        for device in moved {
+            assert_eq!(
+                world.network.device_location(device).unwrap().chunk_index(),
+                0,
+            );
+        }
+
+        for (index, island) in islands.into_iter().enumerate() {
+            assert_eq!(
+                world.derived_topology.island(island).unwrap().revision(),
+                revisions[index],
+                "physical chunk relocation must not modify topology",
+            );
+
+            assert!(
+                world
+                    .derived_topology
+                    .invalidation()
+                    .binding_dirty_islands()
+                    .contains(&island),
+                "every island in the relocated chunk must become binding-dirty",
+            );
+        }
+
+        world.tick(&definitions).unwrap();
+
+        for (index, island) in islands.into_iter().enumerate() {
+            assert_eq!(
+                world.derived_topology.island(island).unwrap().revision(),
+                revisions[index],
+            );
+
+            assert_eq!(
+                world.island_runtimes[island.index()]
+                    .as_ref()
+                    .unwrap()
+                    .binding_rebind_count(),
+                rebinds[index] + 1,
+                "each relocated survivor runtime must be rebound exactly once",
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "stale parameter binding")]
+    fn debug_runtime_sync_detects_unconsumed_stale_binding() {
+        let definitions = DefinitionRegistry::new();
+
+        let mut world = World::new(WorldConfig::new(NonZeroU32::new(30).unwrap()));
+
+        let definition = DefinitionId::from(PrimitiveElementKind::VoltageSource);
+
+        let first = DeviceId::try_from(1).unwrap();
+        let removed = DeviceId::try_from(2).unwrap();
+        let moved = DeviceId::try_from(3).unwrap();
+
+        for (index, device) in [first, removed, moved].into_iter().enumerate() {
+            world.add_device(&definitions, device, definition).unwrap();
+
+            world
+                .set_device_parameter(
+                    &definitions,
+                    device,
+                    ParameterId::new(0),
+                    (index + 1) as f64,
+                )
+                .unwrap();
+        }
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(world.network.device_location(moved).unwrap().row(), 2,);
+
+        world.remove_device(&definitions, removed).unwrap();
+
+        assert_eq!(world.network.device_location(moved).unwrap().row(), 1,);
+
+        assert!(
+            !world
+                .derived_topology
+                .invalidation()
+                .binding_dirty_islands()
+                .is_empty(),
+        );
+
+        world.derived_topology.clear_invalidation();
+        world.tick(&definitions).unwrap();
     }
 }

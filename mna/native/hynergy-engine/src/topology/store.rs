@@ -34,14 +34,16 @@ where
     I: DenseId,
 {
     #[inline]
-    #[allow(dead_code)]
-    pub(super) fn len(&self) -> usize {
-        self.values.len()
-    }
+    pub(super) fn reserve(&mut self, additional: usize) {
+        self.slots
+            .len()
+            .checked_add(additional)
+            .and_then(|len| u32::try_from(len).ok())
+            .expect("dense topology stable ID space exhausted");
 
-    #[inline]
-    pub(super) fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.slots.reserve(additional);
+        self.dense_ids.reserve(additional);
+        self.values.reserve(additional);
     }
 
     #[inline]
@@ -111,6 +113,17 @@ where
             .and_then(|position| u32::try_from(position).ok())
             .and_then(NonZeroU32::new)
             .expect("dense topology store exceeded the u32 position range")
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(super) fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[inline]
+    pub(super) fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 }
 

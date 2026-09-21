@@ -5,9 +5,12 @@ mod slot;
 mod terminals;
 mod wires;
 
+pub use crate::network::device_arena::DeviceLocation;
 pub use connection::ConnectionRef;
 pub use connection::ConnectionType;
-pub use device_arena::{DeviceChunkRelocation, DeviceInsertResult, DeviceRemoveResult, DeviceView};
+pub use device_arena::{
+    DeviceChunkRelocation, DeviceInsertResult, DeviceRemoveResult, DeviceView, PreparedDeviceInsert,
+};
 
 use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
 use crate::network::device_arena::DeviceArena;
@@ -159,6 +162,11 @@ impl Network {
     }
 
     #[inline]
+    pub fn device_location(&self, device: DeviceId) -> Result<DeviceLocation, NetworkModelError> {
+        self.device_arena.location(device)
+    }
+
+    #[inline]
     pub fn device_definition_id(
         &self,
         device: DeviceId,
@@ -181,6 +189,20 @@ impl Network {
                 ty: ConnectionType::Wire,
                 id: wire.id(),
             })
+    }
+
+    #[inline]
+    pub fn parameter_at_location(
+        &self,
+        location: DeviceLocation,
+        parameter: ParameterId,
+    ) -> Option<Option<f64>> {
+        self.device_arena.parameter_at_location(location, parameter)
+    }
+
+    #[inline]
+    pub fn device_ids_in_chunk(&self, chunk_index: u32) -> Option<&[DeviceId]> {
+        self.device_arena.device_ids_in_chunk(chunk_index)
     }
 
     #[inline]
@@ -549,5 +571,179 @@ mod tests {
             .unwrap();
 
         assert!(network.wire_connections(wire).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prepared_device_insert_does_not_assign_until_commit() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let device = device_id(1);
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance);
+
+        let prepared = network
+            .prepare_add_device(&definitions, device, definition)
+            .unwrap();
+
+        assert_eq!(prepared.location().chunk_index(), 0);
+        assert_eq!(prepared.location().row(), 0);
+        assert!(prepared.created_chunk());
+
+        assert!(network.device(device).is_err());
+
+        let inserted = network.commit_add_device(prepared);
+
+        assert_eq!(inserted.location().chunk_index(), 0);
+        assert_eq!(inserted.location().row(), 0);
+        assert!(inserted.created_chunk());
+
+        assert!(network.device(device).is_ok());
+    }
+
+    #[test]
+    fn device_location_tracks_row_swap_remove() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance);
+
+        for raw in 1..=3 {
+            network
+                .add_device(&definitions, device_id(raw), definition)
+                .unwrap();
+        }
+
+        assert_eq!(network.device_location(device_id(3)).unwrap().row(), 2);
+
+        let removal = network.remove_device(device_id(2)).unwrap();
+
+        assert_eq!(removal.moved_device(), Some(device_id(3)));
+
+        let moved = network.device_location(device_id(3)).unwrap();
+
+        assert_eq!(moved.chunk_index(), 0);
+        assert_eq!(moved.row(), 1);
+    }
+
+    #[test]
+    fn device_location_tracks_whole_chunk_swap_remove() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        network
+            .add_device(
+                &definitions,
+                device_id(1),
+                DefinitionId::from(PrimitiveElementKind::VoltageSource),
+            )
+            .unwrap();
+
+        for raw in 2..=4 {
+            network
+                .add_device(
+                    &definitions,
+                    device_id(raw),
+                    DefinitionId::from(PrimitiveElementKind::Conductance),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            network.device_location(device_id(2)).unwrap().chunk_index(),
+            1
+        );
+
+        let removal = network.remove_device(device_id(1)).unwrap();
+        let relocation = removal.chunk_relocation().unwrap();
+
+        assert_eq!(relocation.from_chunk(), 1);
+        assert_eq!(relocation.to_chunk(), 0);
+
+        for (row, raw) in (2..=4).enumerate() {
+            let location = network.device_location(device_id(raw)).unwrap();
+
+            assert_eq!(location.chunk_index(), 0);
+            assert_eq!(location.row() as usize, row);
+        }
+    }
+
+    #[test]
+    fn physical_parameter_lookup_tracks_relocated_row() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let definition = DefinitionId::from(PrimitiveElementKind::Conductance);
+
+        let first = device_id(1);
+        let removed = device_id(2);
+        let moved = device_id(3);
+
+        for device in [first, removed, moved] {
+            network
+                .add_device(&definitions, device, definition)
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, moved, ParameterId::new(0), 7.5)
+            .unwrap();
+
+        let before = network.device_location(moved).unwrap();
+
+        assert_eq!(before.chunk_index(), 0);
+        assert_eq!(before.row(), 2);
+
+        assert_eq!(
+            network.parameter_at_location(before, ParameterId::new(0),),
+            Some(Some(7.5)),
+        );
+
+        let removal = network.remove_device(removed).unwrap();
+
+        assert_eq!(removal.moved_device(), Some(moved),);
+
+        let after = network.device_location(moved).unwrap();
+
+        assert_eq!(after.chunk_index(), 0);
+        assert_eq!(after.row(), 1);
+
+        assert_eq!(
+            network.parameter_at_location(after, ParameterId::new(0),),
+            Some(Some(7.5)),
+        );
+    }
+
+    #[test]
+    fn chunk_device_id_slice_tracks_whole_chunk_relocation() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        network
+            .add_device(
+                &definitions,
+                device_id(1),
+                DefinitionId::from(PrimitiveElementKind::VoltageSource),
+            )
+            .unwrap();
+
+        let conductance = DefinitionId::from(PrimitiveElementKind::Conductance);
+
+        for raw in 2..=4 {
+            network
+                .add_device(&definitions, device_id(raw), conductance)
+                .unwrap();
+        }
+
+        assert_eq!(
+            network.device_ids_in_chunk(1).unwrap(),
+            &[device_id(2), device_id(3), device_id(4),],
+        );
+
+        let removal = network.remove_device(device_id(1)).unwrap();
+
+        assert!(removal.chunk_relocation().is_some());
+
+        assert_eq!(
+            network.device_ids_in_chunk(0).unwrap(),
+            &[device_id(2), device_id(3), device_id(4),],
+        );
     }
 }

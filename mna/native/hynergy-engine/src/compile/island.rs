@@ -924,7 +924,7 @@ mod test {
 
         let component = DeviceComponent::new(device, DevicePartitionId::new(0));
 
-        let island_id = topology.component_island(component);
+        let island_id = topology.component_island(&network, component);
 
         let island = compile_topology_island(&definitions, &network, &topology, island_id).unwrap();
 

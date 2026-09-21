@@ -104,7 +104,10 @@ pub(super) fn island_components(
 ) -> Vec<IslandComponent> {
     scratch.begin_island_traversal(
         topology.nets.slot_count(),
-        topology.component_island_map.len(),
+        topology
+            .device_chunks
+            .iter()
+            .map(|chunk| chunk.row_count() * chunk.partition_count()),
     );
 
     let island = topology
@@ -115,15 +118,16 @@ pub(super) fn island_components(
     let mut pieces = Vec::new();
 
     for &device_component in &island.components {
-        let component_index = topology.component_index(device_component);
+        let (chunk_index, component_index) =
+            topology.component_storage_index(network, device_component);
 
-        if !scratch.visit_component(component_index) {
+        if !scratch.visit_component(chunk_index, component_index) {
             continue;
         }
 
         debug_assert_eq!(
-            topology.component_island_map[component_index],
-            Some(island_id),
+            topology.component_island(network, device_component,),
+            island_id,
         );
 
         debug_assert!(network.device(device_component.device()).is_ok());
@@ -189,16 +193,14 @@ fn walk_island_component(
                     .expect("visited island net must be live");
 
                 for &neighbor in &net.terminal_components {
-                    let component_index = topology.component_index(neighbor);
+                    let (chunk_index, component_index) =
+                        topology.component_storage_index(network, neighbor);
 
-                    if !scratch.visit_component(component_index) {
+                    if !scratch.visit_component(chunk_index, component_index) {
                         continue;
                     }
 
-                    debug_assert_eq!(
-                        topology.component_island_map[component_index],
-                        Some(island_id),
-                    );
+                    debug_assert_eq!(topology.component_island(network, neighbor), island_id,);
 
                     scratch.island_stack.push(IslandVertex::Component(neighbor));
                 }
@@ -249,16 +251,14 @@ fn walk_island_component(
                         let neighbor =
                             terminal_component(definitions, network, other_device, other_terminal);
 
-                        let component_index = topology.component_index(neighbor);
+                        let (chunk_index, component_index) =
+                            topology.component_storage_index(network, neighbor);
 
-                        if !scratch.visit_component(component_index) {
+                        if !scratch.visit_component(chunk_index, component_index) {
                             continue;
                         }
 
-                        debug_assert_eq!(
-                            topology.component_island_map[component_index],
-                            Some(island_id),
-                        );
+                        debug_assert_eq!(topology.component_island(network, neighbor), island_id,);
 
                         scratch.island_stack.push(IslandVertex::Component(neighbor));
                     }
@@ -274,11 +274,12 @@ fn walk_island_component(
 pub(crate) struct TraversalScratch {
     wire_seen: Vec<bool>,
     net_seen: Vec<bool>,
-    component_seen: Vec<u64>,
+
+    component_seen: Vec<Vec<u64>>,
 
     touched_wires: Vec<usize>,
     touched_nets: Vec<usize>,
-    touched_component_words: Vec<usize>,
+    touched_component_words: Vec<(usize, usize)>,
 
     wire_stack: Vec<WireId>,
     island_stack: Vec<IslandVertex>,
@@ -304,20 +305,50 @@ impl TraversalScratch {
     }
 
     #[inline]
-    fn begin_island_traversal(&mut self, net_slots: usize, component_slots: usize) {
+    fn begin_island_traversal(
+        &mut self,
+        net_slots: usize,
+        component_slots: impl IntoIterator<Item = usize>,
+    ) {
         Self::reset_marks(&mut self.net_seen, &mut self.touched_nets, net_slots);
 
-        for word_index in self.touched_component_words.drain(..) {
-            self.component_seen[word_index] = 0;
+        for (chunk_index, word_index) in self.touched_component_words.drain(..) {
+            self.component_seen[chunk_index][word_index] = 0;
         }
 
-        let required_words = component_slots.div_ceil(64);
+        for (chunk_index, slot_count) in component_slots.into_iter().enumerate() {
+            if self.component_seen.len() <= chunk_index {
+                self.component_seen.resize_with(chunk_index + 1, Vec::new);
+            }
 
-        if self.component_seen.len() < required_words {
-            self.component_seen.resize(required_words, 0);
+            let required_words = slot_count.div_ceil(64);
+
+            if self.component_seen[chunk_index].len() < required_words {
+                self.component_seen[chunk_index].resize(required_words, 0);
+            }
         }
 
         self.island_stack.clear();
+    }
+
+    #[inline]
+    fn visit_component(&mut self, chunk_index: usize, index: usize) -> bool {
+        let word_index = index / 64;
+        let mask = 1_u64 << (index % 64);
+
+        let word = self.component_seen[chunk_index][word_index];
+
+        if word & mask != 0 {
+            return false;
+        }
+
+        if word == 0 {
+            self.touched_component_words.push((chunk_index, word_index));
+        }
+
+        self.component_seen[chunk_index][word_index] = word | mask;
+
+        true
     }
 
     #[inline]
@@ -339,26 +370,6 @@ impl TraversalScratch {
 
         self.net_seen[index] = true;
         self.touched_nets.push(index);
-        true
-    }
-
-    #[inline]
-    fn visit_component(&mut self, index: usize) -> bool {
-        let word_index = index / 64;
-        let mask = 1_u64 << (index % 64);
-
-        let word = self.component_seen[word_index];
-
-        if word & mask != 0 {
-            return false;
-        }
-
-        if word == 0 {
-            self.touched_component_words.push(word_index);
-        }
-
-        self.component_seen[word_index] = word | mask;
-
         true
     }
 }
@@ -390,26 +401,25 @@ mod tests {
         assert!(scratch.visit_wire(1));
         assert!(scratch.visit_wire(3));
 
-        // Growing the scratch storage must preserve the reset behavior.
         scratch.begin_wire_traversal(8);
 
         assert!(scratch.visit_wire(1));
         assert!(scratch.visit_wire(7));
 
-        scratch.begin_island_traversal(4, 4);
+        scratch.begin_island_traversal(4, [4]);
 
         assert!(scratch.visit_net(1));
-        assert!(scratch.visit_component(2));
+        assert!(scratch.visit_component(0, 2));
 
         assert!(!scratch.visit_net(1));
-        assert!(!scratch.visit_component(2));
+        assert!(!scratch.visit_component(0, 2));
 
-        scratch.begin_island_traversal(8, 8);
+        scratch.begin_island_traversal(8, [8]);
 
         assert!(scratch.visit_net(1));
-        assert!(scratch.visit_component(2));
+        assert!(scratch.visit_component(0, 2));
 
         assert!(scratch.visit_net(7));
-        assert!(scratch.visit_component(7));
+        assert!(scratch.visit_component(0, 7));
     }
 }
