@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub const ABI_VERSION: u32 = 1;
-pub const ABI_REVISION: u32 = 1;
+pub const ABI_REVISION: u32 = 2;
 
 /// Returns the ABI major version implemented by this library.
 ///
@@ -446,6 +446,7 @@ pub enum CommandCode {
     InvalidParameter = 29,
     ParameterConstraintViolation = 30,
     UnknownDefinition = 31,
+    ResourceExhausted = 32,
 
     InternalPanic = u32::MAX,
 }
@@ -562,6 +563,7 @@ fn map_world_command_error(error: WorldCommandError) -> CommandResult {
             CommandCode::ParameterConstraintViolation
         }
         WorldCommandErrorKind::UnknownDefinition => CommandCode::UnknownDefinition,
+        WorldCommandErrorKind::ResourceExhausted => CommandCode::ResourceExhausted,
     };
 
     CommandResult::failure(code, error.command_index(), error.byte_offset())
@@ -1991,7 +1993,7 @@ mod tests {
         assert_eq!(ABI_VERSION, 1);
 
         assert_eq!(hynergy_abi_revision(), ABI_REVISION);
-        assert_eq!(ABI_REVISION, 1);
+        assert_eq!(ABI_REVISION, 2);
     }
 
     #[test]

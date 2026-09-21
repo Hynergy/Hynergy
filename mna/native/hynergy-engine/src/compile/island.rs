@@ -272,7 +272,7 @@ impl CompiledPartitionInputs {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub(crate) enum IslandCompileError {
     #[error(transparent)]
     UnknownAllocation(#[from] UnknownAllocationError),
@@ -478,13 +478,11 @@ fn resolve_terminal_node(
     device: DeviceId,
     terminal: TerminalId,
 ) -> IslandNode {
-    let device_slot = network
-        .devices()
-        .get(device.index())
-        .and_then(Option::as_ref)
+    let device_view = network
+        .device(device)
         .expect("island component device must exist");
 
-    let connection = device_slot
+    let connection = device_view
         .terminals()
         .get(terminal.index())
         .copied()

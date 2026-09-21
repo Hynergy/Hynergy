@@ -44,6 +44,7 @@ pub enum WorldCommandErrorKind {
     InvalidParameter,
     ParameterConstraintViolation,
     UnknownDefinition,
+    ResourceExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,10 +351,11 @@ fn map_world_apply_error(
             }
             NetworkModelError::InvalidTerminal => WorldCommandErrorKind::InvalidTerminal,
             NetworkModelError::InvalidParameter { .. } => WorldCommandErrorKind::InvalidParameter,
-            NetworkModelError::ParameterConstraint { .. } => {
+            NetworkModelError::ParameterConstraintViolation { .. } => {
                 WorldCommandErrorKind::ParameterConstraintViolation
             }
             NetworkModelError::UnknownDefinition { .. } => WorldCommandErrorKind::UnknownDefinition,
+            NetworkModelError::DeviceArenaExhausted => WorldCommandErrorKind::ResourceExhausted,
         },
     };
 
@@ -845,7 +847,7 @@ mod tests {
                 WorldCommandErrorKind::InvalidParameter,
             ),
             (
-                NetworkModelError::ParameterConstraint {
+                NetworkModelError::ParameterConstraintViolation {
                     parameter,
                     source: ParameterConstraintError::OutOfRange,
                 },
@@ -873,6 +875,19 @@ mod tests {
         let error = map_world_apply_error(WorldCommandApplyError::UnknownWorld, 3, 42);
 
         assert_eq!(error.kind(), WorldCommandErrorKind::UnknownWorld);
+        assert_eq!(error.command_index(), 3);
+        assert_eq!(error.byte_offset(), 42);
+    }
+
+    #[test]
+    fn device_arena_exhaustion_maps_to_resource_exhausted() {
+        let error = map_world_apply_error(
+            WorldCommandApplyError::Model(NetworkModelError::DeviceArenaExhausted),
+            3,
+            42,
+        );
+
+        assert_eq!(error.kind(), WorldCommandErrorKind::ResourceExhausted,);
         assert_eq!(error.command_index(), 3);
         assert_eq!(error.byte_offset(), 42);
     }

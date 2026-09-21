@@ -126,8 +126,7 @@ pub(super) fn island_components(
             Some(island_id),
         );
 
-        debug_assert!(network.devices()[device_component.device().index()].is_some());
-
+        debug_assert!(network.device(device_component.device()).is_ok());
         scratch
             .island_stack
             .push(IslandVertex::Component(device_component));
@@ -210,17 +209,13 @@ fn walk_island_component(
 
                 let device_id = device_component.device();
 
-                let definition_id = network
-                    .device_definition_id(device_id)
-                    .expect("visited component device must have a definition");
+                let device = network
+                    .device(device_id)
+                    .expect("visited island component device must be live");
 
                 let definition = definitions
-                    .get(definition_id)
+                    .get(device.definition_id())
                     .expect("visited component definition must remain registered");
-
-                let device = network.devices()[device_id.index()]
-                    .as_ref()
-                    .expect("visited island component device must be live");
 
                 for (terminal_index, connection) in device.terminals().iter().enumerate() {
                     if definition.terminal_partitions()[terminal_index]

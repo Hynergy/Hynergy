@@ -23,11 +23,14 @@ impl DerivedTopology {
             "net -> island map must mirror the stable NetId slot space"
         );
 
-        assert_eq!(
-            self.device_component_spans.len(),
-            network.devices().len(),
-            "device component spans must mirror Network device slots"
-        );
+        for (device, _) in network.iter_devices() {
+            assert!(
+                self.device_component_spans
+                    .get(device.index())
+                    .is_some_and(Option::is_some),
+                "live Network device must have a derived component span",
+            );
+        }
 
         self.assert_membership_maps(definitions, network);
         self.assert_net_partition_matches_network(network);
@@ -156,10 +159,7 @@ impl DerivedTopology {
                 let device = component.device();
 
                 assert!(
-                    network
-                        .devices()
-                        .get(device.index())
-                        .is_some_and(|slot| slot.is_some()),
+                    network.device(device).is_ok(),
                     "island references a removed or out-of-range device",
                 );
 
@@ -188,44 +188,42 @@ impl DerivedTopology {
             }
         }
 
-        for (device_index, slot) in network.devices().iter().enumerate() {
-            match slot {
-                Some(_) => {
-                    let span = self.device_component_spans[device_index]
-                        .expect("live device must have a component span");
+        for device_index in 0..self.device_component_spans.len() {
+            let device = device_id(device_index);
 
-                    let end = span
-                        .start()
-                        .checked_add(span.len())
-                        .expect("device component index overflow");
+            if network.device(device).is_ok() {
+                let span = self.device_component_spans[device_index]
+                    .expect("live device must have a component span");
 
-                    for (component_index, seen_component) in seen_components
-                        .iter()
-                        .enumerate()
-                        .take(end)
-                        .skip(span.start())
-                    {
-                        assert!(
-                            *seen_component,
-                            "live device component is missing from derived islands",
-                        );
+                let end = span
+                    .start()
+                    .checked_add(span.len())
+                    .expect("device component index overflow");
 
-                        let island_id = self.component_island_map[component_index]
-                            .expect("live device component must have a derived IslandId");
+                for (component_index, seen_component) in seen_components
+                    .iter()
+                    .enumerate()
+                    .take(end)
+                    .skip(span.start())
+                {
+                    assert!(
+                        *seen_component,
+                        "live device component is missing from derived islands",
+                    );
 
-                        assert!(
-                            self.islands.get(island_id).is_some(),
-                            "live device component references a retired IslandId",
-                        );
-                    }
-                }
+                    let island_id = self.component_island_map[component_index]
+                        .expect("live device component must have a derived IslandId");
 
-                None => {
-                    assert_eq!(
-                        self.device_component_spans[device_index], None,
-                        "removed device still has a component span",
+                    assert!(
+                        self.islands.get(island_id).is_some(),
+                        "live device component references a retired IslandId",
                     );
                 }
+            } else {
+                assert_eq!(
+                    self.device_component_spans[device_index], None,
+                    "removed device still has a component span",
+                );
             }
         }
 
@@ -311,12 +309,8 @@ impl DerivedTopology {
         let mut stack = Vec::new();
         let mut connected_component_count = 0usize;
 
-        for (device_index, slot) in network.devices().iter().enumerate() {
-            if slot.is_none() {
-                continue;
-            }
-
-            let device = device_id(device_index);
+        for (device, _) in network.iter_devices() {
+            let device_index = device.index();
 
             let span = self.device_component_spans[device_index]
                 .expect("live device must have a component span");
@@ -418,22 +412,16 @@ impl DerivedTopology {
 
                             let device = component.device();
 
-                            let device_slot = network
-                                .devices()
-                                .get(device.index())
-                                .and_then(Option::as_ref)
+                            let device_view = network
+                                .device(device)
                                 .expect("visited component device must exist");
 
-                            let definition_id = network
-                                .device_definition_id(device)
-                                .expect("visited component device must have a definition");
-
                             let definition = definitions
-                                .get(definition_id)
+                                .get(device_view.definition_id())
                                 .expect("visited component definition must remain registered");
 
                             for (terminal_index, connection) in
-                                device_slot.terminals().iter().enumerate()
+                                device_view.terminals().iter().enumerate()
                             {
                                 if definition.terminal_partitions()[terminal_index]
                                     != component.partition()

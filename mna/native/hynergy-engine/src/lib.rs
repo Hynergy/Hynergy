@@ -748,17 +748,11 @@ impl World {
         &mut self,
         definitions: &DefinitionRegistry,
     ) -> Result<(), PhysicalStateError> {
-        for (index, slot) in self.network.devices().iter().enumerate() {
-            if slot.is_none() {
-                continue;
-            }
+        let network = &self.network;
+        let physical_state = &mut self.physical_state;
 
-            let raw = u32::try_from(index + 1).expect("device index must fit DeviceId");
-
-            let device = DeviceId::try_from(raw).expect("device IDs are one-based");
-
-            self.physical_state
-                .initialize_device(definitions, &self.network, device)?;
+        for (device, _) in network.iter_devices() {
+            physical_state.initialize_device(definitions, network, device)?;
         }
 
         Ok(())
@@ -836,6 +830,15 @@ impl World {
 
             runtime.mark_numerical_dirty();
         }
+
+        debug_assert!(
+            self.derived_topology
+                .invalidation()
+                .binding_dirty_islands()
+                .is_empty(),
+            "binding invalidation was produced before a runtime binding-refresh consumer exists",
+        );
+
         self.derived_topology.clear_invalidation();
 
         Ok(())
@@ -880,6 +883,7 @@ pub(crate) enum PhysicalStateError {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PhysicalStateStore {
     devices: Vec<Option<Box<[f64]>>>,
+    initialized: Vec<bool>,
 }
 
 impl PhysicalStateStore {
@@ -894,16 +898,18 @@ impl PhysicalStateStore {
         network: &Network,
         device: DeviceId,
     ) -> Result<(), PhysicalStateError> {
-        if self
-            .devices
-            .get(device.index())
-            .is_some_and(Option::is_some)
-        {
+        let device_index = device.index();
+
+        if self.initialized.get(device_index).copied().unwrap_or(false) {
             return Ok(());
         }
 
-        if self.devices.len() <= device.index() {
-            self.devices.resize_with(device.index() + 1, || None);
+        if self.devices.len() <= device_index {
+            self.devices.resize_with(device_index + 1, || None);
+        }
+
+        if self.initialized.len() <= device_index {
+            self.initialized.resize(device_index + 1, false);
         }
 
         let definition_id = network
@@ -914,15 +920,12 @@ impl PhysicalStateStore {
             .get(definition_id)
             .expect("state initialization definition must remain registered");
 
-        let device_slot = network
-            .devices()
-            .get(device.index())
-            .and_then(Option::as_ref)
+        let device_view = network
+            .device(device)
             .expect("state initialization device must exist");
 
-        let parameters = device_slot
+        let parameters = device_view
             .parameters()
-            .iter()
             .enumerate()
             .map(|(index, value)| {
                 let parameter = ParameterId::new(
@@ -930,8 +933,7 @@ impl PhysicalStateStore {
                 );
 
                 match value {
-                    Some(value) => InitialParameterValue::Value(*value),
-
+                    Some(value) => InitialParameterValue::Value(value),
                     None => InitialParameterValue::Unassigned(parameter),
                 }
             })
@@ -945,11 +947,12 @@ impl PhysicalStateStore {
             state.len(),
             definition.state_count(),
             "recursive state initialization must produce exactly \
-         the definition state count",
+            the definition state count",
         );
 
-        self.devices[device.index()] = Some(state.into_boxed_slice());
+        self.devices[device_index] = Some(state.into_boxed_slice());
 
+        self.initialized[device_index] = definition.state_count() == 0;
         Ok(())
     }
 
@@ -964,8 +967,14 @@ impl PhysicalStateStore {
 
     #[inline]
     pub(crate) fn remove_device(&mut self, device: DeviceId) {
-        if let Some(slot) = self.devices.get_mut(device.index()) {
+        let device_index = device.index();
+
+        if let Some(slot) = self.devices.get_mut(device_index) {
             *slot = None;
+        }
+
+        if let Some(initialized) = self.initialized.get_mut(device_index) {
+            *initialized = false;
         }
     }
 
@@ -982,7 +991,7 @@ impl PhysicalStateStore {
                     .iter()
                     .any(|previous| previous.state() == state),
                 "state {state:?} has more than one staged write despite \
-                 single-writer definition compilation",
+             single-writer definition compilation",
             );
         }
 
@@ -1003,14 +1012,17 @@ impl PhysicalStateStore {
 
         for write in writes {
             let state = write.state();
+            let device_index = state.device().index();
 
-            let value = self.devices[state.device().index()]
+            let value = self.devices[device_index]
                 .as_mut()
-                .expect("validated state device must remain initialized")
+                .expect("validated state device must remain materialized")
                 .get_mut(state.state().index())
-                .expect("validated state slot must remain initialized");
+                .expect("validated state slot must remain materialized");
 
             *value = write.value();
+
+            self.initialized[device_index] = true;
         }
 
         Ok(())
@@ -1094,7 +1106,7 @@ fn initialize_definition_state(
     Ok(())
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub(crate) enum WorldTickError {
     #[error(transparent)]
     Compile(#[from] IslandCompileError),
@@ -1722,7 +1734,7 @@ mod tests {
 
         assert_eq!(
             world.set_device_parameter(&definitions, d, ParameterId::new(0), -1.0,),
-            Err(NetworkModelError::ParameterConstraint {
+            Err(NetworkModelError::ParameterConstraintViolation {
                 parameter: ParameterId::new(0),
                 source: ParameterConstraintError::OutOfRange,
             })
@@ -1830,7 +1842,7 @@ mod tests {
         let world = engine.world(world).unwrap();
 
         assert!(world.network.wires().iter().all(Option::is_none));
-        assert!(world.network.devices().iter().all(Option::is_none));
+        assert!(world.network.iter_devices().next().is_none());
 
         world
             .derived_topology
@@ -1928,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_delay_state_initializes_once_from_parameter() {
+    fn tick_delay_initial_state_re_evaluates_until_committed() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::new(world_config());
 
@@ -1949,7 +1961,7 @@ mod tests {
 
         let state = DeviceState::new(delay, DefinitionStateId::new(0));
 
-        assert_eq!(world.physical_state.get(state), Some(4.25),);
+        assert_eq!(world.physical_state.get(state), Some(4.25));
 
         world
             .set_device_parameter(&definitions, delay, ParameterId::new(0), 9.0)
@@ -1960,14 +1972,25 @@ mod tests {
             .initialize_device(&definitions, &world.network, delay)
             .unwrap();
 
-        assert_eq!(world.physical_state.get(state), Some(4.25),);
+        assert_eq!(world.physical_state.get(state), Some(9.0));
 
         world
             .physical_state
             .commit_staged(&[StagedStateWrite::new(state, 7.5)])
             .unwrap();
 
-        assert_eq!(world.physical_state.get(state), Some(7.5),);
+        assert_eq!(world.physical_state.get(state), Some(7.5));
+
+        world
+            .set_device_parameter(&definitions, delay, ParameterId::new(0), 12.0)
+            .unwrap();
+
+        world
+            .physical_state
+            .initialize_device(&definitions, &world.network, delay)
+            .unwrap();
+
+        assert_eq!(world.physical_state.get(state), Some(7.5));
     }
 
     #[test]
@@ -2120,6 +2143,57 @@ mod tests {
             - runtime.node_voltage(negative_node).unwrap();
 
         assert!((second_output - 9.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn failed_initialization_does_not_freeze_tick_delay_initial_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let delay = device(1);
+        let blocker = device(2);
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                blocker,
+                PrimitiveElementKind::TickDelay.into(),
+            )
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, delay, ParameterId::new(0), 4.25)
+            .unwrap();
+
+        assert_eq!(
+            world.tick(&definitions),
+            Err(WorldTickError::State(
+                PhysicalStateError::MissingInitialParameter {
+                    device: blocker,
+                    parameter: ParameterId::new(0),
+                },
+            )),
+        );
+
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+
+        assert_eq!(world.physical_state.get(state), Some(4.25));
+
+        world
+            .set_device_parameter(&definitions, delay, ParameterId::new(0), 9.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, blocker, ParameterId::new(0), 0.0)
+            .unwrap();
+
+        world.initialize_physical_state(&definitions).unwrap();
+
+        assert_eq!(world.physical_state.get(state), Some(9.0));
     }
 
     #[test]

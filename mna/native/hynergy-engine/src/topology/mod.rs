@@ -163,31 +163,16 @@ impl DerivedTopology {
             }
         }
 
-        for (index, slot) in network.devices().iter().enumerate() {
-            if slot.is_none() {
-                continue;
-            }
-
-            let device = device_id(index);
-
-            let definition_id = network
-                .device_definition_id(device)
-                .expect("live Network device must have a definition");
-
+        for (device, device_view) in network.iter_devices() {
             let definition = definitions
-                .get(definition_id)
+                .get(device_view.definition_id())
                 .expect("live Network device definition must remain registered");
 
             topology.add_device(device, definition);
         }
 
-        for (index, slot) in network.devices().iter().enumerate() {
-            let Some(device_slot) = slot else {
-                continue;
-            };
-            let device = device_id(index);
-
-            for (terminal_index, connection) in device_slot.terminals().iter().enumerate() {
+        for (device, device_view) in network.iter_devices() {
+            for (terminal_index, connection) in device_view.terminals().iter().enumerate() {
                 let Some(connection) = *connection else {
                     continue;
                 };
@@ -198,6 +183,7 @@ impl DerivedTopology {
 
                 if let Some(wire) = connection.as_wire() {
                     topology.attach_terminal(definitions, network, wire, device, terminal);
+
                     continue;
                 }
 
@@ -596,11 +582,7 @@ impl DerivedTopology {
     }
 
     pub(crate) fn device_nets(&self, network: &Network, device: DeviceId) -> Vec<NetId> {
-        let Some(device) = network
-            .devices()
-            .get(device.index())
-            .and_then(Option::as_ref)
-        else {
+        let Ok(device) = network.device(device) else {
             return Vec::new();
         };
 
@@ -843,19 +825,15 @@ impl DerivedTopology {
 
             let device = component.device();
 
-            let definition_id = network
-                .device_definition_id(device)
-                .expect("island component device must have a definition");
-
-            let definition = definitions
-                .get(definition_id)
-                .expect("island component definition must remain registered");
-
-            let device_slot = network.devices()[device.index()]
-                .as_ref()
+            let device_view = network
+                .device(device)
                 .expect("island component device must be live");
 
-            for (terminal_index, connection) in device_slot.terminals().iter().enumerate() {
+            let definition = definitions
+                .get(device_view.definition_id())
+                .expect("island component definition must remain registered");
+
+            for (terminal_index, connection) in device_view.terminals().iter().enumerate() {
                 if definition.terminal_partitions()[terminal_index] != component.partition() {
                     continue;
                 }
@@ -953,31 +931,21 @@ impl DerivedTopology {
         self.nets.get(id)
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn island(&self, id: IslandId) -> Option<&IslandTopology> {
         self.islands.get(id)
     }
 
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) fn nets(&self) -> impl ExactSizeIterator<Item = (NetId, &Net)> {
-        self.nets.iter()
-    }
-
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn islands(&self) -> impl ExactSizeIterator<Item = (IslandId, &IslandTopology)> {
         self.islands.iter()
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn invalidation(&self) -> &WorldInvalidation {
         &self.invalidation
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn clear_invalidation(&mut self) {
         self.invalidation.clear();
@@ -999,6 +967,26 @@ impl DerivedTopology {
             };
 
             self.invalidation.mark_numerical_dirty(island_id);
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn mark_device_binding_dirty(&mut self, device: DeviceId) {
+        let span = self.device_component_spans[device.index()]
+            .expect("live device must have a component span");
+
+        let end = span
+            .start()
+            .checked_add(span.len())
+            .expect("device component index overflow");
+
+        for component_index in span.start()..end {
+            let Some(island_id) = self.component_island_map[component_index] else {
+                continue;
+            };
+
+            self.invalidation.mark_binding_dirty(island_id);
         }
     }
 }
@@ -1059,6 +1047,7 @@ fn wire_id(index: usize) -> WireId {
         .expect("wire IDs are one-based")
 }
 
+#[cfg(test)]
 fn device_id(index: usize) -> DeviceId {
     DeviceId::try_from(u32::try_from(index + 1).expect("device index must fit DeviceId"))
         .expect("device IDs are one-based")
@@ -1068,6 +1057,7 @@ fn device_id(index: usize) -> DeviceId {
 pub(crate) struct WorldInvalidation {
     topology_dirty: SmallVec<[IslandId; 4]>,
     numerical_dirty: SmallVec<[IslandId; 4]>,
+    binding_dirty: SmallVec<[IslandId; 4]>,
     retired: SmallVec<[IslandId; 4]>,
 }
 
@@ -1079,9 +1069,21 @@ impl WorldInvalidation {
         }
 
         self.numerical_dirty.retain(|dirty| *dirty != island);
+        self.binding_dirty.retain(|dirty| *dirty != island);
 
         if !self.topology_dirty.contains(&island) {
             self.topology_dirty.push(island);
+        }
+    }
+
+    #[inline]
+    fn mark_binding_dirty(&mut self, island: IslandId) {
+        if self.retired.contains(&island) || self.topology_dirty.contains(&island) {
+            return;
+        }
+
+        if !self.binding_dirty.contains(&island) {
+            self.binding_dirty.push(island);
         }
     }
 
@@ -1100,6 +1102,7 @@ impl WorldInvalidation {
     fn mark_retired(&mut self, island: IslandId) {
         self.topology_dirty.retain(|dirty| *dirty != island);
         self.numerical_dirty.retain(|dirty| *dirty != island);
+        self.binding_dirty.retain(|dirty| *dirty != island);
 
         if !self.retired.contains(&island) {
             self.retired.push(island);
@@ -1110,22 +1113,25 @@ impl WorldInvalidation {
     fn clear(&mut self) {
         self.topology_dirty.clear();
         self.numerical_dirty.clear();
+        self.binding_dirty.clear();
         self.retired.clear();
     }
 
-    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn binding_dirty_islands(&self) -> &[IslandId] {
+        &self.binding_dirty
+    }
+
     #[inline]
     pub(crate) fn topology_dirty_islands(&self) -> &[IslandId] {
         &self.topology_dirty
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn numerical_dirty_islands(&self) -> &[IslandId] {
         &self.numerical_dirty
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn retired_islands(&self) -> &[IslandId] {
         &self.retired
@@ -2254,6 +2260,109 @@ mod tests {
     }
 
     #[test]
+    fn marking_device_binding_dirty_marks_all_component_islands_without_changing_revisions() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut topology = DerivedTopology::default();
+
+        let delay = device(1);
+
+        add_device(
+            &mut network,
+            &mut topology,
+            &definitions,
+            delay,
+            PrimitiveElementKind::TickDelay,
+        );
+
+        let input = DeviceComponent::new(delay, DevicePartitionId::new(0));
+        let output = DeviceComponent::new(delay, DevicePartitionId::new(1));
+
+        let input_island = topology.component_island(input);
+        let output_island = topology.component_island(output);
+
+        assert_ne!(input_island, output_island);
+
+        let input_revision = topology.island(input_island).unwrap().revision();
+        let output_revision = topology.island(output_island).unwrap().revision();
+
+        topology.clear_invalidation();
+        topology.mark_device_binding_dirty(delay);
+
+        let invalidation = topology.invalidation();
+
+        assert!(invalidation.topology_dirty_islands().is_empty());
+        assert!(invalidation.numerical_dirty_islands().is_empty());
+        assert!(invalidation.retired_islands().is_empty());
+
+        let binding_dirty = invalidation.binding_dirty_islands();
+
+        assert_eq!(binding_dirty.len(), 2);
+        assert!(binding_dirty.contains(&input_island));
+        assert!(binding_dirty.contains(&output_island));
+
+        assert_eq!(
+            topology.island(input_island).unwrap().revision(),
+            input_revision,
+        );
+        assert_eq!(
+            topology.island(output_island).unwrap().revision(),
+            output_revision,
+        );
+    }
+
+    #[test]
+    fn topology_dirty_supersedes_binding_and_numerical_dirty() {
+        let island = IslandId::try_from(1).unwrap();
+        let mut invalidation = WorldInvalidation::default();
+
+        invalidation.mark_binding_dirty(island);
+        invalidation.mark_numerical_dirty(island);
+
+        assert_eq!(invalidation.binding_dirty_islands(), &[island]);
+        assert_eq!(invalidation.numerical_dirty_islands(), &[island]);
+
+        invalidation.mark_topology_dirty(island);
+
+        assert_eq!(invalidation.topology_dirty_islands(), &[island]);
+        assert!(invalidation.binding_dirty_islands().is_empty());
+        assert!(invalidation.numerical_dirty_islands().is_empty());
+        assert!(invalidation.retired_islands().is_empty());
+
+        invalidation.mark_binding_dirty(island);
+        invalidation.mark_numerical_dirty(island);
+
+        assert!(invalidation.binding_dirty_islands().is_empty());
+        assert!(invalidation.numerical_dirty_islands().is_empty());
+    }
+
+    #[test]
+    fn retiring_island_clears_binding_dirty() {
+        let island = IslandId::try_from(1).unwrap();
+        let mut invalidation = WorldInvalidation::default();
+
+        invalidation.mark_binding_dirty(island);
+
+        assert_eq!(invalidation.binding_dirty_islands(), &[island]);
+
+        invalidation.mark_retired(island);
+
+        assert!(invalidation.topology_dirty_islands().is_empty());
+        assert!(invalidation.numerical_dirty_islands().is_empty());
+        assert!(invalidation.binding_dirty_islands().is_empty());
+        assert_eq!(invalidation.retired_islands(), &[island]);
+
+        invalidation.mark_binding_dirty(island);
+        invalidation.mark_numerical_dirty(island);
+        invalidation.mark_topology_dirty(island);
+
+        assert!(invalidation.binding_dirty_islands().is_empty());
+        assert!(invalidation.numerical_dirty_islands().is_empty());
+        assert!(invalidation.topology_dirty_islands().is_empty());
+        assert_eq!(invalidation.retired_islands(), &[island]);
+    }
+
+    #[test]
     fn tick_delay_terminals_attach_to_their_component_islands() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
@@ -2406,5 +2515,38 @@ mod tests {
         assert_eq!(input_net.terminal_components(), &[input_component],);
 
         assert_eq!(output_net.terminal_components(), &[output_component],);
+    }
+
+    #[test]
+    fn topology_rebuild_uses_live_device_iteration_across_removed_id_holes() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let removed = device(1);
+        let live = device(2);
+
+        network
+            .add_device(
+                &definitions,
+                removed,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        network
+            .add_device(&definitions, live, PrimitiveElementKind::Conductance.into())
+            .unwrap();
+
+        network.remove_device(removed).unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let component = DeviceComponent::new(live, DevicePartitionId::new(0));
+
+        assert!(
+            topology
+                .island(topology.component_island(component))
+                .is_some()
+        );
     }
 }

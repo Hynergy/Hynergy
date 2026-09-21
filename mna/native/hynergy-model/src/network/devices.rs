@@ -1,5 +1,4 @@
-use super::slot::DeviceSlot;
-use super::{ConnectionType, Network, NetworkModelError};
+use super::{ConnectionType, DeviceInsertResult, DeviceRemoveResult, Network, NetworkModelError};
 use crate::device::definition::{DefinitionId, DeviceId, TerminalId};
 use crate::device::registry::DefinitionRegistry;
 use crate::parameter::ParameterId;
@@ -11,13 +10,13 @@ impl Network {
         definition_registry: &DefinitionRegistry,
         id: DeviceId,
         definition_id: DefinitionId,
-    ) -> Result<(), NetworkModelError> {
+    ) -> Result<DeviceInsertResult, NetworkModelError> {
         if id.get() > MAX_PACKED_ID {
             return Err(NetworkModelError::IdExceeds31Bit { id: id.id() });
         }
 
         let index = id.index();
-        let len = self.devices.len();
+        let len = self.device_arena.directory_len();
 
         if index > len {
             return Err(NetworkModelError::IdOutOfBound {
@@ -25,7 +24,8 @@ impl Network {
                 upper_bound: len,
             });
         }
-        if index < len && self.devices[index].is_some() {
+
+        if index < len && self.device_arena.is_assigned(id) {
             return Err(NetworkModelError::IdAlreadyAssigned { id: id.id() });
         }
 
@@ -35,20 +35,13 @@ impl Network {
                 .ok_or(NetworkModelError::UnknownDefinition {
                     definition: definition_id,
                 })?;
-        let slot = Some(DeviceSlot::new(definition_id, definition));
 
-        if index == len {
-            self.devices.push(slot);
-        } else {
-            self.devices[index] = slot;
-        }
-
-        Ok(())
+        self.device_arena.insert(id, definition_id, definition)
     }
 
-    pub fn remove_device(&mut self, id: DeviceId) -> Result<(), NetworkModelError> {
+    pub fn remove_device(&mut self, id: DeviceId) -> Result<DeviceRemoveResult, NetworkModelError> {
         let index = id.index();
-        let len = self.devices.len();
+        let len = self.device_arena.directory_len();
 
         if index >= len {
             return Err(NetworkModelError::IdOutOfBound {
@@ -57,15 +50,10 @@ impl Network {
             });
         }
 
-        let slot = self.devices[index]
-            .take()
-            .ok_or(NetworkModelError::IdNotAssigned {
-                ty: ConnectionType::Device,
-                id: id.id(),
-            })?;
+        let terminals = self.device(id)?.terminals().to_vec();
 
-        for (terminal_index, connection) in slot.terminals().iter().enumerate() {
-            let Some(connection) = *connection else {
+        for (terminal_index, connection) in terminals.into_iter().enumerate() {
+            let Some(connection) = connection else {
                 continue;
             };
 
@@ -76,15 +64,16 @@ impl Network {
 
             let terminal = TerminalId::from(
                 u32::try_from(terminal_index)
-                    .expect("definition_id terminal count fits in TerminalId"),
+                    .expect("definition terminal count fits in TerminalId"),
             );
+
             let removed_ref = Self::terminal_ref(id, terminal)
                 .expect("stored terminal index fits packed connection");
 
             self.unlink_one_way(connection, removed_ref);
         }
 
-        Ok(())
+        self.device_arena.remove(id)
     }
 
     pub fn set_device_parameter(
@@ -94,22 +83,26 @@ impl Network {
         parameter: ParameterId,
         value: f64,
     ) -> Result<(), NetworkModelError> {
-        let slot = Self::device_mut(&mut self.devices, device)?;
-        let definition = definition_registry.get(slot.definition_id()).ok_or(
-            NetworkModelError::UnknownDefinition {
-                definition: slot.definition_id(),
-            },
-        )?;
+        let definition_id = self.device(device)?.definition_id();
+
+        let definition =
+            definition_registry
+                .get(definition_id)
+                .ok_or(NetworkModelError::UnknownDefinition {
+                    definition: definition_id,
+                })?;
+
         let constraints = definition
             .parameters()
             .get(parameter.index())
             .ok_or(NetworkModelError::InvalidParameter { parameter })?;
 
-        constraints
-            .validate(value)
-            .map_err(|source| NetworkModelError::ParameterConstraint { parameter, source })?;
+        constraints.validate(value).map_err(|source| {
+            NetworkModelError::ParameterConstraintViolation { parameter, source }
+        })?;
 
-        slot.set_parameter(parameter, value);
-        Ok(())
+        debug_assert!(value.is_finite());
+
+        self.device_arena.set_parameter(device, parameter, value)
     }
 }

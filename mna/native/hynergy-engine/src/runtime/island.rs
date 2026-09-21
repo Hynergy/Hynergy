@@ -41,7 +41,7 @@ impl NonlinearScratch {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub(crate) enum IslandRuntimeError {
     #[error("device {device:?} no longer exists")]
     MissingDevice { device: DeviceId },
@@ -503,24 +503,19 @@ impl IslandRuntime {
         for partition in &self.partition_inputs {
             let device = partition.device();
 
-            let device_slot = network
-                .devices()
-                .get(device.index())
-                .and_then(Option::as_ref)
-                .ok_or(IslandRuntimeError::MissingDevice { device })?;
+            let device_view = network
+                .device(device)
+                .map_err(|_| IslandRuntimeError::MissingDevice { device })?;
 
             let parameter_ids = partition.definition_parameters();
-
             let parameter_inputs = partition.parameter_inputs();
 
-            debug_assert_eq!(parameter_ids.len(), parameter_inputs.len(),);
+            debug_assert_eq!(parameter_ids.len(), parameter_inputs.len());
 
             for (&parameter, &input) in parameter_ids.iter().zip(parameter_inputs) {
-                let value = device_slot
-                    .parameters()
-                    .get(parameter.index())
-                    .copied()
-                    .flatten()
+                let value = device_view
+                    .parameter(parameter)
+                    .expect("compiled parameter ID must exist in its device definition")
                     .ok_or(IslandRuntimeError::MissingParameter { device, parameter })?;
 
                 if self.workspace.value(input.value()) == value {

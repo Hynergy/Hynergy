@@ -57,6 +57,15 @@ impl CompiledDefinition {
             }
         }
 
+        if let Some(index) = state_writers.iter().position(Option::is_none) {
+            return Err(DefinitionCompileError::MissingStateWriter {
+                state: DefinitionStateId::new(
+                    u32::try_from(index)
+                        .expect("definition state index must fit DefinitionStateId"),
+                ),
+            });
+        }
+
         Ok(Self {
             partitions,
             state_count,
@@ -365,6 +374,9 @@ pub(crate) enum DefinitionCompileError {
         first: DevicePartitionId,
         second: DevicePartitionId,
     },
+
+    #[error("definition state {state:?} has no next-state writer")]
+    MissingStateWriter { state: DefinitionStateId },
 }
 
 impl CompiledDefinitionTemplate {
@@ -1525,6 +1537,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stateful_primitives_have_complete_state_writer_coverage() {
+        let registry = DefinitionRegistry::new();
+
+        for kind in [
+            PrimitiveElementKind::Capacitor,
+            PrimitiveElementKind::Inductor,
+            PrimitiveElementKind::TickDelay,
+            PrimitiveElementKind::SchmittBuffer,
+        ] {
+            let definition = registry.get(DefinitionId::from(kind)).unwrap();
+
+            assert!(
+                definition.state_count() > 0,
+                "{kind:?} should remain stateful",
+            );
+
+            let compiled = CompiledDefinition::compile(&registry, definition)
+                .unwrap_or_else(|error| panic!("{kind:?} failed to compile: {error}"));
+
+            assert_eq!(compiled.state_count(), definition.state_count(), "{kind:?}",);
+        }
+    }
+
+    #[test]
+    fn composite_state_flattening_preserves_complete_writer_coverage() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let input_positive = builder.add_terminal().unwrap();
+            let input_negative = builder.add_terminal().unwrap();
+            let output_positive = builder.add_terminal().unwrap();
+            let output_negative = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::TickDelay.into(),
+                    vec![
+                        input_positive,
+                        input_negative,
+                        output_positive,
+                        output_negative,
+                    ],
+                    vec![ValueRef::Literal(0.0)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.state_count(), 1);
+
+        let compiled = CompiledDefinition::compile(&registry, &definition).unwrap();
+
+        assert_eq!(compiled.state_count(), 1);
+    }
+
     fn partition_with_state_writes(states: &[DefinitionStateId]) -> CompiledPartitionTemplate {
         CompiledPartitionTemplate {
             definition_terminals: SmallVec::new(),
@@ -1559,6 +1630,15 @@ mod tests {
                 second: DevicePartitionId::new(1),
             },
         );
+    }
+
+    #[test]
+    fn compiled_definition_rejects_missing_state_writer() {
+        let state = DefinitionStateId::new(0);
+
+        let error = CompiledDefinition::new(Vec::new().into_boxed_slice(), 1).unwrap_err();
+
+        assert_eq!(error, DefinitionCompileError::MissingStateWriter { state },);
     }
 
     #[test]
