@@ -1,6 +1,6 @@
 use super::island::IslandRuntimeError;
 use crate::compile::island::{CompiledPartitionInputs, DeviceState, IslandStateLayout};
-use crate::state::PhysicalStateAddress;
+use crate::state::{PhysicalStateAddress, PhysicalStateStore};
 use hynergy_ir::{InputSlot, StateSlot};
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::{DeviceLocation, Network};
@@ -201,7 +201,11 @@ impl IslandBindings {
     }
 
     #[cfg(debug_assertions)]
-    pub(super) fn debug_assert_valid(&self, network: &Network) {
+    pub(super) fn debug_assert_valid(
+        &self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) {
         for binding in &self.parameters {
             let current = network
                 .device_location(binding.device())
@@ -246,6 +250,13 @@ impl IslandBindings {
                 state.state().index(),
                 "state binding index must match its semantic state",
             );
+
+            debug_assert!(
+                physical_state.get_at(address).is_some(),
+                "state binding must address a live state scalar for device {:?}, state {:?}",
+                state.device(),
+                state.state(),
+            );
         }
     }
 
@@ -267,6 +278,7 @@ mod tests {
     use crate::compile::island::{
         IslandNode, IslandPartitionSpec, compile_island_parts, compile_topology_island,
     };
+    use crate::state::PhysicalStateStore;
     use crate::topology::{DerivedTopology, DeviceComponent};
     use hynergy_model::device::definition::{
         DefinitionId, DeviceId, DevicePartitionId, PrimitiveElementKind,
@@ -419,7 +431,9 @@ mod tests {
 
         assert_eq!(network.device_location(moved).unwrap().row(), 1,);
 
-        bindings.debug_assert_valid(&network);
+        let physical_state = PhysicalStateStore::new();
+
+        bindings.debug_assert_valid(&network, &physical_state);
     }
 
     #[test]
@@ -476,6 +490,54 @@ mod tests {
 
         assert_eq!(network.device_location(moved).unwrap().row(), 1,);
 
-        bindings.debug_assert_valid(&network);
+        let physical_state = PhysicalStateStore::new();
+
+        bindings.debug_assert_valid(&network, &physical_state);
+    }
+
+    #[test]
+    #[should_panic(expected = "state binding must address a live state scalar")]
+    fn debug_validation_detects_missing_state_sidecar_scalar() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let device = DeviceId::try_from(1).unwrap();
+        let definition = DefinitionId::from(PrimitiveElementKind::Capacitor);
+
+        network
+            .add_device(&definitions, device, definition)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(device, DevicePartitionId::new(0)),
+        );
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let parts = compiled.into_parts();
+
+        let bindings = IslandBindings::new(
+            &network,
+            &parts.states,
+            &parts.partition_inputs,
+            parts.ir.state_inputs(),
+        )
+        .unwrap();
+
+        assert!(
+            !bindings.state_inputs().is_empty(),
+            "capacitor fixture must produce a state-input binding",
+        );
+
+        let physical_state = PhysicalStateStore::new();
+
+        bindings.debug_assert_valid(&network, &physical_state);
     }
 }

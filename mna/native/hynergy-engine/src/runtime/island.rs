@@ -1,7 +1,7 @@
 use crate::compile::definition::DefinitionStateId;
 use crate::compile::island::{
-    CompiledIsland, CompiledIslandParts, CompiledObserverOutput, CompiledPartitionInputs,
-    DeviceObserver, DeviceState, IslandStateLayout,
+    CompiledIsland, CompiledIslandParts, CompiledObserverOutput, DeviceObserver, DeviceState,
+    IslandStateLayout,
 };
 use crate::compile::island_ir::CompiledIslandIr;
 #[cfg(feature = "solver-profiling")]
@@ -15,7 +15,7 @@ use hynergy_model::parameter::ParameterId;
 use thiserror::Error;
 
 use crate::runtime::bindings::IslandBindings;
-use crate::state::PhysicalStateAddress;
+use crate::state::{PhysicalStateAddress, PhysicalStateStore};
 #[cfg(test)]
 use {
     crate::compile::island::{IslandNode, IslandUnknownLayout},
@@ -78,7 +78,6 @@ pub(crate) struct IslandRuntime {
     system: MnaSystem,
     ir: CompiledIslandIr,
     states: IslandStateLayout,
-    partition_inputs: Box<[CompiledPartitionInputs]>,
     bindings: IslandBindings,
     workspace: ValueWorkspace,
     solution: Box<[f64]>,
@@ -158,7 +157,6 @@ impl IslandRuntime {
             system,
             ir,
             states,
-            partition_inputs,
             bindings,
             observer_outputs,
             observer_outputs_dirty: false,
@@ -595,8 +593,12 @@ impl IslandRuntime {
 
     #[cfg(debug_assertions)]
     #[inline]
-    pub(crate) fn debug_assert_bindings_valid(&self, network: &Network) {
-        self.bindings.debug_assert_valid(network);
+    pub(crate) fn debug_assert_bindings_valid(
+        &self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) {
+        self.bindings.debug_assert_valid(network, physical_state);
     }
 
     #[cfg(feature = "solver-profiling")]

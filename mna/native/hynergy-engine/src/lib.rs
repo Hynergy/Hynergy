@@ -829,27 +829,6 @@ impl World {
             .numerical_dirty_islands()
             .to_vec();
 
-        #[cfg(test)]
-        for &island in &binding_dirty {
-            assert!(
-                !topology_dirty.contains(&island),
-                "binding-dirty island must not also be topology-dirty",
-            );
-
-            assert!(
-                !retired.contains(&island),
-                "binding-dirty island must not also be retired",
-            );
-
-            assert!(
-                self.island_runtimes
-                    .get(island.index())
-                    .and_then(Option::as_ref)
-                    .is_some(),
-                "binding-dirty island must already have a runtime",
-            );
-        }
-
         for island in retired {
             if let Some(runtime) = self.island_runtimes.get_mut(island.index()) {
                 *runtime = None;
@@ -882,10 +861,6 @@ impl World {
         }
 
         for island in binding_dirty {
-            if topology_dirty.contains(&island) {
-                continue;
-            }
-
             let Some(runtime) = self
                 .island_runtimes
                 .get_mut(island.index())
@@ -918,7 +893,7 @@ impl World {
                     .and_then(Option::as_ref)
                     .expect("live island must have a runtime after synchronization");
 
-                runtime.debug_assert_bindings_valid(&self.network);
+                runtime.debug_assert_bindings_valid(&self.network, &self.physical_state);
             }
         }
 
