@@ -1,9 +1,7 @@
+use crate::compile::definition::{DefinitionStateId, DefinitionStateInitializer};
 use crate::compile::island::DeviceState;
 use crate::runtime::island::StagedStateWrite;
-use hynergy_model::circuit::ValueRef;
-use hynergy_model::device::definition::{
-    DeviceBody, DeviceDefinition, DeviceId, PrimitiveElementKind,
-};
+use hynergy_model::device::definition::{DeviceDefinition, DeviceId};
 use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{
     DeviceInsertResult, DeviceLocation, DeviceRemoveResult, Network, PreparedDeviceInsert,
@@ -135,11 +133,6 @@ pub(crate) struct PhysicalStateStore {
 }
 
 impl PhysicalStateStore {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn prepare_add_device(
         &mut self,
         definition: &DeviceDefinition,
@@ -193,6 +186,19 @@ impl PhysicalStateStore {
         }
     }
 
+    #[inline]
+    fn state_not_initialized(device: DeviceId, state_index: usize) -> PhysicalStateError {
+        PhysicalStateError::StateNotInitialized {
+            state: DeviceState::new(
+                device,
+                DefinitionStateId::new(
+                    u32::try_from(state_index)
+                        .expect("definition state index must fit DefinitionStateId"),
+                ),
+            ),
+        }
+    }
+
     pub(crate) fn commit_add_device(
         &mut self,
         prepared: PreparedStateInsert,
@@ -222,86 +228,7 @@ impl PhysicalStateStore {
         chunk.push_row();
     }
 
-    pub(crate) fn initialize_device(
-        &mut self,
-        definitions: &DefinitionRegistry,
-        network: &Network,
-        device: DeviceId,
-    ) -> Result<(), PhysicalStateError> {
-        let location = network
-            .device_location(device)
-            .expect("state initialization device must exist");
-
-        let chunk_index = location.chunk_index() as usize;
-        let row = location.row() as usize;
-
-        {
-            let chunk = self
-                .chunks
-                .get(chunk_index)
-                .expect("live model chunk must have an aligned state chunk");
-
-            debug_assert!(row < chunk.row_count());
-
-            if chunk.is_initialized(row) {
-                return Ok(());
-            }
-        }
-
-        let definition_id = network
-            .device_definition_id(device)
-            .expect("state initialization device must exist");
-
-        let definition = definitions
-            .get(definition_id)
-            .expect("state initialization definition must remain registered");
-
-        let device_view = network
-            .device(device)
-            .expect("state initialization device must exist");
-
-        let parameters = device_view
-            .parameters()
-            .enumerate()
-            .map(|(index, value)| {
-                let parameter = ParameterId::new(
-                    u32::try_from(index).expect("definition parameter index must fit ParameterId"),
-                );
-
-                match value {
-                    Some(value) => InitialParameterValue::Value(value),
-                    None => InitialParameterValue::Unassigned(parameter),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut state = Vec::with_capacity(definition.state_count());
-
-        initialize_definition_state(definitions, definition, &parameters, device, &mut state)?;
-
-        debug_assert_eq!(
-            state.len(),
-            definition.state_count(),
-            "recursive state initialization must produce exactly the definition state count",
-        );
-
-        let chunk = self
-            .chunks
-            .get_mut(chunk_index)
-            .expect("live model chunk must have an aligned state chunk");
-
-        debug_assert_eq!(chunk.state_count, definition.state_count());
-        debug_assert!(row < chunk.row_count());
-
-        chunk.row_values_mut(row).copy_from_slice(&state);
-
-        if chunk.state_count == 0 {
-            chunk.set_initialized(row);
-        }
-
-        Ok(())
-    }
-
+    #[cfg(test)]
     #[inline]
     pub(crate) fn get(&self, network: &Network, state: DeviceState) -> Option<f64> {
         #[cfg(test)]
@@ -439,6 +366,51 @@ impl PhysicalStateStore {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) fn read_logical_at(
+        &self,
+        network: &Network,
+        device: DeviceId,
+        address: PhysicalStateAddress,
+        initializer: DefinitionStateInitializer,
+    ) -> Result<f64, PhysicalStateError> {
+        let chunk = self
+            .chunks
+            .get(address.location().chunk_index() as usize)
+            .ok_or_else(|| Self::state_not_initialized(device, address.state_index()))?;
+
+        let row = address.location().row() as usize;
+        let state_index = address.state_index();
+
+        if row >= chunk.row_count() || state_index >= chunk.state_count {
+            return Err(Self::state_not_initialized(device, state_index));
+        }
+
+        if chunk.is_initialized(row) {
+            #[cfg(test)]
+            self.physical_read_count
+                .set(self.physical_read_count.get() + 1);
+
+            return Ok(chunk.row_values(row)[state_index]);
+        }
+
+        match initializer {
+            DefinitionStateInitializer::Literal(value) => Ok(value),
+
+            DefinitionStateInitializer::Parameter(parameter) => {
+                match network.parameter_at_location(address.location(), parameter) {
+                    Some(Some(value)) => Ok(value),
+
+                    Some(None) => {
+                        Err(PhysicalStateError::MissingInitialParameter { device, parameter })
+                    }
+
+                    None => Err(Self::state_not_initialized(device, state_index)),
+                }
+            }
+        }
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn assert_aligned(&self, definitions: &DefinitionRegistry, network: &Network) {
         let mut expected_rows = Vec::<usize>::new();
@@ -536,6 +508,23 @@ impl PhysicalStateStore {
 #[cfg(test)]
 impl PhysicalStateStore {
     #[inline]
+    pub(crate) fn is_initialized_at(&self, location: DeviceLocation) -> bool {
+        let chunk = self
+            .chunks
+            .get(location.chunk_index() as usize)
+            .expect("tested physical state chunk must exist");
+
+        let row = location.row() as usize;
+
+        assert!(
+            row < chunk.row_count(),
+            "tested physical state row must exist",
+        );
+
+        chunk.is_initialized(row)
+    }
+
+    #[inline]
     pub(crate) fn reset_read_counts(&self) {
         self.semantic_read_count.set(0);
         self.physical_read_count.set(0);
@@ -578,12 +567,6 @@ impl PhysicalStateAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum InitialParameterValue {
-    Value(f64),
-    Unassigned(ParameterId),
-}
-
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysicalStateError {
     #[error("device {device:?} initial parameter {parameter:?} is not assigned")]
@@ -594,82 +577,6 @@ pub(crate) enum PhysicalStateError {
 
     #[error("state {state:?} is not initialized")]
     StateNotInitialized { state: DeviceState },
-}
-
-fn initialize_definition_state(
-    definitions: &DefinitionRegistry,
-    definition: &DeviceDefinition,
-    parameters: &[InitialParameterValue],
-    device: DeviceId,
-    state: &mut Vec<f64>,
-) -> Result<(), PhysicalStateError> {
-    debug_assert_eq!(
-        parameters.len(),
-        definition.parameters().len(),
-        "initial parameter mapping must match definition",
-    );
-
-    match definition.body() {
-        DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
-            debug_assert_eq!(definition.state_count(), 1);
-
-            let initial = match parameters[0] {
-                InitialParameterValue::Value(value) => value,
-
-                InitialParameterValue::Unassigned(parameter) => {
-                    return Err(PhysicalStateError::MissingInitialParameter { device, parameter });
-                }
-            };
-
-            state.push(initial);
-        }
-
-        DeviceBody::Primitive(
-            PrimitiveElementKind::Capacitor
-            | PrimitiveElementKind::Inductor
-            | PrimitiveElementKind::SchmittBuffer,
-        ) => {
-            debug_assert_eq!(definition.state_count(), 1);
-
-            state.push(0.0);
-        }
-
-        DeviceBody::Primitive(_) => {
-            debug_assert_eq!(definition.state_count(), 0);
-        }
-
-        DeviceBody::Composite(circuit) => {
-            for element in circuit.elements() {
-                let child = definitions
-                    .get(element.definition())
-                    .expect("registered composite child must remain registered");
-
-                let mut child_parameters = Vec::with_capacity(element.parameters().len());
-
-                for value in element.parameters() {
-                    let value = match *value {
-                        ValueRef::Literal(value) => InitialParameterValue::Value(value),
-
-                        ValueRef::Parameter(parameter) => parameters[parameter.index()],
-                    };
-
-                    child_parameters.push(value);
-                }
-
-                let before = state.len();
-
-                initialize_definition_state(definitions, child, &child_parameters, device, state)?;
-
-                debug_assert_eq!(
-                    state.len() - before,
-                    child.state_count(),
-                    "child state initialization must match child definition state count",
-                );
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -755,7 +662,7 @@ mod tests {
     fn physical_state_row_swap_preserves_moved_device_history() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
-        let mut state = PhysicalStateStore::new();
+        let mut state = PhysicalStateStore::default();
 
         for raw in 1..=3 {
             add_stateful_device(
@@ -797,7 +704,7 @@ mod tests {
     fn physical_state_chunk_swap_preserves_all_moved_rows() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
-        let mut state = PhysicalStateStore::new();
+        let mut state = PhysicalStateStore::default();
 
         add_stateful_device(
             &definitions,
@@ -842,7 +749,7 @@ mod tests {
     fn physical_state_address_reads_bound_chunk_row_directly() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
-        let mut state = PhysicalStateStore::new();
+        let mut state = PhysicalStateStore::default();
 
         let device = device(1);
         let definition_id = DefinitionId::from(PrimitiveElementKind::TickDelay);

@@ -1,5 +1,6 @@
 use crate::compile::definition::{
     CompiledDefinition, CompiledPartitionTemplate, DefinitionCompileError, DefinitionStateId,
+    DefinitionStateInitializer,
 };
 use crate::compile::island_ir::{CompiledIslandIr, IslandIrBuildError, IslandIrBuilder};
 use crate::compile::state::{BoundStateSlots, StateAllocationError};
@@ -164,6 +165,7 @@ impl DeviceState {
 #[derive(Debug, Default)]
 pub(crate) struct IslandStateLayout {
     states: SmallVec<[DeviceState; 2]>,
+    initializers: SmallVec<[DefinitionStateInitializer; 2]>,
 }
 
 impl IslandStateLayout {
@@ -176,15 +178,25 @@ impl IslandStateLayout {
         &mut self,
         device: DeviceId,
         definition_states: &[DefinitionStateId],
+        definition_initializers: &[DefinitionStateInitializer],
     ) -> Result<BoundStateSlots, StateAllocationError> {
         let mut slots = SmallVec::<[StateSlot; 4]>::with_capacity(definition_states.len());
 
         for &state in definition_states {
             let key = DeviceState::new(device, state);
 
+            let initializer = *definition_initializers
+                .get(state.index())
+                .expect("compiled definition state must have an initializer");
+
             let slot = if let Some(index) =
                 self.states.iter().position(|&candidate| candidate == key)
             {
+                debug_assert_eq!(
+                    self.initializers[index], initializer,
+                    "shared logical state must have one initializer",
+                );
+
                 StateSlot::new(u32::try_from(index).expect("island state index must fit StateSlot"))
             } else {
                 if self.states.len() >= crate::compile::state::MAX_STATE_COUNT {
@@ -197,6 +209,7 @@ impl IslandStateLayout {
                 let slot = StateSlot::new(self.states.len() as u32);
 
                 self.states.push(key);
+                self.initializers.push(initializer);
 
                 slot
             };
@@ -204,7 +217,14 @@ impl IslandStateLayout {
             slots.push(slot);
         }
 
+        debug_assert_eq!(self.states.len(), self.initializers.len(),);
+
         Ok(BoundStateSlots::new(slots))
+    }
+
+    #[inline]
+    pub(crate) fn state_initializer(&self, slot: StateSlot) -> Option<DefinitionStateInitializer> {
+        self.initializers.get(slot.index()).copied()
     }
 
     #[inline]
@@ -222,6 +242,7 @@ impl IslandStateLayout {
 pub(crate) struct IslandPartitionSpec<'a> {
     device: DeviceId,
     partition: &'a CompiledPartitionTemplate,
+    state_initializers: &'a [DefinitionStateInitializer],
     terminal_nodes: &'a [IslandNode],
 }
 
@@ -230,11 +251,13 @@ impl<'a> IslandPartitionSpec<'a> {
     pub(crate) const fn new(
         device: DeviceId,
         partition: &'a CompiledPartitionTemplate,
+        state_initializers: &'a [DefinitionStateInitializer],
         terminal_nodes: &'a [IslandNode],
     ) -> Self {
         Self {
             device,
             partition,
+            state_initializers,
             terminal_nodes,
         }
     }
@@ -375,8 +398,11 @@ pub(crate) fn compile_island_parts(
             &mut unknown_allocator,
         )?;
 
-        let states = state_layout
-            .bind_partition_states(partition.device, partition.partition.definition_states())?;
+        let states = state_layout.bind_partition_states(
+            partition.device,
+            partition.partition.definition_states(),
+            partition.state_initializers,
+        )?;
 
         bound_partitions.push(BoundIslandPartition {
             device: partition.device,
@@ -585,6 +611,7 @@ pub(crate) fn compile_topology_island(
         partitions.push(IslandPartitionSpec::new(
             component.device(),
             partition,
+            compiled.state_initializers(),
             &terminal_nodes[index],
         ));
     }
@@ -875,7 +902,12 @@ mod test {
 
         let terminal_nodes = [node_a, node_b];
 
-        let parts = [IslandPartitionSpec::new(device, partition, &terminal_nodes)];
+        let parts = [IslandPartitionSpec::new(
+            device,
+            partition,
+            compiled_definition.state_initializers(),
+            &terminal_nodes,
+        )];
 
         let island = compile_island_parts(&[node_a, node_b], &parts).unwrap();
 

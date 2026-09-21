@@ -15,17 +15,25 @@ use thiserror::Error;
 
 define_id!(DefinitionStateId: u32);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DefinitionStateInitializer {
+    Literal(f64),
+    Parameter(ParameterId),
+}
+
 #[derive(Debug)]
 pub(crate) struct CompiledDefinition {
     partitions: Box<[CompiledPartitionTemplate]>,
-    state_count: usize,
+    state_initializers: Box<[DefinitionStateInitializer]>,
 }
 
 impl CompiledDefinition {
     fn new(
         partitions: Box<[CompiledPartitionTemplate]>,
-        state_count: usize,
+        state_initializers: Box<[DefinitionStateInitializer]>,
     ) -> Result<Self, DefinitionCompileError> {
+        let state_count = state_initializers.len();
+
         let mut state_writers = vec![None; state_count];
 
         for (partition_index, partition) in partitions.iter().enumerate() {
@@ -68,7 +76,7 @@ impl CompiledDefinition {
 
         Ok(Self {
             partitions,
-            state_count,
+            state_initializers,
         })
     }
 
@@ -76,12 +84,13 @@ impl CompiledDefinition {
         registry: &DefinitionRegistry,
         definition: &DeviceDefinition,
     ) -> Result<Self, DefinitionCompileError> {
-        let partitions = match definition.body() {
-            DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => {
-                compile_tick_delay_partitions(definition)?
-            }
+        let (partitions, state_initializers) = match definition.body() {
+            DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => (
+                compile_tick_delay_partitions(definition)?,
+                primitive_state_initializers(PrimitiveElementKind::TickDelay),
+            ),
 
-            DeviceBody::Primitive(_) => {
+            DeviceBody::Primitive(kind) => {
                 let template = CompiledDefinitionTemplate::compile(definition)?;
 
                 debug_assert_eq!(
@@ -93,6 +102,7 @@ impl CompiledDefinition {
                 let partition = DevicePartitionId::new(0);
 
                 let definition_parameters = definition_parameters(definition);
+
                 let definition_states = definition_states(definition);
 
                 let definition_observers =
@@ -104,7 +114,7 @@ impl CompiledDefinition {
                     "primitive template outputs must match primitive observers",
                 );
 
-                vec![CompiledPartitionTemplate {
+                let partitions = vec![CompiledPartitionTemplate {
                     definition_terminals: definition_terminals_for_partition(definition, partition),
                     definition_parameters,
                     definition_state_reads: definition_states.clone(),
@@ -113,12 +123,12 @@ impl CompiledDefinition {
                     definition_observers,
                     template,
                 }]
-                .into_boxed_slice()
+                .into_boxed_slice();
+
+                (partitions, primitive_state_initializers(*kind))
             }
 
-            DeviceBody::Composite(circuit) => {
-                compile_composite_partitions(registry, definition, circuit)?
-            }
+            DeviceBody::Composite(circuit) => compile_composite(registry, definition, circuit)?,
         };
 
         debug_assert_eq!(
@@ -127,17 +137,13 @@ impl CompiledDefinition {
             "compiled partition count must match definition",
         );
 
-        Self::new(partitions, definition.state_count())
-    }
+        debug_assert_eq!(
+            state_initializers.len(),
+            definition.state_count(),
+            "compiled state initializers must cover the definition state space",
+        );
 
-    #[inline]
-    pub(crate) fn partition_count(&self) -> usize {
-        self.partitions.len()
-    }
-
-    #[inline]
-    pub(crate) const fn state_count(&self) -> usize {
-        self.state_count
+        Self::new(partitions, state_initializers)
     }
 
     #[inline]
@@ -146,6 +152,37 @@ impl CompiledDefinition {
         partition: DevicePartitionId,
     ) -> Option<&CompiledPartitionTemplate> {
         self.partitions.get(partition.index())
+    }
+
+    #[inline]
+    pub(crate) fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+
+    #[inline]
+    pub(crate) fn state_count(&self) -> usize {
+        self.state_initializers.len()
+    }
+
+    #[inline]
+    pub(crate) fn state_initializers(&self) -> &[DefinitionStateInitializer] {
+        &self.state_initializers
+    }
+}
+
+fn primitive_state_initializers(kind: PrimitiveElementKind) -> Box<[DefinitionStateInitializer]> {
+    match kind {
+        PrimitiveElementKind::Capacitor
+        | PrimitiveElementKind::Inductor
+        | PrimitiveElementKind::SchmittBuffer => {
+            vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice()
+        }
+
+        PrimitiveElementKind::TickDelay => {
+            vec![DefinitionStateInitializer::Parameter(ParameterId::new(0))].into_boxed_slice()
+        }
+
+        _ => Vec::new().into_boxed_slice(),
     }
 }
 
@@ -685,11 +722,16 @@ fn compile_primitive(
     Ok(builder.finish()?)
 }
 
-fn compile_composite_partitions(
+type CompiledComposite = (
+    Box<[CompiledPartitionTemplate]>,
+    Box<[DefinitionStateInitializer]>,
+);
+
+fn compile_composite(
     registry: &DefinitionRegistry,
     definition: &DeviceDefinition,
     circuit: &Circuit,
-) -> Result<Box<[CompiledPartitionTemplate]>, DefinitionCompileError> {
+) -> Result<CompiledComposite, DefinitionCompileError> {
     let mut compiled_children = Vec::with_capacity(circuit.elements().len());
 
     for element in circuit.elements() {
@@ -699,6 +741,36 @@ fn compile_composite_partitions(
 
         compiled_children.push(CompiledDefinition::compile(registry, child_definition)?);
     }
+
+    let mut state_initializers = Vec::with_capacity(definition.state_count());
+
+    for (element, child) in circuit.elements().iter().zip(&compiled_children) {
+        for &initializer in child.state_initializers() {
+            let initializer = match initializer {
+                DefinitionStateInitializer::Literal(value) => {
+                    DefinitionStateInitializer::Literal(value)
+                }
+
+                DefinitionStateInitializer::Parameter(parameter) => {
+                    match element.parameters()[parameter.index()] {
+                        ValueRef::Literal(value) => DefinitionStateInitializer::Literal(value),
+
+                        ValueRef::Parameter(parameter) => {
+                            DefinitionStateInitializer::Parameter(parameter)
+                        }
+                    }
+                }
+            };
+
+            state_initializers.push(initializer);
+        }
+    }
+
+    debug_assert_eq!(
+        state_initializers.len(),
+        definition.state_count(),
+        "flattened child state initializers must cover composite state space",
+    );
 
     let mut element_state_offsets = Vec::with_capacity(compiled_children.len());
 
@@ -736,7 +808,10 @@ fn compile_composite_partitions(
         )?);
     }
 
-    Ok(partitions.into_boxed_slice())
+    Ok((
+        partitions.into_boxed_slice(),
+        state_initializers.into_boxed_slice(),
+    ))
 }
 
 fn compile_composite_partition(
@@ -1492,7 +1567,7 @@ mod tests {
         definition::{DefinitionId, PrimitiveElementKind},
         registry::DefinitionRegistry,
     };
-    use hynergy_model::parameter::ParameterId;
+    use hynergy_model::parameter::{ParameterConstraints, ParameterId};
 
     fn state_slots(indices: &[u32]) -> BoundStateSlots {
         BoundStateSlots::new(indices.iter().copied().map(StateSlot::new).collect())
@@ -1618,7 +1693,7 @@ mod tests {
                 partition_with_state_writes(&[state]),
             ]
             .into_boxed_slice(),
-            1,
+            vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice(),
         )
         .unwrap_err();
 
@@ -1636,7 +1711,11 @@ mod tests {
     fn compiled_definition_rejects_missing_state_writer() {
         let state = DefinitionStateId::new(0);
 
-        let error = CompiledDefinition::new(Vec::new().into_boxed_slice(), 1).unwrap_err();
+        let error = CompiledDefinition::new(
+            Vec::new().into_boxed_slice(),
+            vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice(),
+        )
+        .unwrap_err();
 
         assert_eq!(error, DefinitionCompileError::MissingStateWriter { state },);
     }
@@ -2965,5 +3044,94 @@ mod tests {
         );
 
         assert_eq!(partition.template().output_count(), 1);
+    }
+
+    #[test]
+    fn stateful_primitives_compile_logical_state_initializers() {
+        let registry = DefinitionRegistry::new();
+
+        let cases = [
+            (
+                PrimitiveElementKind::Capacitor,
+                DefinitionStateInitializer::Literal(0.0),
+            ),
+            (
+                PrimitiveElementKind::Inductor,
+                DefinitionStateInitializer::Literal(0.0),
+            ),
+            (
+                PrimitiveElementKind::TickDelay,
+                DefinitionStateInitializer::Parameter(ParameterId::new(0)),
+            ),
+            (
+                PrimitiveElementKind::SchmittBuffer,
+                DefinitionStateInitializer::Literal(0.0),
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let definition = registry.get(DefinitionId::from(kind)).unwrap();
+
+            let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
+
+            assert_eq!(compiled.state_initializers(), &[expected], "{kind:?}",);
+        }
+    }
+
+    #[test]
+    fn composite_state_initializers_flatten_child_parameter_mappings() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let initial = builder
+                .add_parameter(ParameterConstraints::default())
+                .unwrap();
+
+            let first_terminals = [
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+            ];
+
+            let second_terminals = [
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+            ];
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::TickDelay.into(),
+                    first_terminals.to_vec(),
+                    vec![ValueRef::Parameter(initial)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::TickDelay.into(),
+                    second_terminals.to_vec(),
+                    vec![ValueRef::Literal(4.25)],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.state_count(), 2);
+
+        let compiled = CompiledDefinition::compile(&registry, &definition).unwrap();
+
+        assert_eq!(
+            compiled.state_initializers(),
+            &[
+                DefinitionStateInitializer::Parameter(ParameterId::new(0),),
+                DefinitionStateInitializer::Literal(4.25),
+            ],
+        );
     }
 }

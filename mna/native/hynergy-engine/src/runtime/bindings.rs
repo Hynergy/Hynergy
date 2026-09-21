@@ -1,6 +1,7 @@
 use super::island::IslandRuntimeError;
+use crate::compile::definition::DefinitionStateInitializer;
 use crate::compile::island::{CompiledPartitionInputs, DeviceState, IslandStateLayout};
-use crate::state::{PhysicalStateAddress, PhysicalStateStore};
+use crate::state::{PhysicalStateAddress, PhysicalStateError, PhysicalStateStore};
 use hynergy_ir::{InputSlot, StateSlot};
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::{DeviceLocation, Network};
@@ -56,21 +57,55 @@ impl ParameterInputBinding {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct StateInputBinding {
     state: DeviceState,
     input: InputSlot,
     address: PhysicalStateAddress,
+    initializer: DefinitionStateInitializer,
 }
 
 impl StateInputBinding {
     #[inline]
-    const fn new(state: DeviceState, input: InputSlot, address: PhysicalStateAddress) -> Self {
+    const fn new(
+        state: DeviceState,
+        input: InputSlot,
+        address: PhysicalStateAddress,
+        initializer: DefinitionStateInitializer,
+    ) -> Self {
         Self {
             state,
             input,
             address,
+            initializer,
         }
+    }
+
+    #[inline]
+    pub(super) fn read_logical(
+        &self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<f64, IslandRuntimeError> {
+        physical_state
+            .read_logical_at(network, self.state.device(), self.address, self.initializer)
+            .map_err(|error| match error {
+                PhysicalStateError::MissingInitialParameter { device, parameter } => {
+                    IslandRuntimeError::MissingParameter { device, parameter }
+                }
+
+                PhysicalStateError::StateNotInitialized { state } => {
+                    IslandRuntimeError::MissingState {
+                        device: state.device(),
+                        state: state.state(),
+                    }
+                }
+            })
+    }
+
+    #[inline]
+    pub(super) const fn initializer(&self) -> DefinitionStateInitializer {
+        self.initializer
     }
 
     #[inline]
@@ -150,6 +185,10 @@ impl IslandBindings {
                 .device_state(slot)
                 .expect("compiled state input must have a semantic state");
 
+            let initializer = states
+                .state_initializer(slot)
+                .expect("compiled state input must have an initializer");
+
             let device = state.device();
 
             let location = network
@@ -160,6 +199,7 @@ impl IslandBindings {
                 state,
                 input,
                 PhysicalStateAddress::new(location, state.state().index()),
+                initializer,
             ));
         }
 
@@ -274,7 +314,7 @@ impl IslandBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compile::definition::CompiledDefinition;
+    use crate::compile::definition::{CompiledDefinition, DefinitionStateInitializer};
     use crate::compile::island::{
         IslandNode, IslandPartitionSpec, compile_island_parts, compile_topology_island,
     };
@@ -325,10 +365,14 @@ mod tests {
 
         let terminal_nodes = [node_a, node_b];
 
-        let partition_spec = IslandPartitionSpec::new(moved, partition, &terminal_nodes);
+        let partition_spec = IslandPartitionSpec::new(
+            moved,
+            partition,
+            compiled_definition.state_initializers(),
+            &terminal_nodes,
+        );
 
         let compiled = compile_island_parts(&[node_a, node_b], &[partition_spec]).unwrap();
-
         let parts = compiled.into_parts();
 
         let mut bindings = IslandBindings::new(
@@ -431,7 +475,7 @@ mod tests {
 
         assert_eq!(network.device_location(moved).unwrap().row(), 1,);
 
-        let physical_state = PhysicalStateStore::new();
+        let physical_state = PhysicalStateStore::default();
 
         bindings.debug_assert_valid(&network, &physical_state);
     }
@@ -490,7 +534,7 @@ mod tests {
 
         assert_eq!(network.device_location(moved).unwrap().row(), 1,);
 
-        let physical_state = PhysicalStateStore::new();
+        let physical_state = PhysicalStateStore::default();
 
         bindings.debug_assert_valid(&network, &physical_state);
     }
@@ -536,8 +580,72 @@ mod tests {
             "capacitor fixture must produce a state-input binding",
         );
 
-        let physical_state = PhysicalStateStore::new();
+        let physical_state = PhysicalStateStore::default();
 
         bindings.debug_assert_valid(&network, &physical_state);
+    }
+
+    #[test]
+    fn state_input_binding_carries_precompiled_initializer() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let device = device(1);
+        let definition = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        let mut physical_state = PhysicalStateStore::default();
+
+        let model_insert = network
+            .prepare_add_device(&definitions, device, definition)
+            .unwrap();
+
+        let definition_model = definitions.get(definition).unwrap();
+        let state_insert = physical_state.prepare_add_device(definition_model, &model_insert);
+        let insert = network.commit_add_device(model_insert);
+
+        physical_state.commit_add_device(state_insert, insert);
+
+        network
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 3.25)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(device, DevicePartitionId::new(1)),
+        );
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+        let parts = compiled.into_parts();
+
+        let bindings = IslandBindings::new(
+            &network,
+            &parts.states,
+            &parts.partition_inputs,
+            parts.ir.state_inputs(),
+        )
+        .unwrap();
+
+        assert_eq!(bindings.state_inputs().len(), 1);
+
+        let binding = &bindings.state_inputs()[0];
+
+        assert_eq!(binding.state().device(), device,);
+
+        assert_eq!(
+            binding.initializer(),
+            DefinitionStateInitializer::Parameter(ParameterId::new(0),),
+        );
+
+        assert_eq!(
+            binding.read_logical(&network, &physical_state,).unwrap(),
+            3.25,
+        );
+
+        assert!(
+            !physical_state.is_initialized_at(binding.address().location(),),
+            "runtime logical reads must not commit state initialization",
+        );
     }
 }

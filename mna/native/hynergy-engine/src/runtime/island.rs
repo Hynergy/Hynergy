@@ -14,8 +14,11 @@ use hynergy_model::parameter::ParameterId;
 
 use thiserror::Error;
 
-use crate::runtime::bindings::IslandBindings;
-use crate::state::{PhysicalStateAddress, PhysicalStateStore};
+use crate::runtime::bindings::{IslandBindings, StateInputBinding};
+use crate::state::PhysicalStateStore;
+
+#[cfg(test)]
+use crate::state::PhysicalStateAddress;
 #[cfg(test)]
 use {
     crate::compile::island::{IslandNode, IslandUnknownLayout},
@@ -249,6 +252,94 @@ impl IslandRuntime {
         Ok(())
     }
 
+    pub(crate) fn prepare_tick_state_inputs(
+        &mut self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<(), IslandRuntimeError> {
+        for binding in self.bindings.state_inputs() {
+            let value = binding.read_logical(network, physical_state)?;
+
+            self.workspace.set_input(binding.input(), value);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn solve_prepared_tick(
+        &mut self,
+        network: &Network,
+    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError> {
+        #[cfg(feature = "solver-profiling")]
+        {
+            let nonlinear = self.nonlinear_scratch.is_some();
+
+            self.solver_tick_profile.begin_tick(nonlinear);
+        }
+
+        if self.sleepable && !self.needs_solve {
+            debug_assert!(
+                self.solution_valid,
+                "sleeping island must retain a valid solution",
+            );
+
+            #[cfg(feature = "solver-profiling")]
+            self.solver_tick_profile.mark_slept();
+
+            return Ok(Vec::new());
+        }
+
+        self.solution_valid = false;
+
+        self.prepare_static(network)?;
+
+        self.ir.value_program().execute_tick(&mut self.workspace);
+
+        initialize_iteration_latches(&self.ir, &mut self.workspace);
+
+        if self.nonlinear_scratch.is_none() {
+            self.solve_linear()?;
+        } else {
+            let mut scratch = self
+                .nonlinear_scratch
+                .take()
+                .expect("nonlinear scratch was checked above");
+
+            let result = self.solve_nonlinear(&mut scratch);
+
+            self.nonlinear_scratch = Some(scratch);
+
+            result?;
+        }
+
+        let mut next_state = vec![0.0; self.states.state_count()];
+
+        self.ir
+            .state_transition()
+            .execute(&mut next_state, self.workspace.values());
+
+        let mut writes = Vec::with_capacity(self.ir.state_transition().len());
+
+        for write in self.ir.state_transition().writes() {
+            let slot = write.destination();
+
+            let state = self
+                .states
+                .device_state(slot)
+                .expect("compiled state write must have a physical state");
+
+            writes.push(StagedStateWrite::new(state, next_state[slot.index()]));
+        }
+
+        self.observer_outputs_dirty = true;
+
+        if self.sleepable {
+            self.needs_solve = false;
+        }
+
+        Ok(writes)
+    }
+
     fn solve_linear(&mut self) -> Result<(), IslandRuntimeError> {
         self.factorize_matrix_if_dirty()?;
 
@@ -422,7 +513,17 @@ impl IslandRuntime {
         })
     }
 
-    pub(crate) fn solve_tick<F>(
+    pub(crate) fn solve_tick(
+        &mut self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError> {
+        self.prepare_tick_state_inputs(network, physical_state)?;
+        self.solve_prepared_tick(network)
+    }
+
+    #[cfg(test)]
+    fn solve_tick_with_state_reader<F>(
         &mut self,
         network: &Network,
         mut old_state: F,
@@ -430,9 +531,32 @@ impl IslandRuntime {
     where
         F: FnMut(PhysicalStateAddress) -> Option<f64>,
     {
+        for binding in self.bindings.state_inputs() {
+            let state = binding.state();
+
+            let value = old_state(binding.address()).ok_or(IslandRuntimeError::MissingState {
+                device: state.device(),
+                state: state.state(),
+            })?;
+
+            self.workspace.set_input(binding.input(), value);
+        }
+
+        self.solve_prepared_tick(network)
+    }
+
+    fn solve_tick_with_reader<F>(
+        &mut self,
+        network: &Network,
+        mut read_state: F,
+    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError>
+    where
+        F: FnMut(&StateInputBinding) -> Result<f64, IslandRuntimeError>,
+    {
         #[cfg(feature = "solver-profiling")]
         {
             let nonlinear = self.nonlinear_scratch.is_some();
+
             self.solver_tick_profile.begin_tick(nonlinear);
         }
 
@@ -453,12 +577,7 @@ impl IslandRuntime {
         self.prepare_static(network)?;
 
         for binding in self.bindings.state_inputs() {
-            let state = binding.state();
-
-            let value = old_state(binding.address()).ok_or(IslandRuntimeError::MissingState {
-                device: state.device(),
-                state: state.state(),
-            })?;
+            let value = read_state(binding)?;
 
             self.workspace.set_input(binding.input(), value);
         }
@@ -866,7 +985,7 @@ mod test {
         IslandRuntime, advance_iteration_latches, initialize_iteration_latches,
         iteration_stability_matches, solutions_converged,
     };
-    use crate::state::PhysicalStateAddress;
+    use crate::state::{PhysicalStateAddress, PhysicalStateStore};
     use crate::topology::{DerivedTopology, DeviceComponent};
     use hynergy_ir::StateSlot;
     use hynergy_mna::pattern::PatternBuilder;
@@ -934,12 +1053,16 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.solve_count(), 2);
 
         runtime.mark_numerical_dirty();
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(
             runtime.solve_count(),
@@ -957,7 +1080,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         let profile = runtime.solver_tick_profile();
 
@@ -977,11 +1102,15 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.solve_count(), 1);
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(
             runtime.solve_count(),
@@ -996,13 +1125,19 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.solve_count(), 1);
 
         runtime.mark_numerical_dirty();
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(
             runtime.solve_count(),
@@ -1010,7 +1145,9 @@ mod test {
             "numerical invalidation must wake a sleeping island",
         );
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(
             runtime.solve_count(),
@@ -1026,12 +1163,16 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         let observer = DeviceObserver::new(source, DefinitionObserverId::new(0));
         let first = runtime.observer_value(observer).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.solve_count(), 1);
         assert_eq!(runtime.observer_value(observer), Some(first));
@@ -1044,9 +1185,11 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        let physical_state = PhysicalStateStore::default();
 
-        assert_eq!(runtime.solve_count(), 1);
+        runtime.solve_tick(&network, &physical_state).unwrap();
+
+        assert_eq!(runtime.solve_count(), 1,);
     }
 
     #[test]
@@ -1057,7 +1200,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.solve_count(), 2);
         assert_eq!(runtime.matrix_stamp_count(), 1);
@@ -1125,7 +1270,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime.solve_tick(&network, |_| None).unwrap();
+        let writes = runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert!(writes.is_empty());
 
@@ -1197,13 +1344,13 @@ mod test {
         let state = PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
         runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
+            .solve_tick_with_state_reader(&network, |candidate| (candidate == state).then_some(0.0))
             .unwrap();
 
         assert_eq!(runtime.solve_count(), 1);
 
         runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
+            .solve_tick_with_state_reader(&network, |candidate| (candidate == state).then_some(0.0))
             .unwrap();
 
         assert_eq!(
@@ -1306,7 +1453,9 @@ mod test {
             PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
         let writes = runtime
-            .solve_tick(&network, |state| (state == capacitor_state).then_some(3.0))
+            .solve_tick_with_state_reader(&network, |state| {
+                (state == capacitor_state).then_some(3.0)
+            })
             .unwrap();
 
         let voltage = runtime.node_voltage(node_a).unwrap() - runtime.node_voltage(node_b).unwrap();
@@ -1383,13 +1532,13 @@ mod test {
         let state = PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
         runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
+            .solve_tick_with_state_reader(&network, |candidate| (candidate == state).then_some(0.0))
             .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
         runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(0.0))
+            .solve_tick_with_state_reader(&network, |candidate| (candidate == state).then_some(0.0))
             .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
@@ -1454,11 +1603,15 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
@@ -1467,7 +1620,9 @@ mod test {
             .unwrap();
 
         runtime.mark_numerical_dirty();
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 2);
     }
@@ -1534,7 +1689,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
@@ -1543,7 +1700,9 @@ mod test {
             .unwrap();
 
         runtime.mark_numerical_dirty();
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(runtime.matrix_stamp_count(), 1);
 
@@ -1632,7 +1791,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -1700,7 +1861,9 @@ mod test {
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime.solve_tick(&network, |_| None).unwrap();
+        let writes = runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert!(writes.is_empty());
 
@@ -1871,7 +2034,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -1885,7 +2050,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(
             runtime.solve_count(),
@@ -1959,7 +2126,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
         let first_solve_count = runtime.solve_count();
 
         assert!(
@@ -1967,7 +2136,9 @@ mod test {
             "initial nonlinear solve should iterate"
         );
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert_eq!(
             runtime.solve_count(),
@@ -2134,7 +2305,9 @@ mod test {
         let mut mode = 0.0;
 
         let writes = runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
+            .solve_tick_with_state_reader(&network, |candidate| {
+                (candidate == state).then_some(mode)
+            })
             .unwrap();
 
         assert_eq!(writes.len(), 1);
@@ -2158,7 +2331,9 @@ mod test {
         runtime.mark_numerical_dirty();
 
         let writes = runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
+            .solve_tick_with_state_reader(&network, |candidate| {
+                (candidate == state).then_some(mode)
+            })
             .unwrap();
 
         assert_eq!(writes[0].value(), 1.0);
@@ -2177,7 +2352,9 @@ mod test {
         runtime.mark_numerical_dirty();
 
         let writes = runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
+            .solve_tick_with_state_reader(&network, |candidate| {
+                (candidate == state).then_some(mode)
+            })
             .unwrap();
 
         assert_eq!(writes[0].value(), 1.0);
@@ -2196,7 +2373,9 @@ mod test {
         runtime.mark_numerical_dirty();
 
         let writes = runtime
-            .solve_tick(&network, |candidate| (candidate == state).then_some(mode))
+            .solve_tick_with_state_reader(&network, |candidate| {
+                (candidate == state).then_some(mode)
+            })
             .unwrap();
 
         assert_eq!(writes[0].value(), 0.0);
@@ -2306,7 +2485,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime.solve_tick(&network, |_| None).unwrap();
+        let writes = runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert!(writes.is_empty());
 
@@ -2322,7 +2503,9 @@ mod test {
 
         runtime.mark_numerical_dirty();
 
-        let writes = runtime.solve_tick(&network, |_| None).unwrap();
+        let writes = runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert!(writes.is_empty());
 
@@ -2412,7 +2595,9 @@ mod test {
 
         assert_eq!(runtime.observer_value(observer), None);
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         let value = runtime.observer_value(observer).unwrap();
 
@@ -2427,7 +2612,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
         runtime.reset_parameter_read_count();
 
         network
@@ -2435,7 +2622,9 @@ mod test {
             .unwrap();
 
         runtime.mark_numerical_dirty();
-        runtime.solve_tick(&network, |_| None).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
 
         assert!(
             runtime.physical_parameter_read_count() > 0,
