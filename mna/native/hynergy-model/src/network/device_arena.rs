@@ -61,6 +61,7 @@ impl DeviceDirectoryEntry {
         Self(raw)
     }
 
+    #[cfg(test)]
     #[inline]
     const fn raw(self) -> u32 {
         self.0
@@ -183,16 +184,9 @@ impl DeviceChunk {
 
     #[inline]
     pub(super) fn device_view(&self, row: usize) -> DeviceView<'_> {
-        assert!(row < self.len());
+        debug_assert!(row < self.len());
 
-        let terminal_start = row * self.terminal_count;
-        let parameter_start = row * self.parameter_count;
-
-        DeviceView {
-            definition_id: self.definition_id,
-            terminals: &self.terminals[terminal_start..terminal_start + self.terminal_count],
-            parameters: &self.parameters[parameter_start..parameter_start + self.parameter_count],
-        }
+        DeviceView { chunk: self, row }
     }
 
     fn remove_row(&mut self, row: usize) -> Option<DeviceId> {
@@ -221,33 +215,40 @@ impl DeviceChunk {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceView<'a> {
-    definition_id: DefinitionId,
-    terminals: &'a [Option<ConnectionRef>],
-    parameters: &'a [f64],
+    chunk: &'a DeviceChunk,
+    row: usize,
 }
 
-impl<'a> DeviceView<'a> {
+impl DeviceView<'_> {
     #[inline]
-    pub const fn definition_id(self) -> DefinitionId {
-        self.definition_id
+    pub const fn definition_id(&self) -> DefinitionId {
+        self.chunk.definition_id
     }
 
     #[inline]
-    pub fn terminals(self) -> &'a [Option<ConnectionRef>] {
-        self.terminals
+    pub fn terminals(&self) -> &[Option<ConnectionRef>] {
+        let start = self.row * self.chunk.terminal_count;
+        let end = start + self.chunk.terminal_count;
+
+        &self.chunk.terminals[start..end]
     }
 
     #[inline]
-    pub fn parameter(self, parameter: ParameterId) -> Option<Option<f64>> {
-        self.parameters
-            .get(parameter.index())
+    pub fn parameter(&self, parameter: ParameterId) -> Option<Option<f64>> {
+        let index = self.chunk.parameter_index(self.row, parameter)?;
+
+        Some(decode_parameter(self.chunk.parameters[index]))
+    }
+
+    #[inline]
+    pub fn parameters(&self) -> impl ExactSizeIterator<Item = Option<f64>> + '_ {
+        let start = self.row * self.chunk.parameter_count;
+        let end = start + self.chunk.parameter_count;
+
+        self.chunk.parameters[start..end]
+            .iter()
             .copied()
             .map(decode_parameter)
-    }
-
-    #[inline]
-    pub fn parameters(self) -> impl ExactSizeIterator<Item = Option<f64>> + 'a {
-        self.parameters.iter().copied().map(decode_parameter)
     }
 }
 
@@ -477,9 +478,15 @@ impl DeviceArena {
         Ok(self.chunks[locator.chunk_index()].device_view(locator.row()))
     }
 
-    pub(super) fn iter_devices(&self) -> impl Iterator<Item = (DeviceId, DeviceView<'_>)> {
+    #[inline]
+    pub(super) fn iter_devices(&self) -> impl Iterator<Item = (DeviceId, DeviceView<'_>)> + '_ {
         self.chunks.iter().flat_map(|chunk| {
-            (0..chunk.len()).map(|row| (chunk.device_ids[row], chunk.device_view(row)))
+            chunk
+                .device_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(move |(row, device)| (device, chunk.device_view(row)))
         })
     }
 
@@ -704,6 +711,13 @@ impl DeviceArena {
             assert_eq!(chunk.definition_id.index(), definition_index);
             assert!(!chunk.is_full());
         }
+    }
+
+    #[inline]
+    pub(super) fn iter_device_ids(&self) -> impl Iterator<Item = DeviceId> + '_ {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.device_ids.iter().copied())
     }
 
     #[cfg(test)]

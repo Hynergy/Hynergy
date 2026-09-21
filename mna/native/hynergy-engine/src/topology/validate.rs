@@ -23,7 +23,7 @@ impl DerivedTopology {
             "net -> island map must mirror the stable NetId slot space"
         );
 
-        for (device, _) in network.iter_devices() {
+        for device in network.iter_device_ids() {
             assert!(
                 self.device_component_spans
                     .get(device.index())
@@ -309,7 +309,7 @@ impl DerivedTopology {
         let mut stack = Vec::new();
         let mut connected_component_count = 0usize;
 
-        for (device, _) in network.iter_devices() {
+        for device in network.iter_device_ids() {
             let device_index = device.index();
 
             let span = self.device_component_spans[device_index]

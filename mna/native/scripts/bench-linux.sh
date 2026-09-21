@@ -331,6 +331,13 @@ CURRENT_EPP="unavailable"
     echo "Hynergy benchmark metadata"
     echo "date: $(date --iso-8601=seconds)"
     echo "hostname: $(hostname)"
+    echo "git_commit: $(git -C "$ROOT_DIR" rev-parse HEAD)"
+    echo "git_branch: $(git -C "$ROOT_DIR" branch --show-current)"
+    if git -C "$ROOT_DIR" diff --quiet && git -C "$ROOT_DIR" diff --cached --quiet; then
+        echo "git_dirty: false"
+    else
+        echo "git_dirty: true"
+    fi
     echo "kernel: $(uname -srmo)"
     echo "cpu: ${CPU}"
     echo "core: ${CORE_ID}"

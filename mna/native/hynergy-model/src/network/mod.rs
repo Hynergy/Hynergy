@@ -187,6 +187,11 @@ impl Network {
     pub fn wires(&self) -> &[Option<WireSlot>] {
         &self.wires
     }
+
+    #[inline]
+    pub fn iter_device_ids(&self) -> impl Iterator<Item = DeviceId> + '_ {
+        self.device_arena.iter_device_ids()
+    }
 }
 
 #[cfg(test)]

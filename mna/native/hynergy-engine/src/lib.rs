@@ -751,7 +751,7 @@ impl World {
         let network = &self.network;
         let physical_state = &mut self.physical_state;
 
-        for (device, _) in network.iter_devices() {
+        for device in network.iter_device_ids() {
             physical_state.initialize_device(definitions, network, device)?;
         }
 
