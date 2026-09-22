@@ -478,10 +478,31 @@ mod tests {
         DeviceId::try_from(raw).unwrap()
     }
 
+    fn add_device_with_physical_state(
+        definitions: &DefinitionRegistry,
+        network: &mut Network,
+        physical_state: &mut PhysicalStateStore,
+        device: DeviceId,
+        definition_id: DefinitionId,
+    ) {
+        let definition = definitions.get(definition_id).unwrap();
+
+        let model_insert = network
+            .prepare_add_device(definitions, device, definition_id)
+            .unwrap();
+
+        let state_insert = physical_state.prepare_add_device(definition, &model_insert);
+
+        let insert = network.commit_add_device(model_insert);
+
+        physical_state.commit_add_device(state_insert, insert);
+    }
+
     #[test]
     fn rebind_updates_physical_locations_without_changing_semantic_identity() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
 
         let definition_id = DefinitionId::from(PrimitiveElementKind::Capacitor);
 
@@ -490,9 +511,13 @@ mod tests {
         let moved = device(3);
 
         for device in [first, removed, moved] {
-            network
-                .add_device(&definitions, device, definition_id)
-                .unwrap();
+            add_device_with_physical_state(
+                &definitions,
+                &mut network,
+                &mut physical_state,
+                device,
+                definition_id,
+            );
 
             network
                 .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0e-6)
@@ -533,11 +558,12 @@ mod tests {
 
         assert!(!bindings.parameters().is_empty());
         assert!(!bindings.state_inputs().is_empty());
+        assert!(!bindings.state_outputs().is_empty());
 
         let parameter = &bindings.parameters()[0];
 
         assert_eq!(parameter.device(), moved);
-        assert_eq!(parameter.parameter(), ParameterId::new(0),);
+        assert_eq!(parameter.parameter(), ParameterId::new(0));
         assert_eq!(
             parameter.location(),
             network.device_location(moved).unwrap(),
@@ -553,20 +579,6 @@ mod tests {
         );
         assert_eq!(state.address().location().row(), 2);
 
-        let parameter_input = parameter.input();
-        let state_input = state.input();
-        let semantic_state = state.state();
-
-        let removal = network.remove_device(removed).unwrap();
-
-        assert_eq!(removal.moved_device(), Some(moved),);
-
-        bindings.rebind(&network).unwrap();
-
-        let _output = &bindings.state_outputs()[0];
-
-        assert!(!bindings.state_outputs().is_empty());
-
         let output = &bindings.state_outputs()[0];
 
         assert_eq!(output.state().device(), moved);
@@ -574,25 +586,50 @@ mod tests {
             output.address().location(),
             network.device_location(moved).unwrap(),
         );
+        assert_eq!(output.address().location().row(), 2);
 
+        let parameter_input = parameter.input();
+        let state_input = state.input();
+        let semantic_state = state.state();
         let output_source = output.source();
         let output_state = output.state();
 
-        assert_eq!(output.state(), output_state);
-        assert_eq!(output.source(), output_source);
-        assert_eq!(output.address().location().row(), 1,);
+        let removal = network.remove_device(removed).unwrap();
+
+        assert_eq!(removal.moved_device(), Some(moved));
+
+        physical_state.remove_device(removal);
+
+        assert_eq!(network.device_location(moved).unwrap().row(), 1);
+
+        bindings.rebind(&network).unwrap();
 
         let parameter = &bindings.parameters()[0];
-        let state = &bindings.state_inputs()[0];
 
         assert_eq!(parameter.device(), moved);
-        assert_eq!(parameter.parameter(), ParameterId::new(0),);
+        assert_eq!(parameter.parameter(), ParameterId::new(0));
         assert_eq!(parameter.input(), parameter_input);
         assert_eq!(parameter.location().row(), 1);
 
+        let state = &bindings.state_inputs()[0];
+
         assert_eq!(state.state(), semantic_state);
         assert_eq!(state.input(), state_input);
+        assert_eq!(
+            state.address().location(),
+            network.device_location(moved).unwrap(),
+        );
         assert_eq!(state.address().location().row(), 1);
+
+        let output = &bindings.state_outputs()[0];
+
+        assert_eq!(output.state(), output_state);
+        assert_eq!(output.source(), output_source);
+        assert_eq!(
+            output.address().location(),
+            network.device_location(moved).unwrap(),
+        );
+        assert_eq!(output.address().location().row(), 1);
     }
 
     #[test]
@@ -600,17 +637,22 @@ mod tests {
     fn debug_validation_detects_stale_binding_after_row_relocation() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
 
         let definition = DefinitionId::from(PrimitiveElementKind::Capacitor);
 
-        let first = DeviceId::try_from(1).unwrap();
-        let removed = DeviceId::try_from(2).unwrap();
-        let moved = DeviceId::try_from(3).unwrap();
+        let first = device(1);
+        let removed = device(2);
+        let moved = device(3);
 
         for device in [first, removed, moved] {
-            network
-                .add_device(&definitions, device, definition)
-                .unwrap();
+            add_device_with_physical_state(
+                &definitions,
+                &mut network,
+                &mut physical_state,
+                device,
+                definition,
+            );
 
             network
                 .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
@@ -625,7 +667,6 @@ mod tests {
         );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
-
         let parts = compiled.into_parts();
 
         let bindings = IslandBindings::new(
@@ -643,8 +684,6 @@ mod tests {
 
         assert_eq!(network.device_location(moved).unwrap().row(), 1,);
 
-        let physical_state = PhysicalStateStore::default();
-
         bindings.debug_assert_valid(&network, &physical_state);
     }
 
@@ -653,17 +692,22 @@ mod tests {
     fn debug_validation_detects_stale_state_binding_after_row_relocation() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
 
         let definition = DefinitionId::from(PrimitiveElementKind::Capacitor);
 
-        let first = DeviceId::try_from(1).unwrap();
-        let removed = DeviceId::try_from(2).unwrap();
-        let moved = DeviceId::try_from(3).unwrap();
+        let first = device(1);
+        let removed = device(2);
+        let moved = device(3);
 
         for device in [first, removed, moved] {
-            network
-                .add_device(&definitions, device, definition)
-                .unwrap();
+            add_device_with_physical_state(
+                &definitions,
+                &mut network,
+                &mut physical_state,
+                device,
+                definition,
+            );
 
             network
                 .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
@@ -678,7 +722,6 @@ mod tests {
         );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
-
         let parts = compiled.into_parts();
 
         let mut bindings = IslandBindings::new(
@@ -703,8 +746,6 @@ mod tests {
 
         assert_eq!(network.device_location(moved).unwrap().row(), 1,);
 
-        let physical_state = PhysicalStateStore::default();
-
         bindings.debug_assert_valid(&network, &physical_state);
     }
 
@@ -713,13 +754,18 @@ mod tests {
     fn debug_validation_detects_missing_state_sidecar_scalar() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
 
-        let device = DeviceId::try_from(1).unwrap();
+        let device = device(1);
         let definition = DefinitionId::from(PrimitiveElementKind::Capacitor);
 
-        network
-            .add_device(&definitions, device, definition)
-            .unwrap();
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            device,
+            definition,
+        );
 
         network
             .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
@@ -733,7 +779,6 @@ mod tests {
         );
 
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
-
         let parts = compiled.into_parts();
 
         let bindings = IslandBindings::new(
@@ -750,30 +795,26 @@ mod tests {
             "capacitor fixture must produce a state-input binding",
         );
 
-        let physical_state = PhysicalStateStore::default();
-
-        bindings.debug_assert_valid(&network, &physical_state);
+        let missing_physical_state = PhysicalStateStore::default();
+        bindings.debug_assert_valid(&network, &missing_physical_state);
     }
 
     #[test]
     fn state_input_binding_carries_precompiled_initializer() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
 
         let device = device(1);
         let definition = DefinitionId::from(PrimitiveElementKind::TickDelay);
 
-        let mut physical_state = PhysicalStateStore::default();
-
-        let model_insert = network
-            .prepare_add_device(&definitions, device, definition)
-            .unwrap();
-
-        let definition_model = definitions.get(definition).unwrap();
-        let state_insert = physical_state.prepare_add_device(definition_model, &model_insert);
-        let insert = network.commit_add_device(model_insert);
-
-        physical_state.commit_add_device(state_insert, insert);
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            device,
+            definition,
+        );
 
         network
             .set_device_parameter(&definitions, device, ParameterId::new(0), 3.25)
@@ -797,6 +838,7 @@ mod tests {
             parts.ir.state_transition().writes(),
         )
         .unwrap();
+
         assert_eq!(bindings.state_inputs().len(), 1);
 
         let binding = &bindings.state_inputs()[0];
@@ -823,13 +865,18 @@ mod tests {
     fn state_output_binding_retains_transition_source_and_physical_destination() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
 
         let device = device(1);
         let definition_id = DefinitionId::from(PrimitiveElementKind::Capacitor);
 
-        network
-            .add_device(&definitions, device, definition_id)
-            .unwrap();
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            device,
+            definition_id,
+        );
 
         network
             .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0e-6)
@@ -896,7 +943,7 @@ mod tests {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
 
-        let device = DeviceId::try_from(1).unwrap();
+        let device = device(1);
 
         network
             .add_device(
@@ -907,7 +954,6 @@ mod tests {
             .unwrap();
 
         let location = network.device_location(device).unwrap();
-
         let state = DeviceState::new(device, DefinitionStateId::new(0));
 
         let mut values = ValueProgramBuilder::new();
