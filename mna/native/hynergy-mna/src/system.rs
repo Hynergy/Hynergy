@@ -1,12 +1,12 @@
 use crate::pattern::{MatrixSlot, MnaPattern};
 use faer::{
-    MatMut,
-    linalg::solvers::Solve,
+    Conj, MatMut, get_global_parallelism,
+    dyn_stack::{MemBuffer, MemStack, StackReq},
     sparse::{
         FaerError, SparseColMatRef,
         linalg::{
             LuError,
-            solvers::{Lu, SymbolicLu},
+            lu::{LuRef, NumericLu, SymbolicLu, factorize_symbolic_lu},
         },
     },
 };
@@ -92,20 +92,97 @@ impl MatrixValuesMut<'_> {
     }
 }
 
+struct LuState {
+    symbolic: SymbolicLu<u32>,
+    numeric: NumericLu<u32, f64>,
+    scratch: MemBuffer,
+    factorized: bool,
+}
+
+impl std::fmt::Debug for LuState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LuState")
+            .field("symbolic", &self.symbolic)
+            .field("numeric", &self.numeric)
+            .field("factorized", &self.factorized)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LuState {
+    fn new(symbolic: SymbolicLu<u32>) -> Result<Self, MnaError> {
+        let par = get_global_parallelism();
+        let scratch_requirement = StackReq::any_of(&[
+            symbolic.factorize_numeric_lu_scratch::<f64>(par, Default::default()),
+            symbolic.solve_in_place_scratch::<f64>(1, par),
+        ]);
+        let scratch =
+            MemBuffer::try_new(scratch_requirement).map_err(|_| MnaError::OutOfMemory)?;
+
+        Ok(Self {
+            symbolic,
+            numeric: NumericLu::new(),
+            scratch,
+            factorized: false,
+        })
+    }
+
+    #[inline]
+    fn invalidate(&mut self) {
+        self.factorized = false;
+    }
+
+    fn factorize(&mut self, matrix: SparseColMatRef<'_, u32, f64>) -> Result<(), MnaError> {
+        self.factorized = false;
+
+        let par = get_global_parallelism();
+        let mut stack = MemStack::new(&mut self.scratch);
+
+        self.symbolic
+            .factorize_numeric_lu(
+                &mut self.numeric,
+                matrix,
+                par,
+                &mut stack,
+                Default::default(),
+            )
+            .map_err(MnaError::from_lu)?;
+
+        self.factorized = true;
+
+        Ok(())
+    }
+
+    fn solve_in_place(&mut self, rhs: MatMut<'_, f64>) -> Result<(), MnaError> {
+        if !self.factorized {
+            return Err(MnaError::NotFactorized);
+        }
+
+        let par = get_global_parallelism();
+        let mut stack = MemStack::new(&mut self.scratch);
+        let lu = LuRef::new_unchecked(&self.symbolic, &self.numeric);
+
+        lu.solve_in_place_with_conj(Conj::No, rhs, par, &mut stack);
+
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct MnaSystem {
     pattern: MnaPattern,
     values: Box<[f64]>,
-    symbolic_lu: Option<SymbolicLu<u32>>,
-    numeric_lu: Option<Lu<u32, f64>>,
+    lu: Option<LuState>,
 }
 
 impl MnaSystem {
     pub fn new(pattern: MnaPattern) -> Result<Self, MnaError> {
-        let symbolic_lu = if pattern.dimension() == 0 {
+        let lu = if pattern.dimension() == 0 {
             None
         } else {
-            Some(SymbolicLu::try_new(pattern.symbolic()).map_err(MnaError::from_faer)?)
+            let symbolic = factorize_symbolic_lu(pattern.symbolic(), Default::default())
+                .map_err(MnaError::from_faer)?;
+            Some(LuState::new(symbolic)?)
         };
 
         let values = vec![0.0; pattern.nnz()].into_boxed_slice();
@@ -113,8 +190,7 @@ impl MnaSystem {
         Ok(Self {
             pattern,
             values,
-            symbolic_lu,
-            numeric_lu: None,
+            lu,
         })
     }
 
@@ -140,7 +216,9 @@ impl MnaSystem {
 
     #[inline]
     pub fn values_mut(&mut self) -> MatrixValuesMut<'_> {
-        self.numeric_lu = None;
+        if let Some(lu) = self.lu.as_mut() {
+            lu.invalidate();
+        }
 
         MatrixValuesMut {
             values: &mut self.values,
@@ -149,30 +227,24 @@ impl MnaSystem {
 
     #[inline]
     pub fn is_factorized(&self) -> bool {
-        self.dimension() == 0 || self.numeric_lu.is_some()
+        self.lu.as_ref().is_none_or(|lu| lu.factorized)
     }
 
     pub fn factorize(&mut self) -> Result<(), MnaError> {
-        if self.dimension() == 0 {
+        let Self {
+            pattern, values, lu, ..
+        } = self;
+
+        let Some(lu) = lu.as_mut() else {
             return Ok(());
-        }
+        };
 
-        let symbolic = self
-            .symbolic_lu
-            .as_ref()
-            .expect("non-empty MNA system must own symbolic LU");
+        let matrix = SparseColMatRef::new(pattern.symbolic(), values.as_ref());
 
-        let matrix = SparseColMatRef::new(self.pattern.symbolic(), &self.values);
-
-        let numeric =
-            Lu::try_new_with_symbolic(symbolic.clone(), matrix).map_err(MnaError::from_lu)?;
-
-        self.numeric_lu = Some(numeric);
-
-        Ok(())
+        lu.factorize(matrix)
     }
 
-    pub fn solve_in_place(&self, rhs: &mut [f64]) -> Result<(), MnaError> {
+    pub fn solve_in_place(&mut self, rhs: &mut [f64]) -> Result<(), MnaError> {
         let dimension = self.dimension();
 
         if rhs.len() != dimension {
@@ -186,13 +258,13 @@ impl MnaSystem {
             return Ok(());
         }
 
-        let lu = self.numeric_lu.as_ref().ok_or(MnaError::NotFactorized)?;
-
+        let lu = self
+            .lu
+            .as_mut()
+            .expect("non-empty MNA system must own LU state");
         let rhs = MatMut::from_column_major_slice_mut(rhs, dimension, 1);
 
-        lu.solve_in_place(rhs);
-
-        Ok(())
+        lu.solve_in_place(rhs)
     }
 }
 
@@ -374,7 +446,7 @@ mod tests {
     #[test]
     fn rejects_wrong_rhs_dimension() {
         let pattern = full_2x2_pattern();
-        let system = MnaSystem::new(pattern).unwrap();
+        let mut system = MnaSystem::new(pattern).unwrap();
 
         let mut rhs = [1.0];
 
