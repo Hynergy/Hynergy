@@ -398,6 +398,18 @@ impl Engine {
     }
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum WorldTickError {
+    #[error(transparent)]
+    Compile(#[from] IslandCompileError),
+
+    #[error(transparent)]
+    Runtime(#[from] IslandRuntimeError),
+
+    #[error(transparent)]
+    State(#[from] PhysicalStateError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorldConfig {
     tick_frequency_hz: NonZeroU32,
@@ -487,7 +499,6 @@ impl World {
         }
 
         self.commit_runtime_state_outputs()?;
-
         self.collect_subscription_updates();
 
         Ok(())
@@ -793,6 +804,8 @@ impl World {
         let timestep = self.config.timestep();
 
         {
+            let network = &self.network;
+            let runtimes = &mut self.island_runtimes;
             let topology = &self.derived_topology;
             let invalidation = topology.invalidation();
 
@@ -801,10 +814,17 @@ impl World {
             let retired = invalidation.retired_islands();
             let numerical_dirty = invalidation.numerical_dirty_islands();
 
-            let network = &self.network;
             #[cfg(debug_assertions)]
-            let physical_state = &self.physical_state;
-            let runtimes = &mut self.island_runtimes;
+            for (island, _) in topology.islands() {
+                debug_assert!(
+                    topology_dirty.contains(&island)
+                        || runtimes
+                            .get(island.index())
+                            .and_then(Option::as_ref)
+                            .is_some(),
+                    "clean live island must already have a runtime before synchronization",
+                );
+            }
 
             for &island in retired {
                 if let Some(runtime) = runtimes.get_mut(island.index()) {
@@ -812,16 +832,9 @@ impl World {
                 }
             }
 
-            for (island, _) in topology.islands() {
+            for &island in topology_dirty {
                 if runtimes.len() <= island.index() {
                     runtimes.resize_with(island.index() + 1, || None);
-                }
-
-                let needs_compile =
-                    runtimes[island.index()].is_none() || topology_dirty.contains(&island);
-
-                if !needs_compile {
-                    continue;
                 }
 
                 let compiled = compile_topology_island(definitions, network, topology, island)?;
@@ -850,6 +863,8 @@ impl World {
 
             #[cfg(debug_assertions)]
             {
+                let physical_state = &self.physical_state;
+
                 for (island, _) in topology.islands() {
                     let runtime = runtimes
                         .get(island.index())
@@ -941,18 +956,6 @@ impl World {
     pub const fn config(&self) -> WorldConfig {
         self.config
     }
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub(crate) enum WorldTickError {
-    #[error(transparent)]
-    Compile(#[from] IslandCompileError),
-
-    #[error(transparent)]
-    Runtime(#[from] IslandRuntimeError),
-
-    #[error(transparent)]
-    State(#[from] PhysicalStateError),
 }
 
 #[cfg(test)]
