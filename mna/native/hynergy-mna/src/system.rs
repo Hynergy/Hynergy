@@ -1,7 +1,8 @@
 use crate::pattern::{MatrixSlot, MnaPattern};
 use faer::{
-    Conj, MatMut, get_global_parallelism,
+    Conj, MatMut,
     dyn_stack::{MemBuffer, MemStack, StackReq},
+    get_global_parallelism,
     sparse::{
         FaerError, SparseColMatRef,
         linalg::{
@@ -116,8 +117,7 @@ impl LuState {
             symbolic.factorize_numeric_lu_scratch::<f64>(par, Default::default()),
             symbolic.solve_in_place_scratch::<f64>(1, par),
         ]);
-        let scratch =
-            MemBuffer::try_new(scratch_requirement).map_err(|_| MnaError::OutOfMemory)?;
+        let scratch = MemBuffer::try_new(scratch_requirement).map_err(|_| MnaError::OutOfMemory)?;
 
         Ok(Self {
             symbolic,
@@ -136,16 +136,10 @@ impl LuState {
         self.factorized = false;
 
         let par = get_global_parallelism();
-        let mut stack = MemStack::new(&mut self.scratch);
+        let stack = MemStack::new(&mut self.scratch);
 
         self.symbolic
-            .factorize_numeric_lu(
-                &mut self.numeric,
-                matrix,
-                par,
-                &mut stack,
-                Default::default(),
-            )
+            .factorize_numeric_lu(&mut self.numeric, matrix, par, stack, Default::default())
             .map_err(MnaError::from_lu)?;
 
         self.factorized = true;
@@ -159,10 +153,10 @@ impl LuState {
         }
 
         let par = get_global_parallelism();
-        let mut stack = MemStack::new(&mut self.scratch);
+        let stack = MemStack::new(&mut self.scratch);
         let lu = LuRef::new_unchecked(&self.symbolic, &self.numeric);
 
-        lu.solve_in_place_with_conj(Conj::No, rhs, par, &mut stack);
+        lu.solve_in_place_with_conj(Conj::No, rhs, par, stack);
 
         Ok(())
     }
@@ -232,7 +226,10 @@ impl MnaSystem {
 
     pub fn factorize(&mut self) -> Result<(), MnaError> {
         let Self {
-            pattern, values, lu, ..
+            pattern,
+            values,
+            lu,
+            ..
         } = self;
 
         let Some(lu) = lu.as_mut() else {
