@@ -228,6 +228,7 @@ impl IslandStateLayout {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn state_count(&self) -> usize {
         self.states.len()
     }

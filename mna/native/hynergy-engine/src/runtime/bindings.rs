@@ -2,7 +2,7 @@ use super::island::IslandRuntimeError;
 use crate::compile::definition::DefinitionStateInitializer;
 use crate::compile::island::{CompiledPartitionInputs, DeviceState, IslandStateLayout};
 use crate::state::{PhysicalStateAddress, PhysicalStateError, PhysicalStateStore};
-use hynergy_ir::{InputSlot, StateSlot};
+use hynergy_ir::{InputSlot, StateSlot, StateWrite, ValueSlot, ValueWorkspace};
 use hynergy_model::device::definition::DeviceId;
 use hynergy_model::network::{DeviceLocation, Network};
 use hynergy_model::parameter::ParameterId;
@@ -104,6 +104,7 @@ impl StateInputBinding {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(super) const fn initializer(&self) -> DefinitionStateInitializer {
         self.initializer
     }
@@ -116,6 +117,63 @@ impl StateInputBinding {
     #[inline]
     pub(super) const fn input(&self) -> InputSlot {
         self.input
+    }
+
+    #[inline]
+    #[cfg(debug_assertions)]
+    pub(super) const fn address(&self) -> PhysicalStateAddress {
+        self.address
+    }
+
+    #[inline]
+    fn set_address(&mut self, address: PhysicalStateAddress) {
+        self.address = address;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StateOutputBinding {
+    state: DeviceState,
+    source: ValueSlot,
+    address: PhysicalStateAddress,
+}
+
+impl StateOutputBinding {
+    #[inline]
+    const fn new(state: DeviceState, source: ValueSlot, address: PhysicalStateAddress) -> Self {
+        Self {
+            state,
+            source,
+            address,
+        }
+    }
+
+    #[inline]
+    pub(super) fn validate_source(
+        &self,
+        workspace: &ValueWorkspace,
+    ) -> Result<(), IslandRuntimeError> {
+        if !self.value(workspace).is_finite() {
+            return Err(IslandRuntimeError::NonFiniteState { state: self.state });
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(super) fn value(&self, workspace: &ValueWorkspace) -> f64 {
+        workspace.value(self.source)
+    }
+
+    #[inline]
+    pub(super) const fn state(&self) -> DeviceState {
+        self.state
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(super) const fn source(&self) -> ValueSlot {
+        self.source
     }
 
     #[inline]
@@ -133,6 +191,7 @@ impl StateInputBinding {
 pub(super) struct IslandBindings {
     parameters: Box<[ParameterInputBinding]>,
     state_inputs: Box<[StateInputBinding]>,
+    state_outputs: Box<[StateOutputBinding]>,
 }
 
 impl IslandBindings {
@@ -141,6 +200,7 @@ impl IslandBindings {
         states: &IslandStateLayout,
         partition_inputs: &[CompiledPartitionInputs],
         state_inputs: &[(StateSlot, InputSlot)],
+        state_writes: &[StateWrite],
     ) -> Result<Self, IslandRuntimeError> {
         let parameter_count = partition_inputs
             .iter()
@@ -209,9 +269,38 @@ impl IslandBindings {
             "state binding count must match compiled state inputs",
         );
 
+        let mut state_outputs = Vec::<StateOutputBinding>::with_capacity(state_writes.len());
+
+        for &write in state_writes {
+            let slot = write.destination();
+
+            let state = states
+                .device_state(slot)
+                .expect("compiled state output must have a semantic state");
+
+            let device = state.device();
+
+            let location = network
+                .device_location(device)
+                .map_err(|_| IslandRuntimeError::MissingDevice { device })?;
+
+            state_outputs.push(StateOutputBinding::new(
+                state,
+                write.source(),
+                PhysicalStateAddress::new(location, state.state().index()),
+            ));
+        }
+
+        debug_assert_eq!(
+            state_outputs.len(),
+            state_writes.len(),
+            "state output binding count must match compiled state writes",
+        );
+
         Ok(Self {
             parameters: parameters.into_boxed_slice(),
             state_inputs: bound_state_inputs.into_boxed_slice(),
+            state_outputs: state_outputs.into_boxed_slice(),
         })
     }
 
@@ -227,6 +316,17 @@ impl IslandBindings {
         }
 
         for binding in &mut self.state_inputs {
+            let state = binding.state();
+            let device = state.device();
+
+            let location = network
+                .device_location(device)
+                .map_err(|_| IslandRuntimeError::MissingDevice { device })?;
+
+            binding.set_address(PhysicalStateAddress::new(location, state.state().index()));
+        }
+
+        for binding in &mut self.state_outputs {
             let state = binding.state();
             let device = state.device();
 
@@ -298,6 +398,41 @@ impl IslandBindings {
                 state.state(),
             );
         }
+
+        for binding in &self.state_outputs {
+            let state = binding.state();
+            let address = binding.address();
+
+            let current = network
+                .device_location(state.device())
+                .expect("bound state output device must remain resident");
+
+            debug_assert_eq!(
+                address.location(),
+                current,
+                "stale state output binding for device {:?}, state {:?}",
+                state.device(),
+                state.state(),
+            );
+
+            debug_assert_eq!(
+                address.state_index(),
+                state.state().index(),
+                "state output binding index must match its semantic state",
+            );
+
+            debug_assert!(
+                physical_state.get_at(address).is_some(),
+                "state output binding must address a live state scalar for device {:?}, state {:?}",
+                state.device(),
+                state.state(),
+            );
+        }
+    }
+
+    #[inline]
+    pub(super) fn state_outputs(&self) -> &[StateOutputBinding] {
+        &self.state_outputs
     }
 
     #[inline]
@@ -309,17 +444,29 @@ impl IslandBindings {
     pub(super) fn state_inputs(&self) -> &[StateInputBinding] {
         &self.state_inputs
     }
+
+    #[cfg(test)]
+    pub(super) fn set_state_output_address_for_test(
+        &mut self,
+        index: usize,
+        address: PhysicalStateAddress,
+    ) {
+        self.state_outputs[index].set_address(address);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compile::definition::{CompiledDefinition, DefinitionStateInitializer};
+    use crate::compile::definition::{
+        CompiledDefinition, DefinitionStateId, DefinitionStateInitializer,
+    };
     use crate::compile::island::{
         IslandNode, IslandPartitionSpec, compile_island_parts, compile_topology_island,
     };
     use crate::state::PhysicalStateStore;
     use crate::topology::{DerivedTopology, DeviceComponent};
+    use hynergy_ir::ValueProgramBuilder;
     use hynergy_model::device::definition::{
         DefinitionId, DeviceId, DevicePartitionId, PrimitiveElementKind,
     };
@@ -380,6 +527,7 @@ mod tests {
             &parts.states,
             &parts.partition_inputs,
             parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
         )
         .unwrap();
 
@@ -414,6 +562,25 @@ mod tests {
         assert_eq!(removal.moved_device(), Some(moved),);
 
         bindings.rebind(&network).unwrap();
+
+        let _output = &bindings.state_outputs()[0];
+
+        assert!(!bindings.state_outputs().is_empty());
+
+        let output = &bindings.state_outputs()[0];
+
+        assert_eq!(output.state().device(), moved);
+        assert_eq!(
+            output.address().location(),
+            network.device_location(moved).unwrap(),
+        );
+
+        let output_source = output.source();
+        let output_state = output.state();
+
+        assert_eq!(output.state(), output_state);
+        assert_eq!(output.source(), output_source);
+        assert_eq!(output.address().location().row(), 1,);
 
         let parameter = &bindings.parameters()[0];
         let state = &bindings.state_inputs()[0];
@@ -466,6 +633,7 @@ mod tests {
             &parts.states,
             &parts.partition_inputs,
             parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
         )
         .unwrap();
 
@@ -518,6 +686,7 @@ mod tests {
             &parts.states,
             &parts.partition_inputs,
             parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
         )
         .unwrap();
 
@@ -572,6 +741,7 @@ mod tests {
             &parts.states,
             &parts.partition_inputs,
             parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
         )
         .unwrap();
 
@@ -624,9 +794,9 @@ mod tests {
             &parts.states,
             &parts.partition_inputs,
             parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
         )
         .unwrap();
-
         assert_eq!(bindings.state_inputs().len(), 1);
 
         let binding = &bindings.state_inputs()[0];
@@ -646,6 +816,114 @@ mod tests {
         assert!(
             !physical_state.is_initialized_at(binding.address().location(),),
             "runtime logical reads must not commit state initialization",
+        );
+    }
+
+    #[test]
+    fn state_output_binding_retains_transition_source_and_physical_destination() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let device = device(1);
+        let definition_id = DefinitionId::from(PrimitiveElementKind::Capacitor);
+
+        network
+            .add_device(&definitions, device, definition_id)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0e-6)
+            .unwrap();
+
+        let definition = definitions.get(definition_id).unwrap();
+        let compiled_definition = CompiledDefinition::compile(&definitions, definition).unwrap();
+
+        let partition = compiled_definition
+            .partition(DevicePartitionId::new(0))
+            .unwrap();
+
+        let node_a = IslandNode::net(crate::topology::NetId::try_from(1).unwrap());
+        let node_b = IslandNode::net(crate::topology::NetId::try_from(2).unwrap());
+
+        let terminal_nodes = [node_a, node_b];
+
+        let partition_spec = IslandPartitionSpec::new(
+            device,
+            partition,
+            compiled_definition.state_initializers(),
+            &terminal_nodes,
+        );
+
+        let compiled = compile_island_parts(&[node_a, node_b], &[partition_spec]).unwrap();
+        let parts = compiled.into_parts();
+
+        assert_eq!(parts.ir.state_transition().writes().len(), 1,);
+
+        let write = parts.ir.state_transition().writes()[0];
+
+        let bindings = IslandBindings::new(
+            &network,
+            &parts.states,
+            &parts.partition_inputs,
+            parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
+        )
+        .unwrap();
+
+        assert_eq!(bindings.state_outputs().len(), 1,);
+
+        let binding = &bindings.state_outputs()[0];
+
+        assert_eq!(
+            binding.state(),
+            DeviceState::new(device, DefinitionStateId::new(0),),
+        );
+
+        assert_eq!(binding.source(), write.source(),);
+
+        assert_eq!(
+            binding.address(),
+            PhysicalStateAddress::new(network.device_location(device).unwrap(), 0,),
+        );
+
+        let workspace = parts.ir.value_program().new_workspace();
+
+        assert_eq!(binding.value(&workspace), workspace.value(write.source()),);
+    }
+
+    #[test]
+    fn state_output_binding_rejects_non_finite_source_value() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let device = DeviceId::try_from(1).unwrap();
+
+        network
+            .add_device(
+                &definitions,
+                device,
+                DefinitionId::from(PrimitiveElementKind::TickDelay),
+            )
+            .unwrap();
+
+        let location = network.device_location(device).unwrap();
+
+        let state = DeviceState::new(device, DefinitionStateId::new(0));
+
+        let mut values = ValueProgramBuilder::new();
+
+        let source = values.constant(f64::NAN).unwrap();
+        let workspace = values.finish().new_workspace();
+
+        let binding = StateOutputBinding {
+            state,
+            source,
+            address: PhysicalStateAddress::new(location, 0),
+        };
+
+        assert_eq!(
+            binding.validate_source(&workspace),
+            Err(IslandRuntimeError::NonFiniteState { state },),
         );
     }
 }

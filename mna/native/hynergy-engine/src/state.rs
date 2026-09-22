@@ -1,13 +1,14 @@
 use crate::compile::definition::{DefinitionStateId, DefinitionStateInitializer};
 use crate::compile::island::DeviceState;
-use crate::runtime::island::StagedStateWrite;
 use hynergy_model::device::definition::{DeviceDefinition, DeviceId};
-use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{
     DeviceInsertResult, DeviceLocation, DeviceRemoveResult, Network, PreparedDeviceInsert,
 };
 use hynergy_model::parameter::ParameterId;
 use thiserror::Error;
+
+#[cfg(debug_assertions)]
+use hynergy_model::device::registry::DefinitionRegistry;
 
 const DEVICE_CHUNK_ROWS: usize = 64;
 
@@ -248,6 +249,7 @@ impl PhysicalStateStore {
     }
 
     #[inline]
+    #[cfg(debug_assertions)]
     pub(crate) fn get_at(&self, address: PhysicalStateAddress) -> Option<f64> {
         #[cfg(test)]
         self.physical_read_count
@@ -308,62 +310,6 @@ impl PhysicalStateStore {
                 self.chunks.pop();
             }
         }
-    }
-
-    pub(crate) fn commit_staged(
-        &mut self,
-        network: &Network,
-        writes: &[StagedStateWrite],
-    ) -> Result<(), PhysicalStateError> {
-        #[cfg(debug_assertions)]
-        for (index, write) in writes.iter().enumerate() {
-            let state = write.state();
-
-            debug_assert!(
-                !writes[..index]
-                    .iter()
-                    .any(|previous| previous.state() == state),
-                "state {state:?} has more than one staged write despite single-writer definition compilation",
-            );
-        }
-
-        for write in writes {
-            let state = write.state();
-
-            let location = network
-                .device_location(state.device())
-                .map_err(|_| PhysicalStateError::StateNotInitialized { state })?;
-
-            let Some(chunk) = self.chunks.get(location.chunk_index() as usize) else {
-                return Err(PhysicalStateError::StateNotInitialized { state });
-            };
-
-            let row = location.row() as usize;
-
-            let exists = row < chunk.row_count()
-                && chunk.row_values(row).get(state.state().index()).is_some();
-
-            if !exists {
-                return Err(PhysicalStateError::StateNotInitialized { state });
-            }
-        }
-
-        for write in writes {
-            let state = write.state();
-
-            let location = network
-                .device_location(state.device())
-                .expect("validated state device must remain resident");
-
-            let chunk = &mut self.chunks[location.chunk_index() as usize];
-            let row = location.row() as usize;
-            let state_index = state.state().index();
-
-            chunk.row_values_mut(row)[state_index] = write.value();
-            chunk.set_initialized(row);
-        }
-
-        Ok(())
     }
 
     #[inline]
@@ -503,6 +449,70 @@ impl PhysicalStateStore {
             );
         }
     }
+
+    #[inline]
+    pub(crate) fn validate_address(
+        &self,
+        state: DeviceState,
+        address: PhysicalStateAddress,
+    ) -> Result<(), PhysicalStateError> {
+        if address.state_index() != state.state().index() {
+            return Err(PhysicalStateError::StateNotInitialized { state });
+        }
+
+        let Some(chunk) = self.chunks.get(address.location().chunk_index() as usize) else {
+            return Err(PhysicalStateError::StateNotInitialized { state });
+        };
+
+        let row = address.location().row() as usize;
+
+        if row >= chunk.row_count() || address.state_index() >= chunk.state_count {
+            return Err(PhysicalStateError::StateNotInitialized { state });
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn write_prevalidated(&mut self, address: PhysicalStateAddress, value: f64) {
+        debug_assert!(value.is_finite(), "committed physical state must be finite",);
+
+        let chunk = self
+            .chunks
+            .get_mut(address.location().chunk_index() as usize)
+            .expect("prevalidated state chunk must remain resident");
+
+        let row = address.location().row() as usize;
+
+        debug_assert!(
+            row < chunk.row_count(),
+            "prevalidated state row must remain resident",
+        );
+
+        debug_assert!(
+            address.state_index() < chunk.state_count,
+            "prevalidated state index must remain valid",
+        );
+
+        chunk.row_values_mut(row)[address.state_index()] = value;
+    }
+
+    #[inline]
+    pub(crate) fn mark_initialized_prevalidated(&mut self, location: DeviceLocation) {
+        let chunk = self
+            .chunks
+            .get_mut(location.chunk_index() as usize)
+            .expect("prevalidated state chunk must remain resident");
+
+        let row = location.row() as usize;
+
+        debug_assert!(
+            row < chunk.row_count(),
+            "prevalidated state row must remain resident",
+        );
+
+        chunk.set_initialized(row);
+    }
 }
 
 #[cfg(test)]
@@ -610,10 +620,24 @@ mod tests {
             .unwrap();
 
         let state_insert = state.prepare_add_device(definition, &model_insert);
-
         let insert = network.commit_add_device(model_insert);
 
         state.commit_add_device(state_insert, insert);
+    }
+
+    fn commit_test_state(
+        physical_state: &mut PhysicalStateStore,
+        network: &Network,
+        state: DeviceState,
+        value: f64,
+    ) {
+        let location = network.device_location(state.device()).unwrap();
+
+        let address = PhysicalStateAddress::new(location, state.state().index());
+
+        physical_state.validate_address(state, address).unwrap();
+        physical_state.write_prevalidated(address, value);
+        physical_state.mark_initialized_prevalidated(location);
     }
 
     #[test]
@@ -674,16 +698,9 @@ mod tests {
             );
         }
 
-        state
-            .commit_staged(
-                &network,
-                &[
-                    StagedStateWrite::new(state_key(device(1)), 10.0),
-                    StagedStateWrite::new(state_key(device(2)), 20.0),
-                    StagedStateWrite::new(state_key(device(3)), 30.0),
-                ],
-            )
-            .unwrap();
+        commit_test_state(&mut state, &network, state_key(device(1)), 10.0);
+        commit_test_state(&mut state, &network, state_key(device(2)), 20.0);
+        commit_test_state(&mut state, &network, state_key(device(3)), 30.0);
 
         let removal = network.remove_device(device(2)).unwrap();
 
@@ -724,16 +741,9 @@ mod tests {
             );
         }
 
-        state
-            .commit_staged(
-                &network,
-                &[
-                    StagedStateWrite::new(state_key(device(1)), 10.0),
-                    StagedStateWrite::new(state_key(device(2)), 20.0),
-                    StagedStateWrite::new(state_key(device(3)), 30.0),
-                ],
-            )
-            .unwrap();
+        commit_test_state(&mut state, &network, state_key(device(1)), 10.0);
+        commit_test_state(&mut state, &network, state_key(device(2)), 20.0);
+        commit_test_state(&mut state, &network, state_key(device(3)), 30.0);
 
         let removal = network.remove_device(device(1)).unwrap();
 
@@ -753,6 +763,34 @@ mod tests {
 
         let device = device(1);
         let definition_id = DefinitionId::from(PrimitiveElementKind::TickDelay);
+        let definition = definitions.get(definition_id).unwrap();
+
+        let model_insert = network
+            .prepare_add_device(&definitions, device, definition_id)
+            .unwrap();
+
+        let state_insert = state.prepare_add_device(definition, &model_insert);
+        let insert = network.commit_add_device(model_insert);
+
+        state.commit_add_device(state_insert, insert);
+
+        let semantic = DeviceState::new(device, DefinitionStateId::new(0));
+
+        commit_test_state(&mut state, &network, semantic, 12.5);
+
+        let address = PhysicalStateAddress::new(network.device_location(device).unwrap(), 0);
+
+        assert_eq!(state.get_at(address), Some(12.5),);
+    }
+
+    #[test]
+    fn physical_state_scatter_does_not_initialize_until_finalization() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut state = PhysicalStateStore::default();
+
+        let device = device(1);
+        let definition_id = DefinitionId::from(PrimitiveElementKind::TickDelay);
 
         let definition = definitions.get(definition_id).unwrap();
 
@@ -761,19 +799,29 @@ mod tests {
             .unwrap();
 
         let state_insert = state.prepare_add_device(definition, &model_insert);
-
         let insert = network.commit_add_device(model_insert);
 
         state.commit_add_device(state_insert, insert);
 
         let semantic = DeviceState::new(device, DefinitionStateId::new(0));
+        let location = network.device_location(device).unwrap();
+        let address = PhysicalStateAddress::new(location, 0);
 
-        state
-            .commit_staged(&network, &[StagedStateWrite::new(semantic, 12.5)])
-            .unwrap();
+        state.validate_address(semantic, address).unwrap();
+        state.write_prevalidated(address, 7.5);
 
-        let address = PhysicalStateAddress::new(network.device_location(device).unwrap(), 0);
+        assert_eq!(state.get_at(address), Some(7.5),);
 
-        assert_eq!(state.get_at(address), Some(12.5),);
+        assert!(
+            !state.is_initialized_at(location),
+            "scattering next-state values must not make them visible as committed state yet",
+        );
+
+        state.mark_initialized_prevalidated(location);
+
+        assert!(
+            state.is_initialized_at(location),
+            "initialization is finalized only after every scalar write has completed",
+        );
     }
 }

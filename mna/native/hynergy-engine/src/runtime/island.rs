@@ -1,7 +1,6 @@
 use crate::compile::definition::DefinitionStateId;
 use crate::compile::island::{
     CompiledIsland, CompiledIslandParts, CompiledObserverOutput, DeviceObserver, DeviceState,
-    IslandStateLayout,
 };
 use crate::compile::island_ir::CompiledIslandIr;
 #[cfg(feature = "solver-profiling")]
@@ -14,8 +13,8 @@ use hynergy_model::parameter::ParameterId;
 
 use thiserror::Error;
 
-use crate::runtime::bindings::{IslandBindings, StateInputBinding};
-use crate::state::PhysicalStateStore;
+use crate::runtime::bindings::IslandBindings;
+use crate::state::{PhysicalStateError, PhysicalStateStore};
 
 #[cfg(test)]
 use crate::state::PhysicalStateAddress;
@@ -74,13 +73,15 @@ pub(crate) enum IslandRuntimeError {
 
     #[error("island solution contains a non-finite value")]
     NonFiniteSolution,
+
+    #[error("next-state value for {state:?} is non-finite")]
+    NonFiniteState { state: DeviceState },
 }
 
 #[derive(Debug)]
 pub(crate) struct IslandRuntime {
     system: MnaSystem,
     ir: CompiledIslandIr,
-    states: IslandStateLayout,
     bindings: IslandBindings,
     workspace: ValueWorkspace,
     solution: Box<[f64]>,
@@ -131,7 +132,13 @@ impl IslandRuntime {
             observer_outputs,
         } = compiled.into_parts();
 
-        let bindings = IslandBindings::new(network, &states, &partition_inputs, ir.state_inputs())?;
+        let bindings = IslandBindings::new(
+            network,
+            &states,
+            &partition_inputs,
+            ir.state_inputs(),
+            ir.state_transition().writes(),
+        )?;
 
         let dimension = pattern.dimension();
 
@@ -159,7 +166,6 @@ impl IslandRuntime {
         Ok(Self {
             system,
             ir,
-            states,
             bindings,
             observer_outputs,
             observer_outputs_dirty: false,
@@ -190,6 +196,47 @@ impl IslandRuntime {
             #[cfg(test)]
             unknowns,
         })
+    }
+
+    #[inline]
+    pub(crate) fn validate_state_outputs(
+        &self,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<(), IslandRuntimeError> {
+        for binding in self.bindings.state_outputs() {
+            binding.validate_source(&self.workspace)?;
+
+            physical_state
+                .validate_address(binding.state(), binding.address())
+                .map_err(|error| match error {
+                    PhysicalStateError::MissingInitialParameter { device, parameter } => {
+                        IslandRuntimeError::MissingParameter { device, parameter }
+                    }
+
+                    PhysicalStateError::StateNotInitialized { state } => {
+                        IslandRuntimeError::MissingState {
+                            device: state.device(),
+                            state: state.state(),
+                        }
+                    }
+                })?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn scatter_state_outputs(&self, physical_state: &mut PhysicalStateStore) {
+        for binding in self.bindings.state_outputs() {
+            physical_state.write_prevalidated(binding.address(), binding.value(&self.workspace));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn finalize_state_outputs(&self, physical_state: &mut PhysicalStateStore) {
+        for binding in self.bindings.state_outputs() {
+            physical_state.mark_initialized_prevalidated(binding.address().location());
+        }
     }
 
     pub(crate) fn observer_value(&self, observer: DeviceObserver) -> Option<f64> {
@@ -269,7 +316,7 @@ impl IslandRuntime {
     pub(crate) fn solve_prepared_tick(
         &mut self,
         network: &Network,
-    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError> {
+    ) -> Result<(), IslandRuntimeError> {
         #[cfg(feature = "solver-profiling")]
         {
             let nonlinear = self.nonlinear_scratch.is_some();
@@ -286,7 +333,7 @@ impl IslandRuntime {
             #[cfg(feature = "solver-profiling")]
             self.solver_tick_profile.mark_slept();
 
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         self.solution_valid = false;
@@ -312,32 +359,13 @@ impl IslandRuntime {
             result?;
         }
 
-        let mut next_state = vec![0.0; self.states.state_count()];
-
-        self.ir
-            .state_transition()
-            .execute(&mut next_state, self.workspace.values());
-
-        let mut writes = Vec::with_capacity(self.ir.state_transition().len());
-
-        for write in self.ir.state_transition().writes() {
-            let slot = write.destination();
-
-            let state = self
-                .states
-                .device_state(slot)
-                .expect("compiled state write must have a physical state");
-
-            writes.push(StagedStateWrite::new(state, next_state[slot.index()]));
-        }
-
         self.observer_outputs_dirty = true;
 
         if self.sleepable {
             self.needs_solve = false;
         }
 
-        Ok(writes)
+        Ok(())
     }
 
     fn solve_linear(&mut self) -> Result<(), IslandRuntimeError> {
@@ -513,11 +541,12 @@ impl IslandRuntime {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn solve_tick(
         &mut self,
         network: &Network,
         physical_state: &PhysicalStateStore,
-    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError> {
+    ) -> Result<(), IslandRuntimeError> {
         self.prepare_tick_state_inputs(network, physical_state)?;
         self.solve_prepared_tick(network)
     }
@@ -527,7 +556,7 @@ impl IslandRuntime {
         &mut self,
         network: &Network,
         mut old_state: F,
-    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError>
+    ) -> Result<(), IslandRuntimeError>
     where
         F: FnMut(PhysicalStateAddress) -> Option<f64>,
     {
@@ -543,90 +572,6 @@ impl IslandRuntime {
         }
 
         self.solve_prepared_tick(network)
-    }
-
-    fn solve_tick_with_reader<F>(
-        &mut self,
-        network: &Network,
-        mut read_state: F,
-    ) -> Result<Vec<StagedStateWrite>, IslandRuntimeError>
-    where
-        F: FnMut(&StateInputBinding) -> Result<f64, IslandRuntimeError>,
-    {
-        #[cfg(feature = "solver-profiling")]
-        {
-            let nonlinear = self.nonlinear_scratch.is_some();
-
-            self.solver_tick_profile.begin_tick(nonlinear);
-        }
-
-        if self.sleepable && !self.needs_solve {
-            debug_assert!(
-                self.solution_valid,
-                "sleeping island must retain a valid solution",
-            );
-
-            #[cfg(feature = "solver-profiling")]
-            self.solver_tick_profile.mark_slept();
-
-            return Ok(Vec::new());
-        }
-
-        self.solution_valid = false;
-
-        self.prepare_static(network)?;
-
-        for binding in self.bindings.state_inputs() {
-            let value = read_state(binding)?;
-
-            self.workspace.set_input(binding.input(), value);
-        }
-
-        self.ir.value_program().execute_tick(&mut self.workspace);
-
-        initialize_iteration_latches(&self.ir, &mut self.workspace);
-
-        if self.nonlinear_scratch.is_none() {
-            self.solve_linear()?;
-        } else {
-            let mut scratch = self
-                .nonlinear_scratch
-                .take()
-                .expect("nonlinear scratch was checked above");
-
-            let result = self.solve_nonlinear(&mut scratch);
-
-            self.nonlinear_scratch = Some(scratch);
-
-            result?;
-        }
-
-        let mut next_state = vec![0.0; self.states.state_count()];
-
-        self.ir
-            .state_transition()
-            .execute(&mut next_state, self.workspace.values());
-
-        let mut writes = Vec::with_capacity(self.ir.state_transition().len());
-
-        for write in self.ir.state_transition().writes() {
-            let slot = write.destination();
-
-            let state = self
-                .states
-                .device_state(slot)
-                .expect("compiled state write must have a physical state");
-
-            writes.push(StagedStateWrite::new(state, next_state[slot.index()]));
-        }
-
-        self.observer_outputs_dirty = true;
-
-        if self.sleepable {
-            self.needs_solve = false;
-        }
-
-        Ok(writes)
     }
 
     fn load_parameters(&mut self, network: &Network) -> Result<StaticChanges, IslandRuntimeError> {
@@ -734,6 +679,16 @@ impl IslandRuntime {
     #[inline]
     pub(crate) fn mark_observer_outputs_clean(&mut self) {
         self.observer_outputs_dirty = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_state_output_address_for_test(
+        &mut self,
+        index: usize,
+        address: PhysicalStateAddress,
+    ) {
+        self.bindings
+            .set_state_output_address_for_test(index, address);
     }
 }
 
@@ -937,29 +892,6 @@ fn all_finite(values: &[f64]) -> bool {
     values.iter().all(|value| value.is_finite())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct StagedStateWrite {
-    state: DeviceState,
-    value: f64,
-}
-
-impl StagedStateWrite {
-    #[inline]
-    pub(crate) const fn new(state: DeviceState, value: f64) -> Self {
-        Self { state, value }
-    }
-
-    #[inline]
-    pub(crate) const fn state(self) -> DeviceState {
-        self.state
-    }
-
-    #[inline]
-    pub(crate) const fn value(self) -> f64 {
-        self.value
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 struct StaticChanges {
     values: bool,
@@ -1043,6 +975,120 @@ mod test {
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
 
         (network, compiled)
+    }
+
+    fn add_device_with_physical_state(
+        definitions: &DefinitionRegistry,
+        network: &mut Network,
+        physical_state: &mut PhysicalStateStore,
+        device: DeviceId,
+        definition_id: DefinitionId,
+    ) {
+        let definition = definitions.get(definition_id).unwrap();
+
+        let model_insert = network
+            .prepare_add_device(definitions, device, definition_id)
+            .unwrap();
+
+        let state_insert = physical_state.prepare_add_device(definition, &model_insert);
+        let insert = network.commit_add_device(model_insert);
+
+        physical_state.commit_add_device(state_insert, insert);
+    }
+
+    fn capacitor_runtime_with_physical_state() -> (
+        Network,
+        PhysicalStateStore,
+        IslandRuntime,
+        PhysicalStateAddress,
+    ) {
+        let definitions = DefinitionRegistry::new();
+
+        let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
+
+        let wire_a = WireId::try_from(1).unwrap();
+        let wire_b = WireId::try_from(2).unwrap();
+
+        let conductance = DeviceId::try_from(1).unwrap();
+        let capacitor = DeviceId::try_from(2).unwrap();
+        let source = DeviceId::try_from(3).unwrap();
+
+        network.add_wire(wire_a).unwrap();
+        network.add_wire(wire_b).unwrap();
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            conductance,
+            DefinitionId::from(PrimitiveElementKind::Conductance),
+        );
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            capacitor,
+            DefinitionId::from(PrimitiveElementKind::Capacitor),
+        );
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            source,
+            DefinitionId::from(PrimitiveElementKind::CurrentSource),
+        );
+
+        network
+            .attach_terminal(wire_a, conductance, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(wire_b, conductance, TerminalId::new(1))
+            .unwrap();
+
+        network
+            .attach_terminal(wire_a, capacitor, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(wire_b, capacitor, TerminalId::new(1))
+            .unwrap();
+
+        network
+            .attach_terminal(wire_b, source, TerminalId::new(0))
+            .unwrap();
+
+        network
+            .attach_terminal(wire_a, source, TerminalId::new(1))
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, conductance, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, capacitor, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        network
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 2.0)
+            .unwrap();
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(capacitor, DevicePartitionId::new(0)),
+        );
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+        let runtime = IslandRuntime::new(compiled, &network, 0.5).unwrap();
+        let state = PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
+
+        (network, physical_state, runtime, state)
     }
 
     #[test]
@@ -1270,11 +1316,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime
+        let (): () = runtime
             .solve_tick_with_state_reader(&network, |_| None)
             .unwrap();
-
-        assert!(writes.is_empty());
 
         let voltage = runtime.node_voltage(positive_node).unwrap()
             - runtime.node_voltage(negative_node).unwrap();
@@ -1361,7 +1405,7 @@ mod test {
     }
 
     #[test]
-    fn capacitor_tick_reads_old_state_and_stages_next_state() {
+    fn capacitor_tick_reads_old_state_and_retains_next_state() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
 
@@ -1452,7 +1496,7 @@ mod test {
         let capacitor_state =
             PhysicalStateAddress::new(network.device_location(capacitor).unwrap(), 0);
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |state| {
                 (state == capacitor_state).then_some(3.0)
             })
@@ -1462,12 +1506,19 @@ mod test {
 
         assert!((voltage - 2.8).abs() < 1.0e-12);
 
-        assert_eq!(writes.len(), 1);
+        let outputs = runtime.bindings.state_outputs();
 
+        assert_eq!(outputs.len(), 1);
+
+        let output = &outputs[0];
         let semantic_state = DeviceState::new(capacitor, DefinitionStateId::new(0));
 
-        assert_eq!(writes[0].state(), semantic_state);
-        assert!((writes[0].value() - 2.8).abs() < 1.0e-12);
+        assert_eq!(output.state(), semantic_state,);
+
+        assert!(
+            (output.value(&runtime.workspace) - 2.8).abs() < 1.0e-12,
+            "next state must remain retained in the runtime workspace",
+        );
     }
 
     #[test]
@@ -1861,11 +1912,9 @@ mod test {
         let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |_| None)
             .unwrap();
-
-        assert!(writes.is_empty());
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -1887,7 +1936,7 @@ mod test {
                 profile
                     .iterations()
                     .iter()
-                    .map(|iteration| iteration.matrix_source_changes())
+                    .map(|iteration| { iteration.matrix_source_changes() })
                     .collect::<Vec<_>>(),
                 vec![0, 1, 0],
             );
@@ -2302,27 +2351,38 @@ mod test {
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
         let state = PhysicalStateAddress::new(network.device_location(buffer).unwrap(), 0);
+        let semantic_state = DeviceState::new(buffer, DefinitionStateId::new(0));
+
+        let read_next_mode = |runtime: &IslandRuntime| {
+            let outputs = runtime.bindings.state_outputs();
+
+            assert_eq!(outputs.len(), 1);
+
+            let output = &outputs[0];
+
+            assert_eq!(output.state(), semantic_state,);
+
+            output.value(&runtime.workspace)
+        };
+
         let mut mode = 0.0;
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |candidate| {
                 (candidate == state).then_some(mode)
             })
             .unwrap();
 
-        assert_eq!(writes.len(), 1);
+        let next_mode = read_next_mode(&runtime);
 
-        let semantic_state = DeviceState::new(buffer, DefinitionStateId::new(0));
-
-        assert_eq!(writes[0].state(), semantic_state);
-        assert_eq!(writes[0].value(), 0.0);
+        assert_eq!(next_mode, 0.0);
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
         assert!((voltage - 1.0).abs() < 1.0e-9);
 
-        mode = writes[0].value();
+        mode = next_mode;
 
         network
             .set_device_parameter(&definitions, input_source, ParameterId::new(0), 4.0)
@@ -2330,20 +2390,22 @@ mod test {
 
         runtime.mark_numerical_dirty();
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |candidate| {
                 (candidate == state).then_some(mode)
             })
             .unwrap();
 
-        assert_eq!(writes[0].value(), 1.0);
+        let next_mode = read_next_mode(&runtime);
+
+        assert_eq!(next_mode, 1.0);
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
         assert!((voltage - 4.0).abs() < 1.0e-9);
 
-        mode = writes[0].value();
+        mode = next_mode;
 
         network
             .set_device_parameter(&definitions, input_source, ParameterId::new(0), 2.0)
@@ -2351,20 +2413,22 @@ mod test {
 
         runtime.mark_numerical_dirty();
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |candidate| {
                 (candidate == state).then_some(mode)
             })
             .unwrap();
 
-        assert_eq!(writes[0].value(), 1.0);
+        let next_mode = read_next_mode(&runtime);
+
+        assert_eq!(next_mode, 1.0);
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
 
         assert!((voltage - 4.0).abs() < 1.0e-9);
 
-        mode = writes[0].value();
+        mode = next_mode;
 
         network
             .set_device_parameter(&definitions, input_source, ParameterId::new(0), 0.0)
@@ -2372,13 +2436,15 @@ mod test {
 
         runtime.mark_numerical_dirty();
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |candidate| {
                 (candidate == state).then_some(mode)
             })
             .unwrap();
 
-        assert_eq!(writes[0].value(), 0.0);
+        let next_mode = read_next_mode(&runtime);
+
+        assert_eq!(next_mode, 0.0);
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -2485,11 +2551,9 @@ mod test {
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |_| None)
             .unwrap();
-
-        assert!(writes.is_empty());
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -2503,11 +2567,9 @@ mod test {
 
         runtime.mark_numerical_dirty();
 
-        let writes = runtime
+        runtime
             .solve_tick_with_state_reader(&network, |_| None)
             .unwrap();
-
-        assert!(writes.is_empty());
 
         let voltage =
             runtime.node_voltage(output_node).unwrap() - runtime.node_voltage(common_node).unwrap();
@@ -2634,5 +2696,61 @@ mod test {
         let observer = DeviceObserver::new(source, DefinitionObserverId::new(0));
 
         assert_eq!(runtime.observer_value(observer), Some(9.0),);
+    }
+
+    #[test]
+    fn stateful_runtime_validates_bound_state_outputs() {
+        let (network, physical_state, mut runtime, _state) =
+            capacitor_runtime_with_physical_state();
+
+        runtime.solve_tick(&network, &physical_state).unwrap();
+        runtime.validate_state_outputs(&physical_state).unwrap();
+    }
+
+    #[test]
+    fn scattering_state_outputs_does_not_finalize_state_rows() {
+        let (network, mut physical_state, mut runtime, state) =
+            capacitor_runtime_with_physical_state();
+
+        runtime.solve_tick(&network, &physical_state).unwrap();
+        runtime.validate_state_outputs(&physical_state).unwrap();
+
+        assert!(!physical_state.is_initialized_at(state.location(),),);
+
+        runtime.scatter_state_outputs(&mut physical_state);
+
+        assert!(
+            (physical_state.get_at(state).unwrap() - 0.4).abs() < 1.0e-12,
+            "scatter must copy the retained next-state value into physical storage",
+        );
+
+        assert!(
+            !physical_state.is_initialized_at(state.location(),),
+            "scattering values must not finalize state rows",
+        );
+    }
+
+    #[test]
+    fn finalizing_state_outputs_marks_state_rows_initialized() {
+        let (network, mut physical_state, mut runtime, state) =
+            capacitor_runtime_with_physical_state();
+
+        runtime.solve_tick(&network, &physical_state).unwrap();
+        runtime.validate_state_outputs(&physical_state).unwrap();
+        runtime.scatter_state_outputs(&mut physical_state);
+
+        assert!(!physical_state.is_initialized_at(state.location(),),);
+
+        runtime.finalize_state_outputs(&mut physical_state);
+
+        assert!(
+            physical_state.is_initialized_at(state.location(),),
+            "finalization must make scattered state visible as committed state",
+        );
+
+        assert!(
+            (physical_state.get_at(state).unwrap() - 0.4).abs() < 1.0e-12,
+            "finalization must not modify the already-scattered scalar",
+        );
     }
 }

@@ -8,7 +8,7 @@ mod topology;
 use crate::compile::island::{DeviceObserver, IslandCompileError, compile_topology_island};
 #[cfg(feature = "solver-profiling")]
 pub use crate::profiling::{SolverIslandProfile, SolverIterationProfile, SolverTickProfile};
-use crate::runtime::island::{IslandRuntime, IslandRuntimeError, StagedStateWrite};
+use crate::runtime::island::{IslandRuntime, IslandRuntimeError};
 pub use crate::runtime::subscription::{SubscriptionError, SubscriptionId};
 use crate::runtime::subscription::{SubscriptionRegistry, SubscriptionUpdate};
 use crate::state::{PhysicalStateError, PhysicalStateStore};
@@ -75,7 +75,8 @@ impl From<WorldTickError> for EngineTickError {
 
                 IslandRuntimeError::NonFiniteMatrix => Self::NonFiniteMatrix,
 
-                IslandRuntimeError::NonFiniteSolution => Self::NonFiniteSolution,
+                IslandRuntimeError::NonFiniteSolution
+                | IslandRuntimeError::NonFiniteState { .. } => Self::NonFiniteSolution,
 
                 IslandRuntimeError::Mna(error) => match error {
                     MnaError::Singular { .. } => Self::Singular,
@@ -454,39 +455,39 @@ impl World {
 
         self.sync_island_runtimes(definitions)?;
 
-        let live_islands = self
-            .derived_topology
-            .islands()
-            .map(|(island, _)| island)
-            .collect::<Vec<_>>();
+        {
+            let topology = &self.derived_topology;
+            let network = &self.network;
+            let physical_state = &self.physical_state;
+            let runtimes = &mut self.island_runtimes;
 
-        let network = &self.network;
-        let physical_state = &self.physical_state;
-        let runtimes = &mut self.island_runtimes;
+            for (island, _) in topology.islands() {
+                let runtime = runtimes
+                    .get_mut(island.index())
+                    .and_then(Option::as_mut)
+                    .expect("live island must have a runtime after synchronization");
 
-        for &island in &live_islands {
-            let runtime = runtimes
-                .get_mut(island.index())
-                .and_then(Option::as_mut)
-                .expect("live island must have a runtime after synchronization");
-
-            runtime.prepare_tick_state_inputs(network, physical_state)?;
+                runtime.prepare_tick_state_inputs(network, physical_state)?;
+            }
         }
 
-        let mut staged = Vec::<StagedStateWrite>::new();
+        {
+            let topology = &self.derived_topology;
+            let network = &self.network;
+            let runtimes = &mut self.island_runtimes;
 
-        for island in live_islands {
-            let runtime = runtimes
-                .get_mut(island.index())
-                .and_then(Option::as_mut)
-                .expect("live island must have a runtime after synchronization");
+            for (island, _) in topology.islands() {
+                let runtime = runtimes
+                    .get_mut(island.index())
+                    .and_then(Option::as_mut)
+                    .expect("live island must have a runtime after synchronization");
 
-            let writes = runtime.solve_prepared_tick(network)?;
-
-            staged.extend(writes);
+                runtime.solve_prepared_tick(network)?;
+            }
         }
 
-        self.physical_state.commit_staged(network, &staged)?;
+        self.commit_runtime_state_outputs()?;
+
         self.collect_subscription_updates();
 
         Ok(())
@@ -791,105 +792,133 @@ impl World {
     ) -> Result<(), WorldTickError> {
         let timestep = self.config.timestep();
 
-        let live_islands = self
-            .derived_topology
-            .islands()
-            .map(|(island, _)| island)
-            .collect::<Vec<_>>();
-
-        let topology_dirty = self
-            .derived_topology
-            .invalidation()
-            .topology_dirty_islands()
-            .to_vec();
-
-        let binding_dirty = self
-            .derived_topology
-            .invalidation()
-            .binding_dirty_islands()
-            .to_vec();
-
-        let retired = self
-            .derived_topology
-            .invalidation()
-            .retired_islands()
-            .to_vec();
-
-        let numerical_dirty = self
-            .derived_topology
-            .invalidation()
-            .numerical_dirty_islands()
-            .to_vec();
-
-        for island in retired {
-            if let Some(runtime) = self.island_runtimes.get_mut(island.index()) {
-                *runtime = None;
-            }
-        }
-
-        for island in live_islands {
-            if self.island_runtimes.len() <= island.index() {
-                self.island_runtimes
-                    .resize_with(island.index() + 1, || None);
-            }
-
-            let needs_compile =
-                self.island_runtimes[island.index()].is_none() || topology_dirty.contains(&island);
-
-            if !needs_compile {
-                continue;
-            }
-
-            let compiled = compile_topology_island(
-                definitions,
-                &self.network,
-                &self.derived_topology,
-                island,
-            )?;
-
-            let runtime = IslandRuntime::new(compiled, &self.network, timestep)?;
-
-            self.island_runtimes[island.index()] = Some(runtime);
-        }
-
-        for island in binding_dirty {
-            let Some(runtime) = self
-                .island_runtimes
-                .get_mut(island.index())
-                .and_then(Option::as_mut)
-            else {
-                continue;
-            };
-
-            runtime.rebind(&self.network)?;
-        }
-
-        for island in numerical_dirty {
-            let Some(runtime) = self
-                .island_runtimes
-                .get_mut(island.index())
-                .and_then(Option::as_mut)
-            else {
-                continue;
-            };
-
-            runtime.mark_numerical_dirty();
-        }
-
-        #[cfg(debug_assertions)]
         {
-            for (island, _) in self.derived_topology.islands() {
-                let runtime = self
-                    .island_runtimes
-                    .get(island.index())
-                    .and_then(Option::as_ref)
-                    .expect("live island must have a runtime after synchronization");
+            let topology = &self.derived_topology;
+            let invalidation = topology.invalidation();
 
-                runtime.debug_assert_bindings_valid(&self.network, &self.physical_state);
+            let topology_dirty = invalidation.topology_dirty_islands();
+            let binding_dirty = invalidation.binding_dirty_islands();
+            let retired = invalidation.retired_islands();
+            let numerical_dirty = invalidation.numerical_dirty_islands();
+
+            let network = &self.network;
+            #[cfg(debug_assertions)]
+            let physical_state = &self.physical_state;
+            let runtimes = &mut self.island_runtimes;
+
+            for &island in retired {
+                if let Some(runtime) = runtimes.get_mut(island.index()) {
+                    *runtime = None;
+                }
+            }
+
+            for (island, _) in topology.islands() {
+                if runtimes.len() <= island.index() {
+                    runtimes.resize_with(island.index() + 1, || None);
+                }
+
+                let needs_compile =
+                    runtimes[island.index()].is_none() || topology_dirty.contains(&island);
+
+                if !needs_compile {
+                    continue;
+                }
+
+                let compiled = compile_topology_island(definitions, network, topology, island)?;
+                let runtime = IslandRuntime::new(compiled, network, timestep)?;
+
+                runtimes[island.index()] = Some(runtime);
+            }
+
+            for &island in binding_dirty {
+                let Some(runtime) = runtimes.get_mut(island.index()).and_then(Option::as_mut)
+                else {
+                    continue;
+                };
+
+                runtime.rebind(network)?;
+            }
+
+            for &island in numerical_dirty {
+                let Some(runtime) = runtimes.get_mut(island.index()).and_then(Option::as_mut)
+                else {
+                    continue;
+                };
+
+                runtime.mark_numerical_dirty();
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                for (island, _) in topology.islands() {
+                    let runtime = runtimes
+                        .get(island.index())
+                        .and_then(Option::as_ref)
+                        .expect("live island must have a runtime after synchronization");
+
+                    runtime.debug_assert_bindings_valid(network, physical_state);
+                }
             }
         }
 
         self.derived_topology.clear_invalidation();
+
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_runtime_state_outputs(&self) -> Result<(), IslandRuntimeError> {
+        for (island, _) in self.derived_topology.islands() {
+            let runtime = self
+                .island_runtimes
+                .get(island.index())
+                .and_then(Option::as_ref)
+                .expect("live island must have a runtime after synchronization");
+
+            runtime.validate_state_outputs(&self.physical_state)?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn scatter_runtime_state_outputs(&mut self) {
+        let topology = &self.derived_topology;
+        let runtimes = &self.island_runtimes;
+        let physical_state = &mut self.physical_state;
+
+        for (island, _) in topology.islands() {
+            let runtime = runtimes
+                .get(island.index())
+                .and_then(Option::as_ref)
+                .expect("live island must have a runtime after synchronization");
+
+            runtime.scatter_state_outputs(physical_state);
+        }
+    }
+
+    #[inline]
+    fn finalize_runtime_state_outputs(&mut self) {
+        let topology = &self.derived_topology;
+        let runtimes = &self.island_runtimes;
+        let physical_state = &mut self.physical_state;
+
+        for (island, _) in topology.islands() {
+            let runtime = runtimes
+                .get(island.index())
+                .and_then(Option::as_ref)
+                .expect("live island must have a runtime after synchronization");
+
+            runtime.finalize_state_outputs(physical_state);
+        }
+    }
+
+    #[inline]
+    fn commit_runtime_state_outputs(&mut self) -> Result<(), IslandRuntimeError> {
+        self.validate_runtime_state_outputs()?;
+
+        self.scatter_runtime_state_outputs();
+        self.finalize_runtime_state_outputs();
 
         Ok(())
     }
@@ -931,7 +960,6 @@ mod tests {
     use super::*;
     use crate::compile::definition::{DefinitionStateId, DefinitionStateInitializer};
     use crate::compile::island::{DeviceState, IslandNode};
-    use crate::runtime::island::StagedStateWrite;
     use crate::state::{PhysicalStateAddress, PhysicalStateStore};
     use crate::topology::DeviceComponent;
     use hynergy_model::circuit::{Element, ValueRef};
@@ -1249,36 +1277,6 @@ mod tests {
         assert_eq!(
             engine.unsubscribe(world, subscription),
             Err(SubscriptionError::UnknownSubscription { subscription }),
-        );
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(
-        expected = "has more than one staged write despite single-writer definition compilation"
-    )]
-    fn duplicate_staged_write_violates_single_writer_invariant() {
-        let definitions = DefinitionRegistry::new();
-        let mut world = World::new(world_config());
-
-        let capacitor = device(1);
-
-        world
-            .add_device(
-                &definitions,
-                capacitor,
-                PrimitiveElementKind::Capacitor.into(),
-            )
-            .unwrap();
-
-        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
-
-        let _ = world.physical_state.commit_staged(
-            &world.network,
-            &[
-                StagedStateWrite::new(state, 3.0),
-                StagedStateWrite::new(state, 7.0),
-            ],
         );
     }
 
@@ -2085,8 +2083,9 @@ mod tests {
             "successful tick must commit the state row",
         );
     }
+
     #[test]
-    fn failed_state_commit_does_not_modify_state() {
+    fn failed_state_validation_does_not_modify_state() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::new(world_config());
 
@@ -2102,18 +2101,21 @@ mod tests {
 
         let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
         let missing = DeviceState::new(capacitor, DefinitionStateId::new(1));
+        let location = world.network.device_location(capacitor).unwrap();
+        let valid_address = PhysicalStateAddress::new(location, 0);
+        let missing_address = PhysicalStateAddress::new(location, 1);
 
-        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0));
+        assert_eq!(world.physical_state.get_at(valid_address), Some(0.0),);
+        assert!(!world.physical_state.is_initialized_at(location),);
+
+        world
+            .physical_state
+            .validate_address(state, valid_address)
+            .unwrap();
 
         let error = world
             .physical_state
-            .commit_staged(
-                &world.network,
-                &[
-                    StagedStateWrite::new(state, 3.0),
-                    StagedStateWrite::new(missing, 7.0),
-                ],
-            )
+            .validate_address(missing, missing_address)
             .unwrap_err();
 
         assert_eq!(
@@ -2121,7 +2123,16 @@ mod tests {
             PhysicalStateError::StateNotInitialized { state: missing },
         );
 
-        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0));
+        assert_eq!(
+            world.physical_state.get_at(valid_address),
+            Some(0.0),
+            "validation failure must not modify an earlier valid state",
+        );
+
+        assert!(
+            !world.physical_state.is_initialized_at(location),
+            "validation failure must not initialize the row",
+        );
     }
 
     #[test]
@@ -3281,18 +3292,12 @@ mod tests {
             .unwrap();
 
         let location = network.device_location(device).unwrap();
-
         let address = PhysicalStateAddress::new(location, 0);
+        let semantic = DeviceState::new(device, DefinitionStateId::new(0));
 
-        state
-            .commit_staged(
-                &network,
-                &[StagedStateWrite::new(
-                    DeviceState::new(device, DefinitionStateId::new(0)),
-                    11.0,
-                )],
-            )
-            .unwrap();
+        state.validate_address(semantic, address).unwrap();
+        state.write_prevalidated(address, 11.0);
+        state.mark_initialized_prevalidated(location);
 
         assert!(state.is_initialized_at(location));
 
@@ -3352,5 +3357,87 @@ mod tests {
         );
 
         assert!(!state.is_initialized_at(location),);
+    }
+
+    #[test]
+    fn failed_global_state_validation_prevents_all_scatter() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let first_a = wire(1);
+        let first_b = wire(2);
+        let second_a = wire(3);
+        let second_b = wire(4);
+
+        for wire in [first_a, first_b, second_a, second_b] {
+            world.add_wire(wire).unwrap();
+        }
+
+        let first_conductance = device(1);
+        let first_capacitor = device(2);
+        let second_conductance = device(3);
+        let second_capacitor = device(4);
+
+        for (device, kind) in [
+            (first_conductance, PrimitiveElementKind::Conductance),
+            (first_capacitor, PrimitiveElementKind::Capacitor),
+            (second_conductance, PrimitiveElementKind::Conductance),
+            (second_capacitor, PrimitiveElementKind::Capacitor),
+        ] {
+            world.add_device(&definitions, device, kind.into()).unwrap();
+
+            world
+                .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
+                .unwrap();
+        }
+
+        world.sync_island_runtimes(&definitions).unwrap();
+
+        let first_state = DeviceState::new(first_capacitor, DefinitionStateId::new(0));
+        let first_location = world.network.device_location(first_capacitor).unwrap();
+        let first_address = PhysicalStateAddress::new(first_location, 0);
+
+        world
+            .physical_state
+            .validate_address(first_state, first_address)
+            .unwrap();
+
+        world.physical_state.write_prevalidated(first_address, 7.0);
+
+        assert_eq!(world.physical_state.get_at(first_address), Some(7.0),);
+        assert!(!world.physical_state.is_initialized_at(first_location),);
+
+        let second_island = world.derived_topology.component_island(
+            &world.network,
+            DeviceComponent::new(second_capacitor, DevicePartitionId::new(0)),
+        );
+
+        let second_location = world.network.device_location(second_capacitor).unwrap();
+
+        world.island_runtimes[second_island.index()]
+            .as_mut()
+            .unwrap()
+            .set_state_output_address_for_test(0, PhysicalStateAddress::new(second_location, 1));
+
+        let error = world.commit_runtime_state_outputs().unwrap_err();
+
+        assert_eq!(
+            error,
+            IslandRuntimeError::MissingState {
+                device: second_capacitor,
+                state: DefinitionStateId::new(0),
+            },
+        );
+
+        assert_eq!(
+            world.physical_state.get_at(first_address),
+            Some(7.0),
+            "failure in another island must occur before any earlier scalar is scattered",
+        );
+
+        assert!(
+            !world.physical_state.is_initialized_at(first_location),
+            "failed global validation must not finalize any earlier row",
+        );
     }
 }
