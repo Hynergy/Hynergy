@@ -85,12 +85,13 @@ impl BoundDiscreteMetadata {
         }
     }
 
-    #[inline]
     #[cfg(test)]
+    #[inline]
     pub(crate) fn modes(&self) -> &[ValueSlot] {
         &self.modes
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn complementary_drivers(&self) -> &[BoundComplementaryDriver] {
         &self.complementary_drivers

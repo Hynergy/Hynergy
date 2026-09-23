@@ -1301,11 +1301,13 @@ impl CompiledDefinitionTemplate {
         self.state_count
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn discrete_modes(&self) -> &[LocalValueId] {
         &self.discrete_modes
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn complementary_drivers(&self) -> &[LocalComplementaryDriver] {
         &self.complementary_drivers
