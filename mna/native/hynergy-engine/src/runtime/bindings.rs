@@ -90,10 +90,6 @@ impl StateInputBinding {
         physical_state
             .read_logical_at(network, self.state.device(), self.address, self.initializer)
             .map_err(|error| match error {
-                PhysicalStateError::MissingInitialParameter { device, parameter } => {
-                    IslandRuntimeError::MissingParameter { device, parameter }
-                }
-
                 PhysicalStateError::StateNotInitialized { state } => {
                     IslandRuntimeError::MissingState {
                         device: state.device(),
@@ -800,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn state_input_binding_carries_precompiled_initializer() {
+    fn state_input_binding_carries_precompiled_literal_initializer() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
         let mut physical_state = PhysicalStateStore::default();
@@ -815,10 +811,6 @@ mod tests {
             device,
             definition,
         );
-
-        network
-            .set_device_parameter(&definitions, device, ParameterId::new(0), 3.25)
-            .unwrap();
 
         let topology = DerivedTopology::from_network(&network, &definitions);
 
@@ -847,12 +839,12 @@ mod tests {
 
         assert_eq!(
             binding.initializer(),
-            DefinitionStateInitializer::Parameter(ParameterId::new(0),),
+            DefinitionStateInitializer::Literal(0.0),
         );
 
         assert_eq!(
             binding.read_logical(&network, &physical_state,).unwrap(),
-            3.25,
+            0.0,
         );
 
         assert!(

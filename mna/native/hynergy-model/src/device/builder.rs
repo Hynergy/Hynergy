@@ -1085,7 +1085,7 @@ mod tests {
                     output_positive,
                     output_negative,
                 ],
-                vec![ValueRef::Literal(0.0)],
+                Vec::new(),
             ))
             .unwrap();
 
@@ -1424,7 +1424,7 @@ mod tests {
                     output_positive,
                     output_negative,
                 ],
-                vec![ValueRef::Literal(0.0)],
+                Vec::new(),
             ))
             .unwrap();
 
@@ -1465,7 +1465,7 @@ mod tests {
                         output_positive,
                         output_negative,
                     ],
-                    vec![ValueRef::Literal(0.0)],
+                    Vec::new(),
                 ))
                 .unwrap();
 

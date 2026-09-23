@@ -1321,7 +1321,6 @@ mod tests {
                 ATTACH_TERMINAL,
                 &u32_payload(&[output_negative, output_load, 1]),
             ),
-            world_command(SET_DEVICE_PARAMETER, &set_parameter_payload(delay, 0, 1.0)),
             world_command(
                 SET_DEVICE_PARAMETER,
                 &set_parameter_payload(input_source, 0, 5.0),
@@ -1367,8 +1366,8 @@ mod tests {
         assert_eq!(result.record_count, 3);
 
         assert_close(record_value(&records, input_voltage), 5.0);
-        assert_close(record_value(&records, output_voltage), 1.0);
-        assert_close(record_value(&records, output_current), -2.0);
+        assert_close(record_value(&records, output_voltage), 0.0);
+        assert_close(record_value(&records, output_current), 0.0);
 
         records.fill(subscription_record_sentinel());
         result = tick_result_sentinel();

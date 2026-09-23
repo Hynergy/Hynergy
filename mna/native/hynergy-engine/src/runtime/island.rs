@@ -285,10 +285,6 @@ impl IslandRuntime {
             physical_state
                 .validate_address(binding.state(), binding.address())
                 .map_err(|error| match error {
-                    PhysicalStateError::MissingInitialParameter { device, parameter } => {
-                        IslandRuntimeError::MissingParameter { device, parameter }
-                    }
-
                     PhysicalStateError::StateNotInitialized { state } => {
                         IslandRuntimeError::MissingState {
                             device: state.device(),
