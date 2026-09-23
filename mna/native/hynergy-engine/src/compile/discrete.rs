@@ -510,10 +510,12 @@ fn compile_driver_dependencies(
     )
 }
 
+type FrontierDependencies = (Box<[u32]>, Box<[u32]>, Box<[u32]>);
+
 fn compile_initial_frontier_dependencies(
     ir: &CompiledIslandIr,
     drivers: &[QualifiedComplementaryDriver],
-) -> (Box<[u32]>, Box<[u32]>, Box<[u32]>) {
+) -> FrontierDependencies {
     let value_count = ir.value_program().value_count();
     let stability_values = ir.iteration_stability_values();
 
