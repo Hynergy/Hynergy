@@ -175,6 +175,11 @@ impl MatrixBarrierSource {
 #[derive(Debug)]
 pub(crate) struct CompiledDiscretePlan {
     drivers: Box<[QualifiedComplementaryDriver]>,
+    dependent_offsets: Box<[u32]>,
+    dependents: Box<[u32]>,
+    stability_dependent_offsets: Box<[u32]>,
+    stability_dependents: Box<[u32]>,
+    conservative_seed_drivers: Box<[u32]>,
     matrix_barriers: Box<[MatrixBarrierSource]>,
     rhs_barriers: Box<[ValueSlot]>,
 }
@@ -183,6 +188,27 @@ impl CompiledDiscretePlan {
     #[inline]
     pub(crate) fn drivers(&self) -> &[QualifiedComplementaryDriver] {
         &self.drivers
+    }
+
+    #[inline]
+    pub(crate) fn dependents_for(&self, producer: usize) -> &[u32] {
+        let start = self.dependent_offsets[producer] as usize;
+        let end = self.dependent_offsets[producer + 1] as usize;
+
+        &self.dependents[start..end]
+    }
+
+    #[inline]
+    pub(crate) fn stability_dependents_for(&self, stability_index: usize) -> &[u32] {
+        let start = self.stability_dependent_offsets[stability_index] as usize;
+        let end = self.stability_dependent_offsets[stability_index + 1] as usize;
+
+        &self.stability_dependents[start..end]
+    }
+
+    #[inline]
+    pub(crate) fn conservative_seed_drivers(&self) -> &[u32] {
+        &self.conservative_seed_drivers
     }
 
     #[inline]
@@ -358,11 +384,223 @@ pub(crate) fn compile_discrete_plan(
     rhs_barriers.sort_unstable();
     rhs_barriers.dedup();
 
+    let (dependent_offsets, dependents) = compile_driver_dependencies(ir, &qualified);
+    let (stability_dependent_offsets, stability_dependents, conservative_seed_drivers) =
+        compile_initial_frontier_dependencies(ir, &qualified);
+
+    debug_assert_eq!(dependent_offsets.len(), qualified.len() + 1);
+    debug_assert_eq!(
+        stability_dependent_offsets.len(),
+        ir.iteration_stability_values().len() + 1,
+    );
+
     Some(Box::new(CompiledDiscretePlan {
         drivers: qualified.into_boxed_slice(),
+        dependent_offsets,
+        dependents,
+        stability_dependent_offsets,
+        stability_dependents,
+        conservative_seed_drivers,
         matrix_barriers: matrix_barriers.into_boxed_slice(),
         rhs_barriers: rhs_barriers.into_boxed_slice(),
     }))
+}
+
+fn compile_driver_dependencies(
+    ir: &CompiledIslandIr,
+    drivers: &[QualifiedComplementaryDriver],
+) -> (Box<[u32]>, Box<[u32]>) {
+    let value_count = ir.value_program().value_count();
+
+    let mut value_dependencies = vec![SmallVec::<[ValueSlot; 2]>::new(); value_count];
+
+    ir.value_program()
+        .visit_iteration_dependencies(|destination, source| {
+            value_dependencies[destination.index()].push(source);
+        });
+
+    let mut producers_by_output = drivers
+        .iter()
+        .enumerate()
+        .map(|(index, driver)| {
+            (
+                driver.output(),
+                u32::try_from(index).expect("discrete driver index must fit u32"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    producers_by_output.sort_unstable_by_key(|&(output, _)| output);
+
+    let mut producer_by_solution_value = vec![None; value_count];
+
+    for &(unknown, input) in ir.solution_inputs() {
+        if let Ok(position) =
+            producers_by_output.binary_search_by_key(&unknown, |&(output, _)| output)
+        {
+            producer_by_solution_value[input.value().index()] =
+                Some(producers_by_output[position].1);
+        }
+    }
+
+    let mut adjacency = vec![SmallVec::<[u32; 4]>::new(); drivers.len()];
+    let mut stack = Vec::<ValueSlot>::new();
+    let mut visited = vec![0u32; value_count];
+    let mut generation = 0u32;
+
+    for (dependent, &driver) in drivers.iter().enumerate() {
+        let dependent = u32::try_from(dependent).expect("discrete driver index must fit u32");
+
+        for rail in [driver.high_rail(), driver.low_rail()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(position) =
+                producers_by_output.binary_search_by_key(&rail, |&(output, _)| output)
+            {
+                adjacency[producers_by_output[position].1 as usize].push(dependent);
+            }
+        }
+
+        generation = generation.wrapping_add(1);
+
+        if generation == 0 {
+            visited.fill(0);
+            generation = 1;
+        }
+
+        stack.clear();
+        stack.push(driver.pull_up());
+        stack.push(driver.pull_down());
+
+        while let Some(value) = stack.pop() {
+            if visited[value.index()] == generation {
+                continue;
+            }
+
+            visited[value.index()] = generation;
+
+            if let Some(producer) = producer_by_solution_value[value.index()] {
+                adjacency[producer as usize].push(dependent);
+                continue;
+            }
+
+            stack.extend_from_slice(&value_dependencies[value.index()]);
+        }
+    }
+
+    let mut dependent_offsets = Vec::with_capacity(drivers.len() + 1);
+    let mut dependents = Vec::<u32>::new();
+
+    dependent_offsets.push(0);
+
+    for edges in &mut adjacency {
+        edges.sort_unstable();
+        edges.dedup();
+        dependents.extend_from_slice(edges);
+
+        dependent_offsets.push(
+            u32::try_from(dependents.len()).expect("discrete dependency edge count must fit u32"),
+        );
+    }
+
+    (
+        dependent_offsets.into_boxed_slice(),
+        dependents.into_boxed_slice(),
+    )
+}
+
+fn compile_initial_frontier_dependencies(
+    ir: &CompiledIslandIr,
+    drivers: &[QualifiedComplementaryDriver],
+) -> (Box<[u32]>, Box<[u32]>, Box<[u32]>) {
+    let value_count = ir.value_program().value_count();
+    let stability_values = ir.iteration_stability_values();
+
+    let mut value_dependencies = vec![SmallVec::<[ValueSlot; 2]>::new(); value_count];
+
+    ir.value_program()
+        .visit_iteration_dependencies(|destination, source| {
+            value_dependencies[destination.index()].push(source);
+        });
+
+    let mut solution_values = vec![false; value_count];
+
+    for &(_, input) in ir.solution_inputs() {
+        solution_values[input.value().index()] = true;
+    }
+
+    let mut stability_adjacency = vec![Vec::<u32>::new(); stability_values.len()];
+    let mut conservative_seed_drivers = Vec::<u32>::new();
+    let mut stack = Vec::<ValueSlot>::new();
+    let mut visited = vec![0u32; value_count];
+    let mut generation = 0u32;
+
+    for (dependent, &driver) in drivers.iter().enumerate() {
+        let dependent = u32::try_from(dependent).expect("discrete driver index must fit u32");
+
+        generation = generation.wrapping_add(1);
+
+        if generation == 0 {
+            visited.fill(0);
+            generation = 1;
+        }
+
+        stack.clear();
+        stack.push(driver.pull_up());
+        stack.push(driver.pull_down());
+
+        let mut conservative = false;
+
+        while let Some(value) = stack.pop() {
+            if visited[value.index()] == generation {
+                continue;
+            }
+
+            visited[value.index()] = generation;
+
+            if let Ok(stability_index) = stability_values.binary_search(&value) {
+                stability_adjacency[stability_index].push(dependent);
+                continue;
+            }
+
+            if solution_values[value.index()] {
+                conservative = true;
+                continue;
+            }
+
+            stack.extend_from_slice(&value_dependencies[value.index()]);
+        }
+
+        if conservative {
+            conservative_seed_drivers.push(dependent);
+        }
+    }
+
+    let mut stability_dependent_offsets = Vec::with_capacity(stability_adjacency.len() + 1);
+    let mut stability_dependents = Vec::<u32>::new();
+
+    stability_dependent_offsets.push(0);
+
+    for edges in &mut stability_adjacency {
+        edges.sort_unstable();
+        edges.dedup();
+        stability_dependents.extend_from_slice(edges);
+
+        stability_dependent_offsets.push(
+            u32::try_from(stability_dependents.len())
+                .expect("discrete stability dependency edge count must fit u32"),
+        );
+    }
+
+    conservative_seed_drivers.sort_unstable();
+    conservative_seed_drivers.dedup();
+
+    (
+        stability_dependent_offsets.into_boxed_slice(),
+        stability_dependents.into_boxed_slice(),
+        conservative_seed_drivers.into_boxed_slice(),
+    )
 }
 
 fn collect_matrix_terms(
@@ -472,6 +710,7 @@ fn rhs_has_destination(rhs: &RhsProgram, destination: UnknownIndex) -> bool {
 mod tests {
     use super::*;
     use crate::compile::island_ir::IslandIrBuilder;
+    use hynergy_ir::StateSlot;
     use hynergy_mna::pattern::PatternBuilder;
     use smallvec::smallvec;
 
@@ -502,6 +741,254 @@ mod tests {
 
             ir.add_matrix(destination, source, scale);
         }
+    }
+
+    fn test_driver(
+        output: UnknownIndex,
+        high_rail: Option<UnknownIndex>,
+        low_rail: Option<UnknownIndex>,
+        pull_up: ValueSlot,
+        pull_down: ValueSlot,
+    ) -> QualifiedComplementaryDriver {
+        QualifiedComplementaryDriver {
+            output,
+            high_rail,
+            low_rail,
+            pull_up,
+            pull_down,
+        }
+    }
+
+    fn graph_edges<'a>(offsets: &[u32], dependents: &'a [u32], producer: usize) -> &'a [u32] {
+        let start = offsets[producer] as usize;
+        let end = offsets[producer + 1] as usize;
+
+        &dependents[start..end]
+    }
+
+    #[test]
+    fn dependency_graph_tracks_multilevel_pull_dependency() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+        let input = UnknownIndex::new(2);
+
+        let pattern = PatternBuilder::new(3).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let threshold = ir.constant_value(2.5).unwrap();
+        let input_value = ir.unknown_value(Some(input)).unwrap();
+        let output_a_value = ir.unknown_value(Some(output_a)).unwrap();
+
+        let mode_a = ir.less_equal_value(threshold, input_value).unwrap();
+        let intermediate = ir.add_value(output_a_value, one).unwrap();
+        let mode_b = ir.less_equal_value(threshold, intermediate).unwrap();
+
+        let pull_down_a = ir.sub_value(one, mode_a).unwrap();
+        let pull_down_b = ir.sub_value(one, mode_b).unwrap();
+
+        let ir = ir.finish().unwrap();
+        let drivers = [
+            test_driver(output_a, None, None, mode_a, pull_down_a),
+            test_driver(output_b, None, None, mode_b, pull_down_b),
+        ];
+
+        let (offsets, dependents) = compile_driver_dependencies(&ir, &drivers);
+
+        assert_eq!(graph_edges(&offsets, &dependents, 0), &[1]);
+        assert!(graph_edges(&offsets, &dependents, 1).is_empty());
+    }
+
+    #[test]
+    fn dependency_graph_deduplicates_multiple_paths_to_same_driver() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+
+        let pattern = PatternBuilder::new(2).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let threshold = ir.constant_value(2.5).unwrap();
+        let output_a_value = ir.unknown_value(Some(output_a)).unwrap();
+
+        let mode_b = ir.less_equal_value(threshold, output_a_value).unwrap();
+        let pull_down_b = ir.sub_value(one, mode_b).unwrap();
+
+        let ir = ir.finish().unwrap();
+        let drivers = [
+            test_driver(output_a, None, None, one, one),
+            test_driver(output_b, None, None, mode_b, pull_down_b),
+        ];
+
+        let (offsets, dependents) = compile_driver_dependencies(&ir, &drivers);
+
+        assert_eq!(graph_edges(&offsets, &dependents, 0), &[1]);
+    }
+
+    #[test]
+    fn dependency_graph_ignores_static_and_tick_only_pull_branch() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+        let output_c = UnknownIndex::new(2);
+
+        let pattern = PatternBuilder::new(3).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let threshold = ir.constant_value(2.5).unwrap();
+        let output_a_value = ir.unknown_value(Some(output_a)).unwrap();
+
+        let mode_b = ir.less_equal_value(threshold, output_a_value).unwrap();
+        let pull_down_b = ir.sub_value(one, mode_b).unwrap();
+
+        let parameter = ir.parameter_input(false).unwrap().value();
+        let state = ir.state_value(StateSlot::new(0)).unwrap();
+        let unrelated_pull = ir.add_value(parameter, state).unwrap();
+        let unrelated_pull_down = ir.add_value(unrelated_pull, one).unwrap();
+
+        let ir = ir.finish().unwrap();
+        let drivers = [
+            test_driver(output_a, None, None, one, one),
+            test_driver(output_b, None, None, mode_b, pull_down_b),
+            test_driver(output_c, None, None, unrelated_pull, unrelated_pull_down),
+        ];
+
+        let (offsets, dependents) = compile_driver_dependencies(&ir, &drivers);
+
+        assert_eq!(graph_edges(&offsets, &dependents, 0), &[1]);
+        assert!(graph_edges(&offsets, &dependents, 1).is_empty());
+        assert!(graph_edges(&offsets, &dependents, 2).is_empty());
+    }
+
+    #[test]
+    fn dependency_graph_keeps_self_and_cycle_edges() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+
+        let pattern = PatternBuilder::new(2).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let output_a_value = ir.unknown_value(Some(output_a)).unwrap();
+        let output_b_value = ir.unknown_value(Some(output_b)).unwrap();
+
+        let pull_a = ir.add_value(output_a_value, output_b_value).unwrap();
+        let pull_b = output_a_value;
+
+        let ir = ir.finish().unwrap();
+        let drivers = [
+            test_driver(output_a, None, None, pull_a, one),
+            test_driver(output_b, None, None, pull_b, one),
+        ];
+
+        let (offsets, dependents) = compile_driver_dependencies(&ir, &drivers);
+
+        assert_eq!(graph_edges(&offsets, &dependents, 0), &[0, 1]);
+        assert_eq!(graph_edges(&offsets, &dependents, 1), &[0]);
+    }
+
+    #[test]
+    fn dependency_graph_tracks_direct_rail_dependency() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+
+        let pattern = PatternBuilder::new(2).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let ir = ir.finish().unwrap();
+
+        let drivers = [
+            test_driver(output_a, None, None, one, one),
+            test_driver(output_b, Some(output_a), None, one, one),
+        ];
+
+        let (offsets, dependents) = compile_driver_dependencies(&ir, &drivers);
+
+        assert_eq!(graph_edges(&offsets, &dependents, 0), &[1]);
+        assert!(graph_edges(&offsets, &dependents, 1).is_empty());
+    }
+
+    #[test]
+    fn initial_frontier_maps_stability_values_to_affected_drivers() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+        let input = UnknownIndex::new(2);
+
+        let pattern = PatternBuilder::new(3).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let threshold = ir.constant_value(2.5).unwrap();
+        let input_value = ir.unknown_value(Some(input)).unwrap();
+        let output_a_value = ir.unknown_value(Some(output_a)).unwrap();
+
+        let mode_a = ir.less_equal_value(threshold, input_value).unwrap();
+        let mode_b = ir.less_equal_value(threshold, output_a_value).unwrap();
+        let pull_down_a = ir.sub_value(one, mode_a).unwrap();
+        let pull_down_b = ir.sub_value(one, mode_b).unwrap();
+
+        ir.require_iteration_stability(mode_a);
+        ir.require_iteration_stability(mode_b);
+
+        let ir = ir.finish().unwrap();
+        let drivers = [
+            test_driver(output_a, None, None, mode_a, pull_down_a),
+            test_driver(output_b, None, None, mode_b, pull_down_b),
+        ];
+
+        let (offsets, dependents, conservative) =
+            compile_initial_frontier_dependencies(&ir, &drivers);
+
+        let mode_a_index = ir
+            .iteration_stability_values()
+            .binary_search(&mode_a)
+            .unwrap();
+        let mode_b_index = ir
+            .iteration_stability_values()
+            .binary_search(&mode_b)
+            .unwrap();
+
+        assert_eq!(graph_edges(&offsets, &dependents, mode_a_index), &[0]);
+        assert_eq!(graph_edges(&offsets, &dependents, mode_b_index), &[1]);
+        assert!(conservative.is_empty());
+    }
+
+    #[test]
+    fn initial_frontier_conservatively_seeds_raw_solution_pull_dependencies() {
+        let output_a = UnknownIndex::new(0);
+        let output_b = UnknownIndex::new(1);
+        let input = UnknownIndex::new(2);
+
+        let pattern = PatternBuilder::new(3).unwrap().finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let threshold = ir.constant_value(2.5).unwrap();
+        let input_value = ir.unknown_value(Some(input)).unwrap();
+
+        let mode_a = ir.less_equal_value(threshold, input_value).unwrap();
+        let pull_down_a = ir.sub_value(one, mode_a).unwrap();
+        let raw_pull_down = ir.add_value(input_value, one).unwrap();
+
+        ir.require_iteration_stability(mode_a);
+
+        let ir = ir.finish().unwrap();
+        let drivers = [
+            test_driver(output_a, None, None, mode_a, pull_down_a),
+            test_driver(output_b, None, None, input_value, raw_pull_down),
+        ];
+
+        let (offsets, dependents, conservative) =
+            compile_initial_frontier_dependencies(&ir, &drivers);
+
+        let mode_a_index = ir
+            .iteration_stability_values()
+            .binary_search(&mode_a)
+            .unwrap();
+
+        assert_eq!(graph_edges(&offsets, &dependents, mode_a_index), &[0]);
+        assert_eq!(conservative.as_ref(), &[1]);
     }
 
     #[test]
@@ -549,6 +1036,7 @@ mod tests {
         assert_eq!(plan.drivers()[0].pull_down(), pull_down);
         assert!(plan.matrix_barriers().is_empty());
         assert!(plan.rhs_barriers().is_empty());
+        assert!(plan.dependents_for(0).is_empty());
     }
 
     #[test]

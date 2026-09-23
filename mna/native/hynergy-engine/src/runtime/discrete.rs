@@ -42,6 +42,10 @@ impl DiscreteClosureProfile {
 #[derive(Debug)]
 pub(crate) struct DiscreteScratch {
     driver_outputs: Box<[f64]>,
+    current_frontier: Vec<u32>,
+    next_frontier: Vec<u32>,
+    queued_generation: Box<[u32]>,
+    generation: u32,
     #[cfg(feature = "solver-profiling")]
     profile: DiscreteClosureProfile,
 }
@@ -49,11 +53,54 @@ pub(crate) struct DiscreteScratch {
 impl DiscreteScratch {
     #[inline]
     pub(crate) fn new(plan: &CompiledDiscretePlan) -> Self {
+        let driver_count = plan.drivers().len();
+
         Self {
-            driver_outputs: vec![0.0; plan.drivers().len()].into_boxed_slice(),
+            driver_outputs: vec![0.0; driver_count].into_boxed_slice(),
+            current_frontier: Vec::with_capacity(driver_count),
+            next_frontier: Vec::with_capacity(driver_count),
+            queued_generation: vec![0; driver_count].into_boxed_slice(),
+            generation: 0,
             #[cfg(feature = "solver-profiling")]
             profile: DiscreteClosureProfile::default(),
         }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    fn seed_all(&mut self, driver_count: usize) {
+        self.current_frontier.clear();
+        self.next_frontier.clear();
+
+        self.current_frontier.extend(
+            (0..driver_count)
+                .map(|index| u32::try_from(index).expect("discrete driver index must fit u32")),
+        );
+    }
+
+    #[inline]
+    fn begin_next_frontier(&mut self) {
+        self.next_frontier.clear();
+        self.generation = self.generation.wrapping_add(1);
+
+        if self.generation == 0 {
+            self.queued_generation.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    #[inline]
+    fn queue_dependent(&mut self, driver: u32) {
+        let index = driver as usize;
+
+        debug_assert!(index < self.queued_generation.len());
+
+        if self.queued_generation[index] == self.generation {
+            return;
+        }
+
+        self.queued_generation[index] = self.generation;
+        self.next_frontier.push(driver);
     }
 
     #[cfg(feature = "solver-profiling")]
@@ -89,6 +136,7 @@ pub(crate) fn run_discrete_closure(
     context.run_with_limit(workspace, predicted, scratch, DISCRETE_CLOSURE_MAX_ROUNDS)
 }
 
+#[cfg(test)]
 pub(crate) fn run_discrete_closure_evaluated(
     plan: &CompiledDiscretePlan,
     ir: &CompiledIslandIr,
@@ -106,6 +154,79 @@ pub(crate) fn run_discrete_closure_evaluated(
     };
 
     context.run_evaluated_with_limit(workspace, predicted, scratch, DISCRETE_CLOSURE_MAX_ROUNDS)
+}
+
+pub(crate) fn prepare_discrete_closure_frontier(
+    plan: &CompiledDiscretePlan,
+    ir: &CompiledIslandIr,
+    workspace: &ValueWorkspace,
+    expected_stability: &[f64],
+    scratch: &mut DiscreteScratch,
+) -> bool {
+    debug_assert_eq!(
+        expected_stability.len(),
+        ir.iteration_stability_values().len(),
+    );
+
+    scratch.current_frontier.clear();
+    scratch.begin_next_frontier();
+
+    let mut stability_changed = false;
+
+    for (stability_index, (&slot, &expected)) in ir
+        .iteration_stability_values()
+        .iter()
+        .zip(expected_stability)
+        .enumerate()
+    {
+        if workspace.value(slot) == expected {
+            continue;
+        }
+
+        if !stability_changed {
+            stability_changed = true;
+
+            for &driver in plan.conservative_seed_drivers() {
+                scratch.queue_dependent(driver);
+            }
+        }
+
+        for &driver in plan.stability_dependents_for(stability_index) {
+            scratch.queue_dependent(driver);
+        }
+    }
+
+    if stability_changed {
+        std::mem::swap(&mut scratch.current_frontier, &mut scratch.next_frontier);
+    } else {
+        scratch.next_frontier.clear();
+    }
+
+    stability_changed
+}
+
+pub(crate) fn run_discrete_closure_seeded_evaluated(
+    plan: &CompiledDiscretePlan,
+    ir: &CompiledIslandIr,
+    workspace: &mut ValueWorkspace,
+    predicted: &mut [f64],
+    factorized_iteration_matrix_sources: &[f64],
+    rhs_barrier_reference: &[f64],
+    scratch: &mut DiscreteScratch,
+) -> ClosureOutcome {
+    let context = DiscreteClosureContext {
+        plan,
+        ir,
+        factorized_iteration_matrix_sources,
+        rhs_barrier_reference,
+    };
+
+    context.run_seeded_evaluated_with_limit(
+        workspace,
+        predicted,
+        scratch,
+        DISCRETE_CLOSURE_MAX_ROUNDS,
+    )
 }
 
 struct DiscreteClosureContext<'a> {
@@ -139,7 +260,20 @@ impl DiscreteClosureContext<'_> {
         self.run_evaluated_with_limit(workspace, predicted, scratch, max_rounds)
     }
 
+    #[cfg(test)]
     fn run_evaluated_with_limit(
+        &self,
+        workspace: &mut ValueWorkspace,
+        predicted: &mut [f64],
+        scratch: &mut DiscreteScratch,
+        max_rounds: usize,
+    ) -> ClosureOutcome {
+        scratch.seed_all(self.plan.drivers().len());
+
+        self.run_seeded_evaluated_with_limit(workspace, predicted, scratch, max_rounds)
+    }
+
+    fn run_seeded_evaluated_with_limit(
         &self,
         workspace: &mut ValueWorkspace,
         predicted: &mut [f64],
@@ -148,6 +282,19 @@ impl DiscreteClosureContext<'_> {
     ) -> ClosureOutcome {
         #[cfg(feature = "solver-profiling")]
         scratch.reset_profile();
+
+        if scratch.current_frontier.is_empty() {
+            if barriers_changed(
+                self.plan,
+                workspace,
+                self.factorized_iteration_matrix_sources,
+                self.rhs_barrier_reference,
+            ) {
+                return ClosureOutcome::Barrier;
+            }
+
+            return ClosureOutcome::Settled;
+        }
 
         for _ in 0..max_rounds {
             #[cfg(feature = "solver-profiling")]
@@ -164,15 +311,13 @@ impl DiscreteClosureContext<'_> {
                 return ClosureOutcome::Barrier;
             }
 
-            let driver_outputs = &mut scratch.driver_outputs;
+            for frontier_index in 0..scratch.current_frontier.len() {
+                let driver_index = scratch.current_frontier[frontier_index] as usize;
+                let driver = self.plan.drivers()[driver_index];
 
-            #[cfg(feature = "solver-profiling")]
-            let profile = &mut scratch.profile;
-
-            for (&driver, output) in self.plan.drivers().iter().zip(driver_outputs.iter_mut()) {
                 #[cfg(feature = "solver-profiling")]
                 {
-                    profile.driver_scans += 1;
+                    scratch.profile.driver_scans += 1;
                 }
 
                 let pull_up = workspace.value(driver.pull_up());
@@ -199,25 +344,37 @@ impl DiscreteClosureContext<'_> {
                     return ClosureOutcome::InvalidPrediction;
                 }
 
-                *output = predicted_output;
+                scratch.driver_outputs[driver_index] = predicted_output;
             }
+
+            scratch.begin_next_frontier();
 
             let mut changed = false;
 
-            for (&driver, &output) in self.plan.drivers().iter().zip(driver_outputs.iter()) {
+            for frontier_index in 0..scratch.current_frontier.len() {
+                let driver_index = scratch.current_frontier[frontier_index] as usize;
+                let driver = self.plan.drivers()[driver_index];
+                let output = scratch.driver_outputs[driver_index];
+
                 #[cfg(feature = "solver-profiling")]
                 {
-                    profile.driver_scans += 1;
+                    scratch.profile.driver_scans += 1;
                 }
 
                 let destination = &mut predicted[driver.output().index()];
                 let output_changed = *destination != output;
 
-                changed |= output_changed;
-
-                #[cfg(feature = "solver-profiling")]
                 if output_changed {
-                    profile.output_updates += 1;
+                    changed = true;
+
+                    #[cfg(feature = "solver-profiling")]
+                    {
+                        scratch.profile.output_updates += 1;
+                    }
+
+                    for &dependent in self.plan.dependents_for(driver_index) {
+                        scratch.queue_dependent(dependent);
+                    }
                 }
 
                 *destination = output;
@@ -228,6 +385,21 @@ impl DiscreteClosureContext<'_> {
             }
 
             evaluate_iteration(self.ir, workspace, predicted);
+
+            if scratch.next_frontier.is_empty() {
+                if barriers_changed(
+                    self.plan,
+                    workspace,
+                    self.factorized_iteration_matrix_sources,
+                    self.rhs_barrier_reference,
+                ) {
+                    return ClosureOutcome::Barrier;
+                }
+
+                return ClosureOutcome::Settled;
+            }
+
+            std::mem::swap(&mut scratch.current_frontier, &mut scratch.next_frontier);
         }
 
         ClosureOutcome::BudgetExceeded
@@ -376,6 +548,9 @@ mod tests {
         let mode_a = ir.less_equal_value(threshold, input_voltage).unwrap();
         let mode_b = ir.less_equal_value(threshold, output_a_voltage).unwrap();
 
+        ir.require_iteration_stability(mode_a);
+        ir.require_iteration_stability(mode_b);
+
         let (pull_up_a, pull_down_a) = binary_pulls(&mut ir, mode_a, one);
         let (pull_up_b, pull_down_b) = binary_pulls(&mut ir, mode_b, one);
 
@@ -498,8 +673,129 @@ mod tests {
 
         let profile = scratch.profile();
 
-        assert_eq!(profile.rounds(), 3);
-        assert_eq!(profile.driver_scans(), 12);
+        assert_eq!(plan.dependents_for(0), &[1]);
+        assert!(plan.dependents_for(1).is_empty());
+        assert_eq!(profile.rounds(), 2);
+        assert_eq!(profile.driver_scans(), 6);
+        assert_eq!(profile.output_updates(), 2);
+    }
+
+    #[test]
+    fn frontier_generation_wrap_clears_stale_marks() {
+        let (_pattern, _ir, plan, _) = two_level_chain();
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        scratch.generation = u32::MAX;
+        scratch.queued_generation.fill(u32::MAX);
+
+        scratch.begin_next_frontier();
+        scratch.queue_dependent(1);
+        scratch.queue_dependent(1);
+
+        assert_eq!(scratch.generation, 1);
+        assert_eq!(scratch.next_frontier, vec![1]);
+    }
+
+    #[test]
+    fn frontier_dependents_are_deduplicated_per_round() {
+        let (_pattern, _ir, plan, _) = two_level_chain();
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        scratch.begin_next_frontier();
+
+        for &dependent in plan.dependents_for(0) {
+            scratch.queue_dependent(dependent);
+            scratch.queue_dependent(dependent);
+        }
+
+        assert_eq!(scratch.next_frontier, vec![1]);
+    }
+
+    #[test]
+    fn unchanged_stability_does_not_activate_seeded_frontier() {
+        let (_pattern, ir, plan, [_output_a, _output_b, high, input]) = two_level_chain();
+
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 0.0;
+
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+
+        let expected_stability = ir
+            .iteration_stability_values()
+            .iter()
+            .map(|&slot| workspace.value(slot))
+            .collect::<Vec<_>>();
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        let changed = prepare_discrete_closure_frontier(
+            &plan,
+            &ir,
+            &workspace,
+            &expected_stability,
+            &mut scratch,
+        );
+
+        assert!(!changed);
+        assert!(scratch.current_frontier.is_empty());
+    }
+
+    #[cfg(feature = "solver-profiling")]
+    #[test]
+    fn stability_seeded_frontier_avoids_initial_full_driver_scan() {
+        let (_pattern, ir, plan, [output_a, output_b, high, input]) = two_level_chain();
+
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 0.0;
+
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+
+        let expected_stability = ir
+            .iteration_stability_values()
+            .iter()
+            .map(|&slot| workspace.value(slot))
+            .collect::<Vec<_>>();
+
+        predicted[input.index()] = 5.0;
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+
+        let factorized = vec![0.0; ir.iteration_matrix_sources().len()];
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        let changed = prepare_discrete_closure_frontier(
+            &plan,
+            &ir,
+            &workspace,
+            &expected_stability,
+            &mut scratch,
+        );
+
+        assert!(changed);
+        assert_eq!(scratch.current_frontier, vec![0]);
+
+        let outcome = run_discrete_closure_seeded_evaluated(
+            &plan,
+            &ir,
+            &mut workspace,
+            &mut predicted,
+            &factorized,
+            &[],
+            &mut scratch,
+        );
+
+        assert_eq!(outcome, ClosureOutcome::Settled);
+        assert_eq!(predicted[output_a.index()], 5.0);
+        assert_eq!(predicted[output_b.index()], 5.0);
+
+        let profile = scratch.profile();
+
+        assert_eq!(profile.rounds(), 2);
+        assert_eq!(profile.driver_scans(), 4);
         assert_eq!(profile.output_updates(), 2);
     }
 
@@ -659,6 +955,158 @@ mod tests {
 
         assert_eq!(outcome, ClosureOutcome::Barrier);
         assert_eq!(predicted[output.index()], 0.0);
+    }
+
+    #[test]
+    fn empty_next_frontier_still_detects_matrix_barrier() {
+        let output = UnknownIndex::new(0);
+        let high = UnknownIndex::new(1);
+        let input = UnknownIndex::new(2);
+        let foreign_row = UnknownIndex::new(3);
+
+        let mut pattern_builder = PatternBuilder::new(4).unwrap();
+
+        request_conductance(&mut pattern_builder, Some(high), Some(output));
+        request_conductance(&mut pattern_builder, Some(output), None);
+        pattern_builder.request(foreign_row, foreign_row).unwrap();
+
+        let pattern = pattern_builder.finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let input_value = ir.unknown_value(Some(input)).unwrap();
+        let output_value = ir.unknown_value(Some(output)).unwrap();
+        let mode = ir.less_equal_value(one, input_value).unwrap();
+        let (pull_up, pull_down) = binary_pulls(&mut ir, mode, one);
+
+        add_conductance(&mut ir, Some(high), Some(output), pull_up);
+        add_conductance(&mut ir, Some(output), None, pull_down);
+
+        let foreign_slot = ir.pattern().slot(foreign_row, foreign_row).unwrap();
+        ir.add_matrix(foreign_slot, output_value, 1.0);
+
+        let metadata = BoundDiscreteMetadata::new(
+            smallvec![mode],
+            smallvec![BoundComplementaryDriver::new(
+                mode,
+                Some(output),
+                Some(high),
+                None,
+                pull_up,
+                pull_down,
+            )],
+        );
+
+        let ir = ir.finish().unwrap();
+        let plan = compile_discrete_plan(&pattern, &ir, metadata).unwrap();
+
+        assert!(plan.dependents_for(0).is_empty());
+        assert_eq!(plan.matrix_barriers().len(), 1);
+
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 5.0;
+
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+
+        let factorized = ir
+            .iteration_matrix_sources()
+            .iter()
+            .map(|&source| workspace.value(source))
+            .collect::<Vec<_>>();
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        let outcome = run_discrete_closure(
+            &plan,
+            &ir,
+            &mut workspace,
+            &mut predicted,
+            &factorized,
+            &[],
+            &mut scratch,
+        );
+
+        assert_eq!(outcome, ClosureOutcome::Barrier);
+        assert_eq!(predicted[output.index()], 5.0);
+    }
+
+    #[test]
+    fn empty_next_frontier_still_detects_rhs_barrier() {
+        let output = UnknownIndex::new(0);
+        let high = UnknownIndex::new(1);
+        let input = UnknownIndex::new(2);
+        let rhs_row = UnknownIndex::new(3);
+
+        let mut pattern_builder = PatternBuilder::new(4).unwrap();
+
+        request_conductance(&mut pattern_builder, Some(high), Some(output));
+        request_conductance(&mut pattern_builder, Some(output), None);
+
+        let pattern = pattern_builder.finish().unwrap();
+        let mut ir = IslandIrBuilder::new(&pattern);
+
+        let one = ir.constant_value(1.0).unwrap();
+        let input_value = ir.unknown_value(Some(input)).unwrap();
+        let output_value = ir.unknown_value(Some(output)).unwrap();
+        let mode = ir.less_equal_value(one, input_value).unwrap();
+        let (pull_up, pull_down) = binary_pulls(&mut ir, mode, one);
+
+        add_conductance(&mut ir, Some(high), Some(output), pull_up);
+        add_conductance(&mut ir, Some(output), None, pull_down);
+        ir.add_rhs(rhs_row, output_value, 1.0);
+
+        let metadata = BoundDiscreteMetadata::new(
+            smallvec![mode],
+            smallvec![BoundComplementaryDriver::new(
+                mode,
+                Some(output),
+                Some(high),
+                None,
+                pull_up,
+                pull_down,
+            )],
+        );
+
+        let ir = ir.finish().unwrap();
+        let plan = compile_discrete_plan(&pattern, &ir, metadata).unwrap();
+
+        assert!(plan.dependents_for(0).is_empty());
+        assert_eq!(plan.rhs_barriers(), &[output_value]);
+
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 5.0;
+
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+
+        let factorized = ir
+            .iteration_matrix_sources()
+            .iter()
+            .map(|&source| workspace.value(source))
+            .collect::<Vec<_>>();
+        let rhs_reference = plan
+            .rhs_barriers()
+            .iter()
+            .map(|&source| workspace.value(source))
+            .collect::<Vec<_>>();
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        let outcome = run_discrete_closure(
+            &plan,
+            &ir,
+            &mut workspace,
+            &mut predicted,
+            &factorized,
+            &rhs_reference,
+            &mut scratch,
+        );
+
+        assert_eq!(outcome, ClosureOutcome::Barrier);
+        assert_eq!(predicted[output.index()], 5.0);
     }
 
     #[test]

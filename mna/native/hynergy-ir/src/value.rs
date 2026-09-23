@@ -155,6 +155,47 @@ impl ValueOp {
             }
         }
     }
+
+    #[inline]
+    fn visit_dependencies(self, visit: &mut impl FnMut(ValueSlot, ValueSlot)) {
+        match self {
+            Self::Add {
+                destination,
+                lhs,
+                rhs,
+            }
+            | Self::Sub {
+                destination,
+                lhs,
+                rhs,
+            }
+            | Self::Mul {
+                destination,
+                lhs,
+                rhs,
+            }
+            | Self::Div {
+                destination,
+                lhs,
+                rhs,
+            }
+            | Self::LessEqual {
+                destination,
+                lhs,
+                rhs,
+            } => {
+                visit(destination, lhs);
+                visit(destination, rhs);
+            }
+
+            Self::Neg {
+                destination,
+                operand,
+            } => {
+                visit(destination, operand);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -446,6 +487,13 @@ impl ValueProgram {
     #[inline]
     pub fn iteration_op_count(&self) -> usize {
         self.iteration_ops.len()
+    }
+
+    #[inline]
+    pub fn visit_iteration_dependencies(&self, mut visit: impl FnMut(ValueSlot, ValueSlot)) {
+        for &op in &self.iteration_ops {
+            op.visit_dependencies(&mut visit);
+        }
     }
 
     pub fn new_workspace(&self) -> ValueWorkspace {
@@ -760,6 +808,40 @@ mod tests {
         workspace.set_input(value, 3.0);
         program.execute_iteration(&mut workspace);
         assert_eq!(workspace.value(comparison), 0.0);
+    }
+
+    #[test]
+    fn iteration_dependency_visitor_reports_only_iteration_edges() {
+        let mut builder = ValueProgramBuilder::new();
+
+        let static_input = builder.static_input().unwrap();
+        let tick_input = builder.tick_input().unwrap();
+        let iteration_input = builder.iteration_input().unwrap();
+        let two = builder.constant(2.0).unwrap();
+
+        let static_value = builder.mul(static_input.value(), two).unwrap();
+        let tick_value = builder.add(static_value, tick_input.value()).unwrap();
+        let mixed = builder.add(iteration_input.value(), tick_value).unwrap();
+        let negated = builder.neg(mixed).unwrap();
+        let compared = builder.less_equal(negated, static_value).unwrap();
+
+        let program = builder.finish();
+        let mut edges = Vec::new();
+
+        program.visit_iteration_dependencies(|destination, source| {
+            edges.push((destination, source));
+        });
+
+        assert_eq!(
+            edges,
+            vec![
+                (mixed, iteration_input.value()),
+                (mixed, tick_value),
+                (negated, mixed),
+                (compared, negated),
+                (compared, static_value),
+            ],
+        );
     }
 
     #[test]

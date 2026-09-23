@@ -15,7 +15,10 @@ use hynergy_model::parameter::ParameterId;
 use thiserror::Error;
 
 use crate::runtime::bindings::IslandBindings;
-use crate::runtime::discrete::{ClosureOutcome, DiscreteScratch, run_discrete_closure_evaluated};
+use crate::runtime::discrete::{
+    ClosureOutcome, DiscreteScratch, prepare_discrete_closure_frontier,
+    run_discrete_closure_seeded_evaluated,
+};
 use crate::state::{PhysicalStateError, PhysicalStateStore};
 
 #[cfg(test)]
@@ -609,7 +612,24 @@ impl IslandRuntime {
         while iterations_used < NONLINEAR_MAX_ITERATIONS {
             evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
-            let closure_needed = !self.iteration_stability_matches(&scratch.stability);
+            let closure_needed = {
+                let plan = self
+                    .discrete_plan
+                    .as_deref()
+                    .expect("fast nonlinear path requires a discrete plan");
+                let discrete = scratch
+                    .discrete
+                    .as_deref_mut()
+                    .expect("discrete plan must allocate discrete scratch");
+
+                prepare_discrete_closure_frontier(
+                    plan,
+                    &self.ir,
+                    &self.workspace,
+                    &scratch.stability,
+                    &mut discrete.closure,
+                )
+            };
 
             let outcome = if closure_needed {
                 scratch.current.copy_from_slice(&self.solution);
@@ -625,7 +645,7 @@ impl IslandRuntime {
                         .as_deref_mut()
                         .expect("discrete plan must allocate discrete scratch");
 
-                    run_discrete_closure_evaluated(
+                    run_discrete_closure_seeded_evaluated(
                         plan,
                         &self.ir,
                         &mut self.workspace,
