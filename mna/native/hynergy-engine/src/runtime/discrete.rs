@@ -13,9 +13,37 @@ pub(crate) enum ClosureOutcome {
     InvalidPrediction,
 }
 
+#[cfg(feature = "solver-profiling")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscreteClosureProfile {
+    rounds: usize,
+    driver_scans: usize,
+    output_updates: usize,
+}
+
+#[cfg(feature = "solver-profiling")]
+impl DiscreteClosureProfile {
+    #[inline]
+    pub(crate) const fn rounds(self) -> usize {
+        self.rounds
+    }
+
+    #[inline]
+    pub(crate) const fn driver_scans(self) -> usize {
+        self.driver_scans
+    }
+
+    #[inline]
+    pub(crate) const fn output_updates(self) -> usize {
+        self.output_updates
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DiscreteScratch {
     driver_outputs: Box<[f64]>,
+    #[cfg(feature = "solver-profiling")]
+    profile: DiscreteClosureProfile,
 }
 
 impl DiscreteScratch {
@@ -23,15 +51,25 @@ impl DiscreteScratch {
     pub(crate) fn new(plan: &CompiledDiscretePlan) -> Self {
         Self {
             driver_outputs: vec![0.0; plan.drivers().len()].into_boxed_slice(),
+            #[cfg(feature = "solver-profiling")]
+            profile: DiscreteClosureProfile::default(),
         }
     }
 
+    #[cfg(feature = "solver-profiling")]
     #[inline]
-    fn driver_outputs_mut(&mut self) -> &mut [f64] {
-        &mut self.driver_outputs
+    fn reset_profile(&mut self) {
+        self.profile = DiscreteClosureProfile::default();
+    }
+
+    #[cfg(feature = "solver-profiling")]
+    #[inline]
+    pub(crate) const fn profile(&self) -> DiscreteClosureProfile {
+        self.profile
     }
 }
 
+#[cfg(test)]
 pub(crate) fn run_discrete_closure(
     plan: &CompiledDiscretePlan,
     ir: &CompiledIslandIr,
@@ -51,6 +89,25 @@ pub(crate) fn run_discrete_closure(
     context.run_with_limit(workspace, predicted, scratch, DISCRETE_CLOSURE_MAX_ROUNDS)
 }
 
+pub(crate) fn run_discrete_closure_evaluated(
+    plan: &CompiledDiscretePlan,
+    ir: &CompiledIslandIr,
+    workspace: &mut ValueWorkspace,
+    predicted: &mut [f64],
+    factorized_iteration_matrix_sources: &[f64],
+    rhs_barrier_reference: &[f64],
+    scratch: &mut DiscreteScratch,
+) -> ClosureOutcome {
+    let context = DiscreteClosureContext {
+        plan,
+        ir,
+        factorized_iteration_matrix_sources,
+        rhs_barrier_reference,
+    };
+
+    context.run_evaluated_with_limit(workspace, predicted, scratch, DISCRETE_CLOSURE_MAX_ROUNDS)
+}
+
 struct DiscreteClosureContext<'a> {
     plan: &'a CompiledDiscretePlan,
     ir: &'a CompiledIslandIr,
@@ -59,6 +116,7 @@ struct DiscreteClosureContext<'a> {
 }
 
 impl DiscreteClosureContext<'_> {
+    #[cfg(test)]
     fn run_with_limit(
         &self,
         workspace: &mut ValueWorkspace,
@@ -78,7 +136,25 @@ impl DiscreteClosureContext<'_> {
 
         evaluate_iteration(self.ir, workspace, predicted);
 
+        self.run_evaluated_with_limit(workspace, predicted, scratch, max_rounds)
+    }
+
+    fn run_evaluated_with_limit(
+        &self,
+        workspace: &mut ValueWorkspace,
+        predicted: &mut [f64],
+        scratch: &mut DiscreteScratch,
+        max_rounds: usize,
+    ) -> ClosureOutcome {
+        #[cfg(feature = "solver-profiling")]
+        scratch.reset_profile();
+
         for _ in 0..max_rounds {
+            #[cfg(feature = "solver-profiling")]
+            {
+                scratch.profile.rounds += 1;
+            }
+
             if barriers_changed(
                 self.plan,
                 workspace,
@@ -88,9 +164,17 @@ impl DiscreteClosureContext<'_> {
                 return ClosureOutcome::Barrier;
             }
 
-            let driver_outputs = scratch.driver_outputs_mut();
+            let driver_outputs = &mut scratch.driver_outputs;
+
+            #[cfg(feature = "solver-profiling")]
+            let profile = &mut scratch.profile;
 
             for (&driver, output) in self.plan.drivers().iter().zip(driver_outputs.iter_mut()) {
+                #[cfg(feature = "solver-profiling")]
+                {
+                    profile.driver_scans += 1;
+                }
+
                 let pull_up = workspace.value(driver.pull_up());
                 let pull_down = workspace.value(driver.pull_down());
 
@@ -121,9 +205,21 @@ impl DiscreteClosureContext<'_> {
             let mut changed = false;
 
             for (&driver, &output) in self.plan.drivers().iter().zip(driver_outputs.iter()) {
-                let destination = &mut predicted[driver.output().index()];
+                #[cfg(feature = "solver-profiling")]
+                {
+                    profile.driver_scans += 1;
+                }
 
-                changed |= *destination != output;
+                let destination = &mut predicted[driver.output().index()];
+                let output_changed = *destination != output;
+
+                changed |= output_changed;
+
+                #[cfg(feature = "solver-profiling")]
+                if output_changed {
+                    profile.output_updates += 1;
+                }
+
                 *destination = output;
             }
 
@@ -314,6 +410,36 @@ mod tests {
     }
 
     #[test]
+    fn evaluated_closure_entry_point_uses_existing_workspace_evaluation() {
+        let (_pattern, ir, plan, [output_a, output_b, high, input]) = two_level_chain();
+
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 5.0;
+
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+
+        let factorized = vec![0.0; ir.iteration_matrix_sources().len()];
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        let outcome = run_discrete_closure_evaluated(
+            &plan,
+            &ir,
+            &mut workspace,
+            &mut predicted,
+            &factorized,
+            &[],
+            &mut scratch,
+        );
+
+        assert_eq!(outcome, ClosureOutcome::Settled);
+        assert_eq!(predicted[output_a.index()], 5.0);
+        assert_eq!(predicted[output_b.index()], 5.0);
+    }
+
+    #[test]
     fn closure_propagates_multiple_logic_levels_without_mna() {
         let (_pattern, ir, plan, [output_a, output_b, high, input]) = two_level_chain();
 
@@ -342,6 +468,39 @@ mod tests {
         assert_eq!(outcome, ClosureOutcome::Settled);
         assert_eq!(predicted[output_a.index()], 5.0);
         assert_eq!(predicted[output_b.index()], 5.0);
+    }
+
+    #[cfg(feature = "solver-profiling")]
+    #[test]
+    fn closure_profile_counts_rounds_scans_and_updates() {
+        let (_pattern, ir, plan, [_output_a, _output_b, high, input]) = two_level_chain();
+
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 5.0;
+
+        let factorized = vec![0.0; ir.iteration_matrix_sources().len()];
+        let mut scratch = DiscreteScratch::new(&plan);
+
+        let outcome = run_discrete_closure(
+            &plan,
+            &ir,
+            &mut workspace,
+            &mut predicted,
+            &factorized,
+            &[],
+            &mut scratch,
+        );
+
+        assert_eq!(outcome, ClosureOutcome::Settled);
+
+        let profile = scratch.profile();
+
+        assert_eq!(profile.rounds(), 3);
+        assert_eq!(profile.driver_scans(), 12);
+        assert_eq!(profile.output_updates(), 2);
     }
 
     #[test]

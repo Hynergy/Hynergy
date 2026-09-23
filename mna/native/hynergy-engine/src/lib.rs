@@ -7,7 +7,9 @@ mod topology;
 
 use crate::compile::island::{DeviceObserver, IslandCompileError, compile_topology_island};
 #[cfg(feature = "solver-profiling")]
-pub use crate::profiling::{SolverIslandProfile, SolverIterationProfile, SolverTickProfile};
+pub use crate::profiling::{
+    SolverDiscreteProfile, SolverIslandProfile, SolverIterationProfile, SolverTickProfile,
+};
 use crate::runtime::island::{IslandRuntime, IslandRuntimeError};
 pub use crate::runtime::subscription::{SubscriptionError, SubscriptionId};
 use crate::runtime::subscription::{SubscriptionRegistry, SubscriptionUpdate};

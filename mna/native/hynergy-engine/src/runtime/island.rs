@@ -15,7 +15,7 @@ use hynergy_model::parameter::ParameterId;
 use thiserror::Error;
 
 use crate::runtime::bindings::IslandBindings;
-use crate::runtime::discrete::{ClosureOutcome, DiscreteScratch, run_discrete_closure};
+use crate::runtime::discrete::{ClosureOutcome, DiscreteScratch, run_discrete_closure_evaluated};
 use crate::state::{PhysicalStateError, PhysicalStateStore};
 
 #[cfg(test)]
@@ -60,6 +60,23 @@ impl FastDiscreteScratch {
         {
             *target = workspace.value(source);
         }
+    }
+
+    #[inline]
+    fn rhs_reference_matches(
+        &self,
+        plan: &CompiledDiscretePlan,
+        workspace: &ValueWorkspace,
+    ) -> bool {
+        debug_assert_eq!(self.rhs_barrier_reference.len(), plan.rhs_barriers().len(),);
+
+        self.rhs_reference_valid
+            && self
+                .rhs_barrier_reference
+                .iter()
+                .copied()
+                .zip(plan.rhs_barriers().iter().copied())
+                .all(|(expected, source)| expected == workspace.value(source))
     }
 }
 
@@ -377,7 +394,21 @@ impl IslandRuntime {
         {
             let nonlinear = self.nonlinear_scratch.is_some();
 
-            self.solver_tick_profile.begin_tick(nonlinear);
+            let (qualified_drivers, matrix_barriers, rhs_barriers) =
+                self.discrete_plan.as_deref().map_or((0, 0, 0), |plan| {
+                    (
+                        plan.drivers().len(),
+                        plan.matrix_barriers().len(),
+                        plan.rhs_barriers().len(),
+                    )
+                });
+
+            self.solver_tick_profile.begin_tick(
+                nonlinear,
+                qualified_drivers,
+                matrix_barriers,
+                rhs_barriers,
+            );
         }
 
         if self.sleepable && !self.needs_solve {
@@ -529,12 +560,12 @@ impl IslandRuntime {
         had_authoritative_solution: bool,
     ) -> Result<(), IslandRuntimeError> {
         if self.discrete_plan.is_some() {
-            match self.solve_nonlinear_fast(scratch, had_authoritative_solution)? {
-                FastSolveResult::Solved => return Ok(()),
+            return match self.solve_nonlinear_fast(scratch, had_authoritative_solution)? {
+                FastSolveResult::Solved => Ok(()),
                 FastSolveResult::Fallback { iterations_used } => {
-                    return self.solve_nonlinear_generic(scratch, iterations_used);
+                    self.solve_nonlinear_generic(scratch, iterations_used)
                 }
-            }
+            };
         }
 
         self.solve_nonlinear_generic(scratch, 0)
@@ -576,34 +607,83 @@ impl IslandRuntime {
         }
 
         while iterations_used < NONLINEAR_MAX_ITERATIONS {
-            scratch.current.copy_from_slice(&self.solution);
+            evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
-            let outcome = {
-                let plan = self
-                    .discrete_plan
-                    .as_deref()
-                    .expect("fast nonlinear path requires a discrete plan");
+            let closure_needed = !self.iteration_stability_matches(&scratch.stability);
 
-                let discrete = scratch
-                    .discrete
-                    .as_deref_mut()
-                    .expect("discrete plan must allocate discrete scratch");
+            let outcome = if closure_needed {
+                scratch.current.copy_from_slice(&self.solution);
 
-                run_discrete_closure(
-                    plan,
-                    &self.ir,
-                    &mut self.workspace,
-                    &mut scratch.current,
-                    &self.factorized_iteration_matrix_sources,
-                    &discrete.rhs_barrier_reference,
-                    &mut discrete.closure,
-                )
+                let outcome = {
+                    let plan = self
+                        .discrete_plan
+                        .as_deref()
+                        .expect("fast nonlinear path requires a discrete plan");
+
+                    let discrete = scratch
+                        .discrete
+                        .as_deref_mut()
+                        .expect("discrete plan must allocate discrete scratch");
+
+                    run_discrete_closure_evaluated(
+                        plan,
+                        &self.ir,
+                        &mut self.workspace,
+                        &mut scratch.current,
+                        &self.factorized_iteration_matrix_sources,
+                        &discrete.rhs_barrier_reference,
+                        &mut discrete.closure,
+                    )
+                };
+
+                #[cfg(feature = "solver-profiling")]
+                {
+                    let closure_profile = scratch
+                        .discrete
+                        .as_deref()
+                        .expect("discrete plan must allocate discrete scratch")
+                        .closure
+                        .profile();
+
+                    self.solver_tick_profile.discrete_mut().record_closure(
+                        closure_profile.rounds(),
+                        closure_profile.driver_scans(),
+                        closure_profile.output_updates(),
+                    );
+                }
+
+                outcome
+            } else {
+                ClosureOutcome::Settled
             };
 
             match outcome {
-                ClosureOutcome::Settled | ClosureOutcome::Barrier => {}
+                ClosureOutcome::Settled => {}
 
-                ClosureOutcome::BudgetExceeded | ClosureOutcome::InvalidPrediction => {
+                ClosureOutcome::Barrier => {
+                    #[cfg(feature = "solver-profiling")]
+                    self.solver_tick_profile
+                        .discrete_mut()
+                        .record_barrier_exit();
+                }
+
+                ClosureOutcome::BudgetExceeded => {
+                    #[cfg(feature = "solver-profiling")]
+                    self.solver_tick_profile
+                        .discrete_mut()
+                        .record_budget_fallback();
+
+                    evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
+
+                    return Ok(FastSolveResult::Fallback { iterations_used });
+                }
+
+                ClosureOutcome::InvalidPrediction => {
+                    #[cfg(feature = "solver-profiling")]
+                    self.solver_tick_profile
+                        .discrete_mut()
+                        .record_invalid_fallback();
+
                     evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
                     return Ok(FastSolveResult::Fallback { iterations_used });
@@ -633,6 +713,11 @@ impl IslandRuntime {
 
         self.solve_nonlinear_candidate(&mut scratch.next, scratch.discrete.as_deref_mut())?;
 
+        #[cfg(feature = "solver-profiling")]
+        self.solver_tick_profile
+            .discrete_mut()
+            .record_verification_solve();
+
         evaluate_iteration(&self.ir, &mut self.workspace, &scratch.next);
 
         #[cfg(feature = "solver-profiling")]
@@ -653,8 +738,16 @@ impl IslandRuntime {
             );
         }
 
-        let converged = solutions_converged(&self.solution, &scratch.next)
-            && self.iteration_stability_matches(&scratch.stability);
+        let stability_matches = self.iteration_stability_matches(&scratch.stability);
+
+        // If the candidate reproduces the exact matrix, RHS, and stability state used to
+        // produce it, another verification solve would solve the identical linear system.
+        let exact_system_matches = self.discrete_linear_system_matches(scratch);
+
+        let exact_fixed_point = stability_matches && exact_system_matches;
+
+        let converged = exact_fixed_point
+            || (stability_matches && solutions_converged(&self.solution, &scratch.next));
 
         std::mem::swap(&mut self.solution, &mut scratch.next);
 
@@ -862,6 +955,25 @@ impl IslandRuntime {
     }
 
     #[inline]
+    fn discrete_linear_system_matches(&self, scratch: &NonlinearScratch) -> bool {
+        let plan = self
+            .discrete_plan
+            .as_deref()
+            .expect("discrete system comparison requires a discrete plan");
+
+        let discrete = scratch
+            .discrete
+            .as_deref()
+            .expect("discrete plan must allocate discrete scratch");
+
+        iteration_matrix_sources_match(
+            &self.ir,
+            &self.workspace,
+            &self.factorized_iteration_matrix_sources,
+        ) && discrete.rhs_reference_matches(plan, &self.workspace)
+    }
+
+    #[inline]
     pub(crate) fn rebind(&mut self, network: &Network) -> Result<(), IslandRuntimeError> {
         self.bindings.rebind(network)?;
 
@@ -1007,6 +1119,21 @@ fn capture_iteration_matrix_sources(
     for (target, &slot) in target.iter_mut().zip(ir.iteration_matrix_sources()) {
         *target = workspace.value(slot);
     }
+}
+
+#[inline]
+fn iteration_matrix_sources_match(
+    ir: &CompiledIslandIr,
+    workspace: &ValueWorkspace,
+    expected: &[f64],
+) -> bool {
+    debug_assert_eq!(expected.len(), ir.iteration_matrix_sources().len());
+
+    expected
+        .iter()
+        .copied()
+        .zip(ir.iteration_matrix_sources().iter().copied())
+        .all(|(expected, source)| expected == workspace.value(source))
 }
 
 #[inline]
@@ -2357,6 +2484,109 @@ mod test {
         (network, compiled, output_node, common_node)
     }
 
+    fn fast_not_island(input_voltage: f64) -> (Network, crate::compile::island::CompiledIsland) {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+
+        let gate = DeviceId::try_from(1).unwrap();
+        let vdd_source = DeviceId::try_from(2).unwrap();
+        let input_source = DeviceId::try_from(3).unwrap();
+
+        network
+            .add_device(&definitions, gate, PrimitiveElementKind::Not.into())
+            .unwrap();
+
+        for source in [vdd_source, input_source] {
+            network
+                .add_device(
+                    &definitions,
+                    source,
+                    PrimitiveElementKind::VoltageSource.into(),
+                )
+                .unwrap();
+        }
+
+        for (index, value) in [2.5, 10.0, 0.01].into_iter().enumerate() {
+            network
+                .set_device_parameter(&definitions, gate, ParameterId::new(index as u32), value)
+                .unwrap();
+        }
+
+        network
+            .set_device_parameter(&definitions, vdd_source, ParameterId::new(0), 5.0)
+            .unwrap();
+        network
+            .set_device_parameter(
+                &definitions,
+                input_source,
+                ParameterId::new(0),
+                input_voltage,
+            )
+            .unwrap();
+
+        let gate_definition = CompiledDefinition::compile(
+            &definitions,
+            definitions
+                .get(DefinitionId::from(PrimitiveElementKind::Not))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let source_definition = CompiledDefinition::compile(
+            &definitions,
+            definitions
+                .get(DefinitionId::from(PrimitiveElementKind::VoltageSource))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let gate_partition = gate_definition
+            .partition(DevicePartitionId::new(0))
+            .unwrap();
+        let source_partition = source_definition
+            .partition(DevicePartitionId::new(0))
+            .unwrap();
+
+        let output = IslandNode::terminal(gate, TerminalId::new(0));
+        let vdd = IslandNode::terminal(gate, TerminalId::new(1));
+        let vss = IslandNode::terminal(gate, TerminalId::new(2));
+        let input = IslandNode::terminal(gate, TerminalId::new(3));
+
+        let gate_nodes = [output, vdd, vss, input];
+        let vdd_source_nodes = [vdd, vss];
+        let input_source_nodes = [input, vss];
+
+        let parts = [
+            IslandPartitionSpec::new(
+                gate,
+                gate_partition,
+                gate_definition.state_initializers(),
+                &gate_nodes,
+            ),
+            IslandPartitionSpec::new(
+                vdd_source,
+                source_partition,
+                source_definition.state_initializers(),
+                &vdd_source_nodes,
+            ),
+            IslandPartitionSpec::new(
+                input_source,
+                source_partition,
+                source_definition.state_initializers(),
+                &input_source_nodes,
+            ),
+        ];
+
+        let compiled = compile_island_parts(&[vss, output, vdd, input], &parts).unwrap();
+
+        assert!(
+            compiled.discrete_plan().is_some(),
+            "H1 test fixture must compile a discrete fast-path plan",
+        );
+
+        (network, compiled)
+    }
+
     fn solve_logic_gate(
         kind: PrimitiveElementKind,
         input_a_voltage: f64,
@@ -2378,8 +2608,40 @@ mod test {
     }
 
     #[test]
-    fn nonlinear_matrix_iteration_reuses_factorization_when_sources_are_unchanged() {
-        let (network, compiled, _, _) = logic_gate_island(PrimitiveElementKind::Not, 0.0, None);
+    fn exact_first_verification_fixed_point_needs_no_confirmation_solve() {
+        let (network, compiled) = fast_not_island(0.0);
+
+        assert!(
+            compiled.discrete_plan().is_some(),
+            "H1 test fixture must compile a discrete fast-path plan",
+        );
+
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
+
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
+
+        assert_eq!(
+            runtime.solve_count(),
+            1,
+            "an exact matrix/RHS/stability fixed point needs no confirmation solve",
+        );
+        assert_eq!(
+            runtime.matrix_stamp_count(),
+            1,
+            "the accepted fixed point should use the factorization that produced it",
+        );
+    }
+
+    #[test]
+    fn changed_discrete_matrix_still_requires_corrective_verification_solve() {
+        let (network, compiled) = fast_not_island(5.0);
+
+        assert!(
+            compiled.discrete_plan().is_some(),
+            "H1 test fixture must compile a discrete fast-path plan",
+        );
 
         let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
 
@@ -2390,12 +2652,12 @@ mod test {
         assert_eq!(
             runtime.solve_count(),
             2,
-            "initial nonlinear solution still requires convergence confirmation",
+            "a candidate that changes its discrete matrix must be solved again",
         );
         assert_eq!(
             runtime.matrix_stamp_count(),
-            1,
-            "unchanged iteration-dependent matrix sources must reuse numeric LU",
+            2,
+            "the changed discrete matrix must be factorized before acceptance",
         );
     }
 

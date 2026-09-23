@@ -33,13 +33,23 @@ fn profile_cpu(width: FullCpuWidth, ticks: usize) {
         let profile = cpu.solver_tick_profile();
 
         println!(
-            "tick={tick:02} islands={} nonlinear_iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} max_delta={:.6e}",
+            "tick={tick:02} islands={} nonlinear_iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} discrete_islands={} drivers={} closures={} closure_rounds={} driver_scans={} output_updates={} zero_update_attempts={} barrier_exits={} verification_solves={} fast_fallbacks={} max_delta={:.6e}",
             profile.islands().len(),
             profile.total_nonlinear_iterations(),
             profile.total_mna_solves(),
             profile.total_matrix_factorizations(),
             profile.total_matrix_source_changes(),
             profile.total_stability_changes(),
+            profile.planned_discrete_islands(),
+            profile.total_qualified_discrete_drivers(),
+            profile.total_discrete_closure_attempts(),
+            profile.total_discrete_closure_rounds(),
+            profile.total_discrete_driver_scans(),
+            profile.total_discrete_output_updates(),
+            profile.total_discrete_zero_update_attempts(),
+            profile.total_discrete_barrier_exits(),
+            profile.total_discrete_verification_solves(),
+            profile.total_discrete_fallbacks(),
             profile.max_solution_delta(),
         );
 
@@ -52,14 +62,29 @@ fn profile_cpu(width: FullCpuWidth, ticks: usize) {
             continue;
         };
 
+        let discrete = hottest.discrete();
+
         println!(
-            "  island={} iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} max_delta={:.6e}",
+            "  island={} iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} plan={} drivers={} matrix_barriers={} rhs_barriers={} closures={} closure_rounds={} driver_scans={} output_updates={} zero_update_attempts={} barrier_exits={} verification_solves={} budget_fallbacks={} invalid_fallbacks={} max_delta={:.6e}",
             hottest.island_index(),
             hottest.nonlinear_iterations(),
             hottest.mna_solves(),
             hottest.matrix_factorizations(),
             hottest.matrix_source_changes(),
             hottest.stability_changes(),
+            discrete.has_plan(),
+            discrete.qualified_drivers(),
+            discrete.matrix_barriers(),
+            discrete.rhs_barriers(),
+            discrete.closure_attempts(),
+            discrete.closure_rounds(),
+            discrete.driver_scans(),
+            discrete.output_updates(),
+            discrete.zero_update_attempts(),
+            discrete.barrier_exits(),
+            discrete.verification_solves(),
+            discrete.budget_fallbacks(),
+            discrete.invalid_fallbacks(),
             hottest.max_solution_delta(),
         );
 
