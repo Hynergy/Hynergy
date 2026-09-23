@@ -142,7 +142,7 @@ impl PrimitiveElementKind {
             Self::Inductor => 1,
             Self::VoltageControlledSwitch => 3,
             Self::VoltageControlledConductance => 4,
-            Self::TickDelay => 1,
+            Self::TickDelay => 0,
             Self::Diode => 2,
             Self::Not | Self::And | Self::Nand | Self::Or | Self::Nor => 3,
             Self::SchmittBuffer => 4,
@@ -301,10 +301,7 @@ impl PrimitiveElementKind {
                 [unrestricted, positive, non_negative].get(index).copied()
             }
 
-            Self::TickDelay => {
-                // initial output
-                [unrestricted].get(index).copied()
-            }
+            Self::TickDelay => None,
         }
     }
 
@@ -1018,8 +1015,13 @@ mod tests {
     }
 
     #[test]
-    fn primitive_empty_parameters_report_wrong_count() {
+    fn primitive_empty_parameters_match_parameter_count_contract() {
         for kind in PrimitiveElementKind::ALL {
+            if kind.parameter_count() == 0 {
+                assert_eq!(kind.validate_parameters(&[]), Ok(()), "{kind:?}");
+                continue;
+            }
+
             assert_eq!(
                 kind.validate_parameters(&[]),
                 Err(PrimitiveParameterError::WrongParameterCount {
@@ -1029,6 +1031,22 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn tick_delay_is_parameterless_and_stateful() {
+        let kind = PrimitiveElementKind::TickDelay;
+
+        assert_eq!(kind.parameter_count(), 0);
+        assert_eq!(kind.state_count(), 1);
+        assert_eq!(kind.validate_parameters(&[]), Ok(()));
+        assert_eq!(
+            kind.validate_parameters(&[0.0]),
+            Err(PrimitiveParameterError::WrongParameterCount {
+                expected: 0,
+                actual: 1,
+            }),
+        );
     }
 
     #[test]

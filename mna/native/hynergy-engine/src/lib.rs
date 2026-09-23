@@ -97,10 +97,6 @@ impl From<WorldTickError> for EngineTickError {
             },
 
             WorldTickError::State(error) => match error {
-                PhysicalStateError::MissingInitialParameter { device, parameter } => {
-                    Self::MissingParameter { device, parameter }
-                }
-
                 PhysicalStateError::StateNotInitialized { .. } => Self::InternalInvariant,
             },
         }
@@ -1720,60 +1716,95 @@ mod tests {
 
     #[test]
     fn parameter_change_invalidates_all_component_islands() {
-        let definitions = DefinitionRegistry::new();
+        let mut definitions = DefinitionRegistry::new();
+
+        let conductance = DefinitionId::from(PrimitiveElementKind::Conductance);
+        let conductance_constraint = definitions.get(conductance).unwrap().parameters()[0];
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let first_positive = builder.add_terminal().unwrap();
+            let first_negative = builder.add_terminal().unwrap();
+            let second_positive = builder.add_terminal().unwrap();
+            let second_negative = builder.add_terminal().unwrap();
+
+            let shared = builder.add_parameter(conductance_constraint).unwrap();
+
+            for (positive, negative) in [
+                (first_positive, first_negative),
+                (second_positive, second_negative),
+            ] {
+                builder
+                    .add_element(Element::new(
+                        conductance,
+                        vec![positive, negative],
+                        vec![ValueRef::Parameter(shared)],
+                    ))
+                    .unwrap();
+            }
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.partition_count(), 2);
+
+        let definition = definitions.register(definition).unwrap();
+
         let mut world = World::new(world_config());
-        let delay = device(1);
+        let multi_partition = device(1);
 
         world
-            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .add_device(&definitions, multi_partition, definition)
             .unwrap();
 
-        let input_component = DeviceComponent::new(delay, DevicePartitionId::new(0));
-        let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
+        let first_component = DeviceComponent::new(multi_partition, DevicePartitionId::new(0));
+        let second_component = DeviceComponent::new(multi_partition, DevicePartitionId::new(1));
 
-        let input_island = world
+        let first_island = world
             .derived_topology
-            .component_island(world.network(), input_component);
-        let output_island = world
-            .derived_topology
-            .component_island(world.network(), output_component);
+            .component_island(world.network(), first_component);
 
-        assert_ne!(input_island, output_island);
-
-        let input_revision = world
+        let second_island = world
             .derived_topology
-            .island(input_island)
+            .component_island(world.network(), second_component);
+
+        assert_ne!(first_island, second_island);
+
+        let first_revision = world
+            .derived_topology
+            .island(first_island)
             .unwrap()
             .revision();
 
-        let output_revision = world
+        let second_revision = world
             .derived_topology
-            .island(output_island)
+            .island(second_island)
             .unwrap()
             .revision();
 
         world.derived_topology.clear_invalidation();
 
         world
-            .set_device_parameter(&definitions, delay, ParameterId::new(0), 1.0)
+            .set_device_parameter(&definitions, multi_partition, ParameterId::new(0), 1.0)
             .unwrap();
 
         assert_eq!(
             world
                 .derived_topology
-                .island(input_island)
+                .island(first_island)
                 .unwrap()
                 .revision(),
-            input_revision,
+            first_revision,
         );
 
         assert_eq!(
             world
                 .derived_topology
-                .island(output_island)
+                .island(second_island)
                 .unwrap()
                 .revision(),
-            output_revision,
+            second_revision,
         );
 
         assert!(
@@ -1790,8 +1821,8 @@ mod tests {
             .numerical_dirty_islands();
 
         assert_eq!(dirty.len(), 2);
-        assert!(dirty.contains(&input_island));
-        assert!(dirty.contains(&output_island));
+        assert!(dirty.contains(&first_island));
+        assert!(dirty.contains(&second_island));
     }
 
     #[test]
@@ -1894,10 +1925,6 @@ mod tests {
             .unwrap();
 
         world
-            .set_device_parameter(&definitions, delay, ParameterId::new(0), 4.0)
-            .unwrap();
-
-        world
             .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
             .unwrap();
 
@@ -1927,7 +1954,7 @@ mod tests {
         let first_output = runtime.node_voltage(positive_node).unwrap()
             - runtime.node_voltage(negative_node).unwrap();
 
-        assert!((first_output - 4.0).abs() < 1.0e-12);
+        assert!(first_output.abs() < 1.0e-12);
 
         assert_eq!(
             world.physical_state.get(&world.network, physical_state),
@@ -1947,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_initialization_does_not_freeze_tick_delay_initial_state() {
+    fn failed_tick_does_not_initialize_tick_delay_before_zero_initialized_retry() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::new(world_config());
 
@@ -1990,7 +2017,7 @@ mod tests {
             .add_device(
                 &definitions,
                 blocker,
-                PrimitiveElementKind::TickDelay.into(),
+                PrimitiveElementKind::Conductance.into(),
             )
             .unwrap();
 
@@ -2031,10 +2058,6 @@ mod tests {
             .unwrap();
 
         world
-            .set_device_parameter(&definitions, delay, ParameterId::new(0), 4.25)
-            .unwrap();
-
-        world
             .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
             .unwrap();
 
@@ -2054,10 +2077,6 @@ mod tests {
             !world.physical_state.is_initialized_at(location),
             "a failed tick must not commit first-time state initialization",
         );
-
-        world
-            .set_device_parameter(&definitions, delay, ParameterId::new(0), 9.0)
-            .unwrap();
 
         world.remove_device(&definitions, blocker).unwrap();
 
@@ -2079,14 +2098,18 @@ mod tests {
             - runtime.node_voltage(negative_node).unwrap();
 
         assert!(
-            (output - 9.0).abs() < 1.0e-12,
-            "successful retry must re-evaluate the current TickDelay initial parameter",
+            output.abs() < 1.0e-12,
+            "TickDelay must expose zero before its first committed sample",
         );
 
         assert!(
             world.physical_state.is_initialized_at(location),
             "successful tick must commit the state row",
         );
+
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(5.0),);
     }
 
     #[test]
@@ -2368,8 +2391,6 @@ mod tests {
 
         let tick_delay = DefinitionId::from(PrimitiveElementKind::TickDelay);
 
-        let initial_constraint = definitions.get(tick_delay).unwrap().parameters()[0];
-
         let composite = {
             let mut builder = DeviceDefinitionBuilder::new(&definitions);
 
@@ -2381,8 +2402,6 @@ mod tests {
 
             let output_negative = builder.add_terminal().unwrap();
 
-            let initial = builder.add_parameter(initial_constraint).unwrap();
-
             builder
                 .add_element(Element::new(
                     tick_delay,
@@ -2392,7 +2411,7 @@ mod tests {
                         output_positive,
                         output_negative,
                     ],
-                    vec![ValueRef::Parameter(initial)],
+                    Vec::new(),
                 ))
                 .unwrap();
 
@@ -2461,10 +2480,6 @@ mod tests {
             .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
             .unwrap();
 
-        world
-            .set_device_parameter(&definitions, delay, ParameterId::new(0), 1.5)
-            .unwrap();
-
         let output_component = DeviceComponent::new(delay, DevicePartitionId::new(1));
 
         let output_island = world
@@ -2490,7 +2505,7 @@ mod tests {
         let voltage = output_runtime.node_voltage(output_positive_node).unwrap()
             - output_runtime.node_voltage(output_negative_node).unwrap();
 
-        assert!((voltage - 1.5).abs() < 1.0e-12);
+        assert!(voltage.abs() < 1.0e-12);
         assert_eq!(world.physical_state.get(&world.network, state), Some(5.0),);
 
         world.tick(&definitions).unwrap();
@@ -3227,56 +3242,6 @@ mod tests {
     }
 
     #[test]
-    fn uninitialized_parameter_backed_state_is_re_evaluated_until_commit() {
-        let definitions = DefinitionRegistry::new();
-        let mut network = Network::new();
-        let mut state = PhysicalStateStore::default();
-
-        let device = device(1);
-
-        add_stateful_device(
-            &definitions,
-            &mut network,
-            &mut state,
-            device,
-            PrimitiveElementKind::TickDelay,
-        );
-
-        network
-            .set_device_parameter(&definitions, device, ParameterId::new(0), 3.25)
-            .unwrap();
-
-        let location = network.device_location(device).unwrap();
-
-        let address = PhysicalStateAddress::new(location, 0);
-
-        let initializer = DefinitionStateInitializer::Parameter(ParameterId::new(0));
-
-        assert_eq!(
-            state
-                .read_logical_at(&network, device, address, initializer,)
-                .unwrap(),
-            3.25,
-        );
-
-        assert!(!state.is_initialized_at(location));
-
-        network
-            .set_device_parameter(&definitions, device, ParameterId::new(0), 7.5)
-            .unwrap();
-
-        assert_eq!(
-            state
-                .read_logical_at(&network, device, address, initializer,)
-                .unwrap(),
-            7.5,
-            "uncommitted initial state must follow the current initial parameter",
-        );
-
-        assert!(!state.is_initialized_at(location));
-    }
-
-    #[test]
     fn committed_state_overrides_logical_initializer() {
         let definitions = DefinitionRegistry::new();
         let mut network = Network::new();
@@ -3289,12 +3254,8 @@ mod tests {
             &mut network,
             &mut state,
             device,
-            PrimitiveElementKind::TickDelay,
+            PrimitiveElementKind::Capacitor,
         );
-
-        network
-            .set_device_parameter(&definitions, device, ParameterId::new(0), 3.25)
-            .unwrap();
 
         let location = network.device_location(device).unwrap();
         let address = PhysicalStateAddress::new(location, 0);
@@ -3306,62 +3267,18 @@ mod tests {
 
         assert!(state.is_initialized_at(location));
 
-        network
-            .set_device_parameter(&definitions, device, ParameterId::new(0), 7.5)
-            .unwrap();
-
         assert_eq!(
             state
                 .read_logical_at(
                     &network,
                     device,
                     address,
-                    DefinitionStateInitializer::Parameter(ParameterId::new(0),),
+                    DefinitionStateInitializer::Literal(0.0),
                 )
                 .unwrap(),
             11.0,
             "committed history must take precedence over the initializer",
         );
-    }
-
-    #[test]
-    fn missing_logical_initial_parameter_does_not_initialize_state() {
-        let definitions = DefinitionRegistry::new();
-        let mut network = Network::new();
-        let mut state = PhysicalStateStore::default();
-
-        let device = device(1);
-
-        add_stateful_device(
-            &definitions,
-            &mut network,
-            &mut state,
-            device,
-            PrimitiveElementKind::TickDelay,
-        );
-
-        let location = network.device_location(device).unwrap();
-
-        let address = PhysicalStateAddress::new(location, 0);
-
-        let error = state
-            .read_logical_at(
-                &network,
-                device,
-                address,
-                DefinitionStateInitializer::Parameter(ParameterId::new(0)),
-            )
-            .unwrap_err();
-
-        assert_eq!(
-            error,
-            PhysicalStateError::MissingInitialParameter {
-                device,
-                parameter: ParameterId::new(0),
-            },
-        );
-
-        assert!(!state.is_initialized_at(location),);
     }
 
     #[test]

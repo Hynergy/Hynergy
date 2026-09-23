@@ -18,7 +18,6 @@ define_id!(DefinitionStateId: u32);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum DefinitionStateInitializer {
     Literal(f64),
-    Parameter(ParameterId),
 }
 
 #[derive(Debug)]
@@ -174,12 +173,9 @@ fn primitive_state_initializers(kind: PrimitiveElementKind) -> Box<[DefinitionSt
     match kind {
         PrimitiveElementKind::Capacitor
         | PrimitiveElementKind::Inductor
+        | PrimitiveElementKind::TickDelay
         | PrimitiveElementKind::SchmittBuffer => {
             vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice()
-        }
-
-        PrimitiveElementKind::TickDelay => {
-            vec![DefinitionStateInitializer::Parameter(ParameterId::new(0))].into_boxed_slice()
         }
 
         _ => Vec::new().into_boxed_slice(),
@@ -744,26 +740,8 @@ fn compile_composite(
 
     let mut state_initializers = Vec::with_capacity(definition.state_count());
 
-    for (element, child) in circuit.elements().iter().zip(&compiled_children) {
-        for &initializer in child.state_initializers() {
-            let initializer = match initializer {
-                DefinitionStateInitializer::Literal(value) => {
-                    DefinitionStateInitializer::Literal(value)
-                }
-
-                DefinitionStateInitializer::Parameter(parameter) => {
-                    match element.parameters()[parameter.index()] {
-                        ValueRef::Literal(value) => DefinitionStateInitializer::Literal(value),
-
-                        ValueRef::Parameter(parameter) => {
-                            DefinitionStateInitializer::Parameter(parameter)
-                        }
-                    }
-                }
-            };
-
-            state_initializers.push(initializer);
-        }
+    for child in &compiled_children {
+        state_initializers.extend_from_slice(child.state_initializers());
     }
 
     debug_assert_eq!(
@@ -1582,7 +1560,7 @@ mod tests {
         definition::{DefinitionId, PrimitiveElementKind},
         registry::DefinitionRegistry,
     };
-    use hynergy_model::parameter::{ParameterConstraints, ParameterId};
+    use hynergy_model::parameter::ParameterId;
 
     fn state_slots(indices: &[u32]) -> BoundStateSlots {
         BoundStateSlots::new(indices.iter().copied().map(StateSlot::new).collect())
@@ -1672,7 +1650,7 @@ mod tests {
                         output_positive,
                         output_negative,
                     ],
-                    vec![ValueRef::Literal(0.0)],
+                    Vec::new(),
                 ))
                 .unwrap();
 
@@ -3035,7 +3013,7 @@ mod tests {
                         output_positive,
                         output_negative,
                     ],
-                    vec![ValueRef::Literal(1.25)],
+                    Vec::new(),
                 ))
                 .unwrap();
 
@@ -3158,7 +3136,7 @@ mod tests {
             ),
             (
                 PrimitiveElementKind::TickDelay,
-                DefinitionStateInitializer::Parameter(ParameterId::new(0)),
+                DefinitionStateInitializer::Literal(0.0),
             ),
             (
                 PrimitiveElementKind::SchmittBuffer,
@@ -3176,15 +3154,11 @@ mod tests {
     }
 
     #[test]
-    fn composite_state_initializers_flatten_child_parameter_mappings() {
+    fn composite_tick_delay_state_initializers_are_literal_zero() {
         let registry = DefinitionRegistry::new();
 
         let definition = {
             let mut builder = DeviceDefinitionBuilder::new(&registry);
-
-            let initial = builder
-                .add_parameter(ParameterConstraints::default())
-                .unwrap();
 
             let first_terminals = [
                 builder.add_terminal().unwrap(),
@@ -3204,7 +3178,7 @@ mod tests {
                 .add_element(Element::new(
                     PrimitiveElementKind::TickDelay.into(),
                     first_terminals.to_vec(),
-                    vec![ValueRef::Parameter(initial)],
+                    Vec::new(),
                 ))
                 .unwrap();
 
@@ -3212,7 +3186,7 @@ mod tests {
                 .add_element(Element::new(
                     PrimitiveElementKind::TickDelay.into(),
                     second_terminals.to_vec(),
-                    vec![ValueRef::Literal(4.25)],
+                    Vec::new(),
                 ))
                 .unwrap();
 
@@ -3226,8 +3200,8 @@ mod tests {
         assert_eq!(
             compiled.state_initializers(),
             &[
-                DefinitionStateInitializer::Parameter(ParameterId::new(0),),
-                DefinitionStateInitializer::Literal(4.25),
+                DefinitionStateInitializer::Literal(0.0),
+                DefinitionStateInitializer::Literal(0.0),
             ],
         );
     }

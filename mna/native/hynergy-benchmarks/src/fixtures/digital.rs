@@ -260,22 +260,21 @@ impl DigitalHarness {
         let n6 = self.nand(carry_in, n4.wire);
         let sum = self.nand(n5.wire, n6.wire);
 
-        // n1 = !(A & B), n4 = !(Cin & (A xor B)). NANDing those
-        // complements gives (A & B) | (Cin & (A xor B)).
         let carry_out = self.nand(n1.wire, n4.wire);
 
         (sum, carry_out)
     }
 
-    fn register_bit(&mut self, initial_high: bool) -> RegisterBit {
+    fn register_bit(&mut self) -> RegisterBit {
         let input = add_wire(&mut self.engine, self.world_id, &mut self.ids);
         let output = add_wire(&mut self.engine, self.world_id, &mut self.ids);
+
         let delay = add_primitive(
             &mut self.engine,
             self.world_id,
             &mut self.ids,
             PrimitiveElementKind::TickDelay,
-            &[logic_voltage(initial_high)],
+            &[],
         );
 
         attach_all(
@@ -292,14 +291,15 @@ impl DigitalHarness {
         }
     }
 
-    fn tick_delay(&mut self, input: WireId, initial_high: bool) -> (WireId, DeviceId) {
+    fn tick_delay(&mut self, input: WireId) -> (WireId, DeviceId) {
         let output = add_wire(&mut self.engine, self.world_id, &mut self.ids);
+
         let delay = add_primitive(
             &mut self.engine,
             self.world_id,
             &mut self.ids,
             PrimitiveElementKind::TickDelay,
-            &[logic_voltage(initial_high)],
+            &[],
         );
 
         attach_all(
@@ -488,7 +488,7 @@ pub fn full_adder_truth_table() -> Vec<((bool, bool, bool), f64, f64)> {
 pub fn tick_delay_trace() -> Vec<f64> {
     let mut harness = DigitalHarness::new();
     let input = harness.input(false);
-    let (_, delay) = harness.tick_delay(input.wire, false);
+    let (_, delay) = harness.tick_delay(input.wire);
     let probe = harness.observe_delay(delay);
 
     harness.tick().unwrap();
@@ -571,12 +571,12 @@ impl ValidatedCpuScenario {
             for bit in 0..BITS_PER_LANE {
                 let (sum, carry_out) =
                     harness.full_adder(a_pins[bit].wire, b_pins[bit].wire, carry_wire);
-                let (_, delay) = harness.tick_delay(sum.wire, false);
+                let (_, delay) = harness.tick_delay(sum.wire);
                 result_delays.push(delay);
                 carry_wire = carry_out.wire;
             }
 
-            let (_, carry_delay) = harness.tick_delay(carry_wire, false);
+            let (_, carry_delay) = harness.tick_delay(carry_wire);
 
             if observe_outputs {
                 let result = result_delays
@@ -973,19 +973,18 @@ impl FullCpuScenario {
         let instruction_bits = FULL_CPU_OPCODE_BITS + register_bits;
         let program = full_cpu_program(width);
 
-        let pc: [RegisterBit; FULL_CPU_PC_BITS] =
-            std::array::from_fn(|_| harness.register_bit(false));
+        let pc: [RegisterBit; FULL_CPU_PC_BITS] = std::array::from_fn(|_| harness.register_bit());
         let a = (0..register_bits)
-            .map(|_| harness.register_bit(false))
+            .map(|_| harness.register_bit())
             .collect::<Vec<_>>();
         let b = (0..register_bits)
-            .map(|_| harness.register_bit(false))
+            .map(|_| harness.register_bit())
             .collect::<Vec<_>>();
-        let carry = harness.register_bit(false);
+        let carry = harness.register_bit();
         let instruction = (0..instruction_bits)
-            .map(|_| harness.register_bit(false))
+            .map(|_| harness.register_bit())
             .collect::<Vec<_>>();
-        let phase = harness.register_bit(false);
+        let phase = harness.register_bit();
 
         harness.inverter_into(phase.input, phase.output);
 
