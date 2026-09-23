@@ -4,7 +4,6 @@ use hynergy_model::device::definition::{DeviceDefinition, DeviceId};
 use hynergy_model::network::{
     DeviceInsertResult, DeviceLocation, DeviceRemoveResult, Network, PreparedDeviceInsert,
 };
-use hynergy_model::parameter::ParameterId;
 use thiserror::Error;
 
 #[cfg(debug_assertions)]
@@ -315,7 +314,7 @@ impl PhysicalStateStore {
     #[inline]
     pub(crate) fn read_logical_at(
         &self,
-        network: &Network,
+        _network: &Network,
         device: DeviceId,
         address: PhysicalStateAddress,
         initializer: DefinitionStateInitializer,
@@ -342,18 +341,6 @@ impl PhysicalStateStore {
 
         match initializer {
             DefinitionStateInitializer::Literal(value) => Ok(value),
-
-            DefinitionStateInitializer::Parameter(parameter) => {
-                match network.parameter_at_location(address.location(), parameter) {
-                    Some(Some(value)) => Ok(value),
-
-                    Some(None) => {
-                        Err(PhysicalStateError::MissingInitialParameter { device, parameter })
-                    }
-
-                    None => Err(Self::state_not_initialized(device, state_index)),
-                }
-            }
         }
     }
 
@@ -579,12 +566,6 @@ impl PhysicalStateAddress {
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysicalStateError {
-    #[error("device {device:?} initial parameter {parameter:?} is not assigned")]
-    MissingInitialParameter {
-        device: DeviceId,
-        parameter: ParameterId,
-    },
-
     #[error("state {state:?} is not initialized")]
     StateNotInitialized { state: DeviceState },
 }
