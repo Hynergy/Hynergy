@@ -1,3 +1,4 @@
+pub(crate) mod discrete;
 pub(crate) mod island_ir;
 mod state;
 pub(crate) mod template;

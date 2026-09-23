@@ -1,6 +1,6 @@
 use crate::compile::template::{
     CompiledDefinitionTemplate, DefinitionTemplateBuildError, DefinitionTemplateBuilder,
-    LocalStateId, LocalUnknownId, LocalValueId,
+    LocalDiscreteMode, LocalStateId, LocalUnknownId, LocalValueId,
 };
 use hynergy_ids::define_id;
 use hynergy_model::circuit::{Circuit, NodeId, ValueRef};
@@ -1114,6 +1114,22 @@ fn stamp_conductance(
 }
 
 #[inline]
+fn stamp_complementary_output_stage(
+    builder: &mut DefinitionTemplateBuilder,
+    mode: LocalDiscreteMode,
+    output: LocalUnknownId,
+    high_rail: LocalUnknownId,
+    low_rail: LocalUnknownId,
+    pull_up: LocalValueId,
+    pull_down: LocalValueId,
+) {
+    stamp_conductance(builder, high_rail, output, pull_up);
+    stamp_conductance(builder, output, low_rail, pull_down);
+
+    builder.register_complementary_driver(mode, output, high_rail, low_rail, pull_up, pull_down);
+}
+
+#[inline]
 fn switched_conductance(
     builder: &mut DefinitionTemplateBuilder,
     mode: LocalValueId,
@@ -1276,7 +1292,7 @@ fn compile_logic_gate(
         _ => unreachable!("compile_logic_gate called for a non-logic primitive"),
     };
 
-    builder.require_iteration_stability(output_high);
+    let output_mode = builder.discrete_mode(output_high);
 
     // Complementary finite-conductance output stage:
     // HIGH -> pull-up = G_max, pull-down = G_min
@@ -1286,8 +1302,7 @@ fn compile_logic_gate(
     let pull_up = builder.add(g_min, high_delta)?;
     let pull_down = builder.sub(g_max, high_delta)?;
 
-    stamp_conductance(builder, vdd, output, pull_up);
-    stamp_conductance(builder, output, vss, pull_down);
+    stamp_complementary_output_stage(builder, output_mode, output, vdd, vss, pull_up, pull_down);
 
     let output_voltage = voltage_difference(builder, output, vss)?;
     let supply_branch_voltage = voltage_difference(builder, vdd, output)?;
@@ -1479,7 +1494,7 @@ fn stamp_voltage_controlled_switch(
     let control_voltage = builder.sub(control_positive_voltage, control_negative_voltage)?;
     let mode = builder.less_equal(threshold, control_voltage)?;
 
-    builder.require_iteration_stability(mode);
+    builder.discrete_mode(mode);
 
     let conductance = switched_conductance(builder, mode, g_min, g_max)?;
 
@@ -1790,6 +1805,88 @@ mod tests {
         assert_eq!(switch.allocated_unknown_count(), 0);
         assert_eq!(switch.parameter_count(), 3);
         assert_eq!(switch.state_count(), 0);
+    }
+
+    #[test]
+    fn stateless_logic_templates_expose_discrete_complementary_metadata() {
+        for kind in [
+            PrimitiveElementKind::Not,
+            PrimitiveElementKind::And,
+            PrimitiveElementKind::Nand,
+            PrimitiveElementKind::Or,
+            PrimitiveElementKind::Nor,
+        ] {
+            let gate = template(kind);
+
+            assert_eq!(gate.discrete_modes().len(), 1, "{kind:?}");
+            assert_eq!(gate.complementary_drivers().len(), 1, "{kind:?}");
+            assert_eq!(
+                gate.complementary_drivers()[0].mode().value(),
+                gate.discrete_modes()[0],
+                "{kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn voltage_controlled_switch_exposes_discrete_mode_without_complementary_driver() {
+        let switch = template(PrimitiveElementKind::VoltageControlledSwitch);
+
+        assert_eq!(switch.discrete_modes().len(), 1);
+        assert!(switch.complementary_drivers().is_empty());
+    }
+
+    #[test]
+    fn stage_a_non_participants_emit_no_discrete_metadata() {
+        for kind in [
+            PrimitiveElementKind::Diode,
+            PrimitiveElementKind::VoltageControlledConductance,
+            PrimitiveElementKind::SchmittBuffer,
+        ] {
+            let template = template(kind);
+
+            assert!(template.discrete_modes().is_empty(), "{kind:?}");
+            assert!(template.complementary_drivers().is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn composite_preserves_child_logic_discrete_metadata() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let output = builder.add_terminal().unwrap();
+            let vdd = builder.add_terminal().unwrap();
+            let vss = builder.add_terminal().unwrap();
+            let input = builder.add_terminal().unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Not.into(),
+                    vec![output, vdd, vss, input],
+                    vec![
+                        ValueRef::Literal(2.5),
+                        ValueRef::Literal(1.0),
+                        ValueRef::Literal(0.0),
+                    ],
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        let compiled = CompiledDefinition::compile(&registry, &definition).unwrap();
+        let partition = compiled.partition(DevicePartitionId::new(0)).unwrap();
+        let template = partition.template();
+
+        assert_eq!(template.discrete_modes().len(), 1);
+        assert_eq!(template.complementary_drivers().len(), 1);
+        assert_eq!(
+            template.complementary_drivers()[0].mode().value(),
+            template.discrete_modes()[0],
+        );
     }
 
     #[test]

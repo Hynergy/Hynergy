@@ -194,6 +194,34 @@ impl MnaPattern {
         Some(MatrixSlot::from_index(start + relative))
     }
 
+    pub fn coordinate(&self, slot: MatrixSlot) -> Option<(UnknownIndex, UnknownIndex)> {
+        let index = slot.index();
+
+        if index >= self.row_indices.len() {
+            return None;
+        }
+
+        let mut low = 0usize;
+        let mut high = self.dimension();
+
+        while low < high {
+            let middle = low + (high - low) / 2;
+
+            if self.column_ptrs[middle + 1] as usize <= index {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+
+        debug_assert!(low < self.dimension());
+
+        Some((
+            UnknownIndex::new(self.row_indices[index]),
+            UnknownIndex::new(u32::try_from(low).expect("MNA column index must fit UnknownIndex")),
+        ))
+    }
+
     #[cfg(test)]
     #[inline]
     pub(crate) fn column_ptrs(&self) -> &[u32] {
@@ -344,6 +372,49 @@ mod tests {
 
         assert_eq!(pattern.column_ptrs(), &[0, 1, 1, 1, 2]);
         assert_eq!(pattern.row_indices(), &[1, 2]);
+    }
+
+    #[test]
+    fn recovers_coordinates_across_empty_columns() {
+        let mut builder = PatternBuilder::new(5).unwrap();
+
+        builder
+            .request(UnknownIndex::new(3), UnknownIndex::new(0))
+            .unwrap();
+        builder
+            .request(UnknownIndex::new(1), UnknownIndex::new(4))
+            .unwrap();
+
+        let pattern = builder.finish().unwrap();
+
+        let first = pattern
+            .slot(UnknownIndex::new(3), UnknownIndex::new(0))
+            .unwrap();
+        let last = pattern
+            .slot(UnknownIndex::new(1), UnknownIndex::new(4))
+            .unwrap();
+
+        assert_eq!(
+            pattern.coordinate(first),
+            Some((UnknownIndex::new(3), UnknownIndex::new(0))),
+        );
+        assert_eq!(
+            pattern.coordinate(last),
+            Some((UnknownIndex::new(1), UnknownIndex::new(4))),
+        );
+    }
+
+    #[test]
+    fn coordinate_rejects_slot_outside_pattern() {
+        let mut builder = PatternBuilder::new(1).unwrap();
+
+        builder
+            .request(UnknownIndex::new(0), UnknownIndex::new(0))
+            .unwrap();
+
+        let pattern = builder.finish().unwrap();
+
+        assert_eq!(pattern.coordinate(MatrixSlot::from_index(1)), None);
     }
 
     #[test]

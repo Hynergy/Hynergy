@@ -2,6 +2,9 @@ use crate::compile::definition::{
     CompiledDefinition, CompiledPartitionTemplate, DefinitionCompileError, DefinitionStateId,
     DefinitionStateInitializer,
 };
+use crate::compile::discrete::{
+    BoundDiscreteMetadata, CompiledDiscretePlan, compile_discrete_plan,
+};
 use crate::compile::island_ir::{CompiledIslandIr, IslandIrBuildError, IslandIrBuilder};
 use crate::compile::state::{BoundStateSlots, StateAllocationError};
 use crate::compile::template::{BoundUnknowns, CompiledDefinitionTemplate, DefinitionLinkError};
@@ -318,6 +321,7 @@ pub(crate) enum IslandCompileError {
 pub(crate) struct CompiledIsland {
     pattern: MnaPattern,
     ir: CompiledIslandIr,
+    discrete_plan: Option<Box<CompiledDiscretePlan>>,
     states: IslandStateLayout,
     partition_inputs: Box<[CompiledPartitionInputs]>,
     observer_outputs: Box<[CompiledObserverOutput]>,
@@ -329,6 +333,7 @@ pub(crate) struct CompiledIsland {
 pub(crate) struct CompiledIslandParts {
     pub(crate) pattern: MnaPattern,
     pub(crate) ir: CompiledIslandIr,
+    pub(crate) discrete_plan: Option<Box<CompiledDiscretePlan>>,
     pub(crate) states: IslandStateLayout,
     pub(crate) partition_inputs: Box<[CompiledPartitionInputs]>,
     pub(crate) observer_outputs: Box<[CompiledObserverOutput]>,
@@ -342,6 +347,7 @@ impl CompiledIsland {
         CompiledIslandParts {
             pattern: self.pattern,
             ir: self.ir,
+            discrete_plan: self.discrete_plan,
             #[cfg(test)]
             unknowns: self.unknowns,
             states: self.states,
@@ -361,6 +367,11 @@ impl CompiledIsland {
     #[inline]
     pub(crate) const fn ir(&self) -> &CompiledIslandIr {
         &self.ir
+    }
+
+    #[inline]
+    pub(crate) fn discrete_plan(&self) -> Option<&CompiledDiscretePlan> {
+        self.discrete_plan.as_deref()
     }
 
     #[inline]
@@ -421,6 +432,7 @@ pub(crate) fn compile_island_parts(
     let pattern = build_island_pattern(unknown_allocator.dimension(), &pattern_partitions)?;
 
     let mut ir_builder = IslandIrBuilder::new(&pattern);
+    let mut discrete_metadata = BoundDiscreteMetadata::default();
     let mut partition_inputs = Vec::with_capacity(bound_partitions.len());
     let mut observer_outputs = Vec::new();
 
@@ -430,7 +442,10 @@ pub(crate) fn compile_island_parts(
                 .template
                 .bind(&partition.unknowns, &partition.states, &mut ir_builder)?;
 
-        let (parameter_inputs, outputs) = inputs.into_parts();
+        let (parameter_inputs, outputs, discrete) = inputs.into_parts();
+
+        discrete_metadata.extend(discrete);
+
         let definition_observers = spec.partition.definition_observers();
 
         debug_assert_eq!(
@@ -465,10 +480,12 @@ pub(crate) fn compile_island_parts(
     );
 
     let ir = ir_builder.finish()?;
+    let discrete_plan = compile_discrete_plan(&pattern, &ir, discrete_metadata);
 
     Ok(CompiledIsland {
         pattern,
         ir,
+        discrete_plan,
         #[cfg(test)]
         unknowns: unknown_layout,
         states: state_layout,
@@ -919,6 +936,104 @@ mod test {
         assert_eq!(island.ir().matrix_program().len(), 1,);
 
         assert_eq!(island.state_count(), 0,);
+    }
+
+    #[test]
+    fn logic_island_compiles_qualified_discrete_plan() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::Not))
+            .unwrap();
+
+        let compiled_definition = CompiledDefinition::compile(&registry, definition).unwrap();
+
+        let partition = compiled_definition
+            .partition(DevicePartitionId::new(0))
+            .unwrap();
+
+        let device = DeviceId::try_from(1).unwrap();
+
+        let output = IslandNode::terminal(device, TerminalId::new(0));
+        let vdd = IslandNode::terminal(device, TerminalId::new(1));
+        let vss = IslandNode::terminal(device, TerminalId::new(2));
+        let input = IslandNode::terminal(device, TerminalId::new(3));
+
+        let terminal_nodes = [output, vdd, vss, input];
+
+        let parts = [IslandPartitionSpec::new(
+            device,
+            partition,
+            compiled_definition.state_initializers(),
+            &terminal_nodes,
+        )];
+
+        let island = compile_island_parts(&[vss, output, vdd, input], &parts).unwrap();
+
+        let plan = island.discrete_plan().unwrap();
+
+        assert_eq!(plan.drivers().len(), 1);
+        assert!(plan.matrix_barriers().is_empty());
+        assert!(plan.rhs_barriers().is_empty());
+    }
+
+    #[test]
+    fn voltage_controlled_switch_conductance_is_discrete_plan_barrier() {
+        let registry = DefinitionRegistry::new();
+
+        let gate_definition = registry
+            .get(DefinitionId::from(PrimitiveElementKind::Not))
+            .unwrap();
+        let switch_definition = registry
+            .get(DefinitionId::from(
+                PrimitiveElementKind::VoltageControlledSwitch,
+            ))
+            .unwrap();
+
+        let compiled_gate = CompiledDefinition::compile(&registry, gate_definition).unwrap();
+        let compiled_switch = CompiledDefinition::compile(&registry, switch_definition).unwrap();
+
+        let gate_partition = compiled_gate.partition(DevicePartitionId::new(0)).unwrap();
+        let switch_partition = compiled_switch
+            .partition(DevicePartitionId::new(0))
+            .unwrap();
+
+        let gate_device = DeviceId::try_from(1).unwrap();
+        let switch_device = DeviceId::try_from(2).unwrap();
+
+        let vss = IslandNode::net(NetId::try_from(1).unwrap());
+        let gate_output = IslandNode::net(NetId::try_from(2).unwrap());
+        let vdd = IslandNode::net(NetId::try_from(3).unwrap());
+        let gate_input = IslandNode::net(NetId::try_from(4).unwrap());
+        let switch_output = IslandNode::net(NetId::try_from(5).unwrap());
+
+        let gate_terminals = [gate_output, vdd, vss, gate_input];
+        let switch_terminals = [switch_output, vss, gate_output, vss];
+
+        let parts = [
+            IslandPartitionSpec::new(
+                gate_device,
+                gate_partition,
+                compiled_gate.state_initializers(),
+                &gate_terminals,
+            ),
+            IslandPartitionSpec::new(
+                switch_device,
+                switch_partition,
+                compiled_switch.state_initializers(),
+                &switch_terminals,
+            ),
+        ];
+
+        let island =
+            compile_island_parts(&[vss, gate_output, vdd, gate_input, switch_output], &parts)
+                .unwrap();
+
+        let plan = island.discrete_plan().unwrap();
+
+        assert_eq!(plan.drivers().len(), 1);
+        assert_eq!(plan.matrix_barriers().len(), 1);
+        assert!(plan.rhs_barriers().is_empty());
     }
 
     #[test]

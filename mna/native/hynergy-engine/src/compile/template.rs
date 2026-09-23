@@ -1,3 +1,4 @@
+use crate::compile::discrete::{BoundComplementaryDriver, BoundDiscreteMetadata};
 use crate::compile::island_ir::IslandIrBuilder;
 use crate::compile::state::BoundStateSlots;
 use crate::compile::unknown::{UnknownAllocationError, UnknownRange};
@@ -135,6 +136,60 @@ impl LocalIterationLatch {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalDiscreteMode {
+    value: LocalValueId,
+}
+
+impl LocalDiscreteMode {
+    #[inline]
+    pub(crate) const fn value(self) -> LocalValueId {
+        self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalComplementaryDriver {
+    mode: LocalDiscreteMode,
+    output: LocalUnknownId,
+    high_rail: LocalUnknownId,
+    low_rail: LocalUnknownId,
+    pull_up: LocalValueId,
+    pull_down: LocalValueId,
+}
+
+impl LocalComplementaryDriver {
+    #[inline]
+    pub(crate) const fn mode(self) -> LocalDiscreteMode {
+        self.mode
+    }
+
+    #[inline]
+    pub(crate) const fn output(self) -> LocalUnknownId {
+        self.output
+    }
+
+    #[inline]
+    pub(crate) const fn high_rail(self) -> LocalUnknownId {
+        self.high_rail
+    }
+
+    #[inline]
+    pub(crate) const fn low_rail(self) -> LocalUnknownId {
+        self.low_rail
+    }
+
+    #[inline]
+    pub(crate) const fn pull_up(self) -> LocalValueId {
+        self.pull_up
+    }
+
+    #[inline]
+    pub(crate) const fn pull_down(self) -> LocalValueId {
+        self.pull_down
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionTemplateBuildError {
     #[error("definition-template ID range is exhausted")]
@@ -193,6 +248,9 @@ pub(crate) struct DefinitionTemplateBuilder {
 
     iteration_stability_values: Vec<LocalValueId>,
     iteration_latches: Vec<(LocalValueId, Option<LocalValueId>)>,
+
+    discrete_modes: Vec<LocalValueId>,
+    complementary_drivers: Vec<LocalComplementaryDriver>,
 
     outputs: Vec<LocalValueId>,
 }
@@ -575,6 +633,11 @@ impl DefinitionTemplateBuilder {
         self.iteration_stability_values
             .dedup_by_key(|value| value.index());
 
+        self.discrete_modes
+            .sort_unstable_by_key(|value| value.index());
+
+        self.discrete_modes.dedup_by_key(|value| value.index());
+
         let iteration_latches = self
             .iteration_latches
             .into_iter()
@@ -602,6 +665,9 @@ impl DefinitionTemplateBuilder {
 
             iteration_stability_values: self.iteration_stability_values.into_boxed_slice(),
             iteration_latches,
+
+            discrete_modes: self.discrete_modes.into_boxed_slice(),
+            complementary_drivers: self.complementary_drivers.into_boxed_slice(),
 
             outputs: self.outputs.into_boxed_slice(),
         })
@@ -727,6 +793,47 @@ impl DefinitionTemplateBuilder {
     }
 
     #[inline]
+    pub(crate) fn discrete_mode(&mut self, value: LocalValueId) -> LocalDiscreteMode {
+        debug_assert!(value.index() < self.values.len());
+
+        self.require_iteration_stability(value);
+        self.discrete_modes.push(value);
+
+        LocalDiscreteMode { value }
+    }
+
+    #[inline]
+    pub(crate) fn register_complementary_driver(
+        &mut self,
+        mode: LocalDiscreteMode,
+        output: LocalUnknownId,
+        high_rail: LocalUnknownId,
+        low_rail: LocalUnknownId,
+        pull_up: LocalValueId,
+        pull_down: LocalValueId,
+    ) {
+        debug_assert!(mode.value.index() < self.values.len());
+        debug_assert!(output.index() < self.unknowns.len());
+        debug_assert!(high_rail.index() < self.unknowns.len());
+        debug_assert!(low_rail.index() < self.unknowns.len());
+        debug_assert!(pull_up.index() < self.values.len());
+        debug_assert!(pull_down.index() < self.values.len());
+        debug_assert!(
+            self.discrete_modes.contains(&mode.value),
+            "complementary driver mode must be registered as a discrete mode",
+        );
+
+        self.complementary_drivers.push(LocalComplementaryDriver {
+            mode,
+            output,
+            high_rail,
+            low_rail,
+            pull_up,
+            pull_down,
+        });
+    }
+
+    #[inline]
     pub(crate) fn require_iteration_stability(&mut self, value: LocalValueId) {
         debug_assert!(value.index() < self.values.len());
 
@@ -759,6 +866,8 @@ pub(crate) struct CompiledDefinitionTemplate {
     allocated_unknown_count: usize,
     iteration_stability_values: Box<[LocalValueId]>,
     iteration_latches: Box<[(LocalValueId, LocalValueId)]>,
+    discrete_modes: Box<[LocalValueId]>,
+    complementary_drivers: Box<[LocalComplementaryDriver]>,
     outputs: Box<[LocalValueId]>,
 }
 
@@ -870,6 +979,23 @@ impl CompiledDefinitionTemplate {
             builder.require_iteration_stability(values[value.index()]);
         }
 
+        for &mode in &self.discrete_modes {
+            builder.discrete_mode(values[mode.index()]);
+        }
+
+        for &driver in &self.complementary_drivers {
+            builder.register_complementary_driver(
+                LocalDiscreteMode {
+                    value: values[driver.mode.value.index()],
+                },
+                unknowns[driver.output.index()],
+                unknowns[driver.high_rail.index()],
+                unknowns[driver.low_rail.index()],
+                values[driver.pull_up.index()],
+                values[driver.pull_down.index()],
+            );
+        }
+
         for term in &self.matrix_terms {
             let entry = self.matrix_entries[term.destination.index()];
 
@@ -936,6 +1062,7 @@ impl CompiledDefinitionTemplate {
         }
 
         let (values, parameters) = self.bind_values(unknowns, states, ir)?;
+        let discrete = self.bind_discrete_metadata(unknowns, &values);
 
         for &(latch, update) in &self.iteration_latches {
             ir.update_iteration_latch(values[latch.index()], values[update.index()]);
@@ -990,7 +1117,37 @@ impl CompiledDefinitionTemplate {
         Ok(BoundDefinitionInputs {
             parameters,
             outputs,
+            discrete,
         })
+    }
+
+    fn bind_discrete_metadata(
+        &self,
+        unknowns: &BoundUnknowns,
+        values: &[ValueSlot],
+    ) -> BoundDiscreteMetadata {
+        let mut modes = SmallVec::<[ValueSlot; 2]>::with_capacity(self.discrete_modes.len());
+
+        for &mode in &self.discrete_modes {
+            modes.push(values[mode.index()]);
+        }
+
+        let mut complementary_drivers = SmallVec::<[BoundComplementaryDriver; 1]>::with_capacity(
+            self.complementary_drivers.len(),
+        );
+
+        for &driver in &self.complementary_drivers {
+            complementary_drivers.push(BoundComplementaryDriver::new(
+                values[driver.mode().value().index()],
+                unknowns.get(driver.output()),
+                unknowns.get(driver.high_rail()),
+                unknowns.get(driver.low_rail()),
+                values[driver.pull_up().index()],
+                values[driver.pull_down().index()],
+            ));
+        }
+
+        BoundDiscreteMetadata::new(modes, complementary_drivers)
     }
 
     fn bind_values(
@@ -1145,6 +1302,16 @@ impl CompiledDefinitionTemplate {
     }
 
     #[inline]
+    pub(crate) fn discrete_modes(&self) -> &[LocalValueId] {
+        &self.discrete_modes
+    }
+
+    #[inline]
+    pub(crate) fn complementary_drivers(&self) -> &[LocalComplementaryDriver] {
+        &self.complementary_drivers
+    }
+
+    #[inline]
     pub(crate) fn output_count(&self) -> usize {
         self.outputs.len()
     }
@@ -1214,11 +1381,12 @@ fn matrix_static_dependencies(
 pub(crate) struct BoundDefinitionInputs {
     parameters: Box<[InputSlot]>,
     outputs: Box<[ValueSlot]>,
+    discrete: BoundDiscreteMetadata,
 }
 
 impl BoundDefinitionInputs {
-    pub(crate) fn into_parts(self) -> (Box<[InputSlot]>, Box<[ValueSlot]>) {
-        (self.parameters, self.outputs)
+    pub(crate) fn into_parts(self) -> (Box<[InputSlot]>, Box<[ValueSlot]>, BoundDiscreteMetadata) {
+        (self.parameters, self.outputs, self.discrete)
     }
 
     #[cfg(test)]
@@ -1231,6 +1399,12 @@ impl BoundDefinitionInputs {
     #[inline]
     pub(crate) fn output(&self, index: usize) -> Option<ValueSlot> {
         self.outputs.get(index).copied()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn discrete(&self) -> &BoundDiscreteMetadata {
+        &self.discrete
     }
 }
 
@@ -1332,6 +1506,223 @@ mod tests {
         let template = builder.finish().unwrap();
 
         assert_eq!(template.matrix_entry_count(), 0);
+    }
+
+    #[test]
+    fn discrete_mode_is_stable_and_deduplicated() {
+        let mut builder = DefinitionTemplateBuilder::default();
+
+        let input = builder.terminal_voltage().unwrap();
+        let value = builder.unknown_value(input).unwrap();
+
+        builder.discrete_mode(value);
+        builder.discrete_mode(value);
+
+        let template = builder.finish().unwrap();
+
+        assert_eq!(template.discrete_modes(), &[value]);
+        assert_eq!(template.iteration_stability_values.as_ref(), &[value]);
+    }
+
+    #[test]
+    fn complementary_driver_preserves_exact_local_references() {
+        let mut builder = DefinitionTemplateBuilder::default();
+
+        let output = builder.terminal_voltage().unwrap();
+        let high_rail = builder.terminal_voltage().unwrap();
+        let low_rail = builder.terminal_voltage().unwrap();
+        let input = builder.terminal_voltage().unwrap();
+
+        let mode_value = builder.unknown_value(input).unwrap();
+        let mode = builder.discrete_mode(mode_value);
+        let pull_up = builder.parameter().unwrap();
+        let pull_down = builder.parameter().unwrap();
+
+        builder
+            .register_complementary_driver(mode, output, high_rail, low_rail, pull_up, pull_down);
+
+        let template = builder.finish().unwrap();
+        let driver = template.complementary_drivers()[0];
+
+        assert_eq!(driver.mode().value(), mode_value);
+        assert_eq!(driver.output(), output);
+        assert_eq!(driver.high_rail(), high_rail);
+        assert_eq!(driver.low_rail(), low_rail);
+        assert_eq!(driver.pull_up(), pull_up);
+        assert_eq!(driver.pull_down(), pull_down);
+    }
+
+    #[test]
+    fn compiled_template_instantiation_preserves_discrete_driver_metadata() {
+        let mut child = DefinitionTemplateBuilder::default();
+
+        let child_output = child.terminal_voltage().unwrap();
+        let child_high_rail = child.terminal_voltage().unwrap();
+        let child_low_rail = child.terminal_voltage().unwrap();
+        let child_input = child.terminal_voltage().unwrap();
+
+        let child_mode_value = child.unknown_value(child_input).unwrap();
+        let child_mode = child.discrete_mode(child_mode_value);
+        let child_pull_up = child.parameter().unwrap();
+        let child_pull_down = child.parameter().unwrap();
+
+        child.register_complementary_driver(
+            child_mode,
+            child_output,
+            child_high_rail,
+            child_low_rail,
+            child_pull_up,
+            child_pull_down,
+        );
+
+        let child = child.finish().unwrap();
+
+        let mut parent = DefinitionTemplateBuilder::default();
+
+        let output = parent.terminal_voltage().unwrap();
+        let high_rail = parent.terminal_voltage().unwrap();
+        let low_rail = parent.terminal_voltage().unwrap();
+        let input = parent.terminal_voltage().unwrap();
+        let pull_up = parent.parameter().unwrap();
+        let pull_down = parent.parameter().unwrap();
+
+        child
+            .instantiate_into(
+                &mut parent,
+                &[output, high_rail, low_rail, input],
+                &[pull_up, pull_down],
+                &[],
+            )
+            .unwrap();
+
+        let parent = parent.finish().unwrap();
+
+        assert_eq!(parent.discrete_modes().len(), 1);
+        assert_eq!(parent.complementary_drivers().len(), 1);
+
+        let driver = parent.complementary_drivers()[0];
+
+        assert_eq!(driver.mode().value(), parent.discrete_modes()[0]);
+        assert_eq!(driver.output(), output);
+        assert_eq!(driver.high_rail(), high_rail);
+        assert_eq!(driver.low_rail(), low_rail);
+        assert_eq!(driver.pull_up(), pull_up);
+        assert_eq!(driver.pull_down(), pull_down);
+    }
+
+    #[test]
+    fn bind_maps_discrete_metadata_to_island_values_and_unknowns() {
+        let mut builder = DefinitionTemplateBuilder::default();
+
+        let output = builder.terminal_voltage().unwrap();
+        let high_rail = builder.terminal_voltage().unwrap();
+        let low_rail = builder.terminal_voltage().unwrap();
+        let input = builder.terminal_voltage().unwrap();
+
+        let mode_value = builder.unknown_value(input).unwrap();
+        let mode = builder.discrete_mode(mode_value);
+        let pull_up = builder.parameter().unwrap();
+        let pull_down = builder.parameter().unwrap();
+
+        builder
+            .register_complementary_driver(mode, output, high_rail, low_rail, pull_up, pull_down);
+
+        let template = builder.finish().unwrap();
+
+        let output_unknown = UnknownIndex::new(10);
+        let high_rail_unknown = UnknownIndex::new(4);
+        let low_rail_unknown = UnknownIndex::new(1);
+        let input_unknown = UnknownIndex::new(7);
+
+        let mut unknown_allocator = UnknownAllocator::new(12).unwrap();
+        let allocated = unknown_allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let unknowns = template
+            .bind_unknowns(
+                &[
+                    Some(output_unknown),
+                    Some(high_rail_unknown),
+                    Some(low_rail_unknown),
+                    Some(input_unknown),
+                ],
+                allocated,
+            )
+            .unwrap();
+
+        let pattern = PatternBuilder::new(12).unwrap().finish().unwrap();
+        let states = state_slots(&[]);
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        let inputs = template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+
+        let discrete = inputs.discrete();
+
+        assert_eq!(discrete.modes().len(), 1);
+        assert_eq!(discrete.complementary_drivers().len(), 1);
+
+        let driver = discrete.complementary_drivers()[0];
+
+        assert_eq!(driver.mode(), discrete.modes()[0]);
+        assert_eq!(driver.output(), Some(output_unknown));
+        assert_eq!(driver.high_rail(), Some(high_rail_unknown));
+        assert_eq!(driver.low_rail(), Some(low_rail_unknown));
+        assert_eq!(driver.pull_up(), inputs.parameter(0).unwrap().value());
+        assert_eq!(driver.pull_down(), inputs.parameter(1).unwrap().value());
+    }
+
+    #[test]
+    fn bind_preserves_reference_rails_in_discrete_metadata() {
+        let mut builder = DefinitionTemplateBuilder::default();
+
+        let output = builder.terminal_voltage().unwrap();
+        let high_rail = builder.terminal_voltage().unwrap();
+        let low_rail = builder.terminal_voltage().unwrap();
+        let input = builder.terminal_voltage().unwrap();
+
+        let mode_value = builder.unknown_value(input).unwrap();
+        let mode = builder.discrete_mode(mode_value);
+        let pull_up = builder.parameter().unwrap();
+        let pull_down = builder.parameter().unwrap();
+
+        builder
+            .register_complementary_driver(mode, output, high_rail, low_rail, pull_up, pull_down);
+
+        let template = builder.finish().unwrap();
+
+        let output_unknown = UnknownIndex::new(0);
+        let low_rail_unknown = UnknownIndex::new(1);
+        let input_unknown = UnknownIndex::new(2);
+
+        let mut unknown_allocator = UnknownAllocator::new(3).unwrap();
+        let allocated = unknown_allocator
+            .allocate(template.allocated_unknown_count())
+            .unwrap();
+
+        let unknowns = template
+            .bind_unknowns(
+                &[
+                    Some(output_unknown),
+                    None,
+                    Some(low_rail_unknown),
+                    Some(input_unknown),
+                ],
+                allocated,
+            )
+            .unwrap();
+
+        let pattern = PatternBuilder::new(3).unwrap().finish().unwrap();
+        let states = state_slots(&[]);
+        let mut ir_builder = IslandIrBuilder::new(&pattern);
+
+        let inputs = template.bind(&unknowns, &states, &mut ir_builder).unwrap();
+
+        let driver = inputs.discrete().complementary_drivers()[0];
+
+        assert_eq!(driver.output(), Some(output_unknown));
+        assert_eq!(driver.high_rail(), None);
+        assert_eq!(driver.low_rail(), Some(low_rail_unknown));
     }
 
     #[test]
