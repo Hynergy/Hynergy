@@ -20,17 +20,41 @@ pub(crate) enum DefinitionStateInitializer {
     Literal(f64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum FailedTickStateTransition {
+    Preserve,
+    Literal(f64),
+}
+
 #[derive(Debug)]
 pub(crate) struct CompiledDefinition {
     partitions: Box<[CompiledPartitionTemplate]>,
     state_initializers: Box<[DefinitionStateInitializer]>,
+    failed_tick_transitions: Box<[FailedTickStateTransition]>,
 }
 
 impl CompiledDefinition {
     fn new(
         partitions: Box<[CompiledPartitionTemplate]>,
         state_initializers: Box<[DefinitionStateInitializer]>,
+        failed_tick_transitions: Box<[FailedTickStateTransition]>,
     ) -> Result<Self, DefinitionCompileError> {
+        debug_assert_eq!(
+            state_initializers.len(),
+            failed_tick_transitions.len(),
+            "compiled state initializers and failed-tick transitions must stay aligned",
+        );
+
+        debug_assert!(
+            failed_tick_transitions
+                .iter()
+                .all(|transition| match transition {
+                    FailedTickStateTransition::Preserve => true,
+                    FailedTickStateTransition::Literal(value) => value.is_finite(),
+                }),
+            "failed-tick literal state transitions must be finite",
+        );
+
         let state_count = state_initializers.len();
 
         let mut state_writers = vec![None; state_count];
@@ -76,6 +100,7 @@ impl CompiledDefinition {
         Ok(Self {
             partitions,
             state_initializers,
+            failed_tick_transitions,
         })
     }
 
@@ -83,10 +108,11 @@ impl CompiledDefinition {
         registry: &DefinitionRegistry,
         definition: &DeviceDefinition,
     ) -> Result<Self, DefinitionCompileError> {
-        let (partitions, state_initializers) = match definition.body() {
+        let (partitions, state_initializers, failed_tick_transitions) = match definition.body() {
             DeviceBody::Primitive(PrimitiveElementKind::TickDelay) => (
                 compile_tick_delay_partitions(definition)?,
                 primitive_state_initializers(PrimitiveElementKind::TickDelay),
+                primitive_failed_tick_transitions(PrimitiveElementKind::TickDelay),
             ),
 
             DeviceBody::Primitive(kind) => {
@@ -124,11 +150,21 @@ impl CompiledDefinition {
                 }]
                 .into_boxed_slice();
 
-                (partitions, primitive_state_initializers(*kind))
+                (
+                    partitions,
+                    primitive_state_initializers(*kind),
+                    primitive_failed_tick_transitions(*kind),
+                )
             }
 
             DeviceBody::Composite(circuit) => compile_composite(registry, definition, circuit)?,
         };
+
+        debug_assert_eq!(
+            failed_tick_transitions.len(),
+            definition.state_count(),
+            "compiled failed-tick transitions must cover the definition state space",
+        );
 
         debug_assert_eq!(
             partitions.len(),
@@ -142,7 +178,7 @@ impl CompiledDefinition {
             "compiled state initializers must cover the definition state space",
         );
 
-        Self::new(partitions, state_initializers)
+        Self::new(partitions, state_initializers, failed_tick_transitions)
     }
 
     #[inline]
@@ -167,6 +203,11 @@ impl CompiledDefinition {
     pub(crate) fn state_initializers(&self) -> &[DefinitionStateInitializer] {
         &self.state_initializers
     }
+
+    #[inline]
+    pub(crate) fn failed_tick_transitions(&self) -> &[FailedTickStateTransition] {
+        &self.failed_tick_transitions
+    }
 }
 
 fn primitive_state_initializers(kind: PrimitiveElementKind) -> Box<[DefinitionStateInitializer]> {
@@ -176,6 +217,24 @@ fn primitive_state_initializers(kind: PrimitiveElementKind) -> Box<[DefinitionSt
         | PrimitiveElementKind::TickDelay
         | PrimitiveElementKind::SchmittBuffer => {
             vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice()
+        }
+
+        _ => Vec::new().into_boxed_slice(),
+    }
+}
+
+fn primitive_failed_tick_transitions(
+    kind: PrimitiveElementKind,
+) -> Box<[FailedTickStateTransition]> {
+    match kind {
+        PrimitiveElementKind::Capacitor
+        | PrimitiveElementKind::Inductor
+        | PrimitiveElementKind::SchmittBuffer => {
+            vec![FailedTickStateTransition::Preserve].into_boxed_slice()
+        }
+
+        PrimitiveElementKind::TickDelay => {
+            vec![FailedTickStateTransition::Literal(0.0)].into_boxed_slice()
         }
 
         _ => Vec::new().into_boxed_slice(),
@@ -721,6 +780,7 @@ fn compile_primitive(
 type CompiledComposite = (
     Box<[CompiledPartitionTemplate]>,
     Box<[DefinitionStateInitializer]>,
+    Box<[FailedTickStateTransition]>,
 );
 
 fn compile_composite(
@@ -739,15 +799,23 @@ fn compile_composite(
     }
 
     let mut state_initializers = Vec::with_capacity(definition.state_count());
+    let mut failed_tick_transitions = Vec::with_capacity(definition.state_count());
 
     for child in &compiled_children {
         state_initializers.extend_from_slice(child.state_initializers());
+        failed_tick_transitions.extend_from_slice(child.failed_tick_transitions());
     }
 
     debug_assert_eq!(
         state_initializers.len(),
         definition.state_count(),
         "flattened child state initializers must cover composite state space",
+    );
+
+    debug_assert_eq!(
+        failed_tick_transitions.len(),
+        definition.state_count(),
+        "flattened child failed-tick transitions must cover composite state space",
     );
 
     let mut element_state_offsets = Vec::with_capacity(compiled_children.len());
@@ -789,6 +857,7 @@ fn compile_composite(
     Ok((
         partitions.into_boxed_slice(),
         state_initializers.into_boxed_slice(),
+        failed_tick_transitions.into_boxed_slice(),
     ))
 }
 
@@ -1687,6 +1756,7 @@ mod tests {
             ]
             .into_boxed_slice(),
             vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice(),
+            vec![FailedTickStateTransition::Literal(0.0)].into_boxed_slice(),
         )
         .unwrap_err();
 
@@ -1707,6 +1777,7 @@ mod tests {
         let error = CompiledDefinition::new(
             Vec::new().into_boxed_slice(),
             vec![DefinitionStateInitializer::Literal(0.0)].into_boxed_slice(),
+            vec![FailedTickStateTransition::Literal(0.0)].into_boxed_slice(),
         )
         .unwrap_err();
 
@@ -3202,6 +3273,123 @@ mod tests {
             &[
                 DefinitionStateInitializer::Literal(0.0),
                 DefinitionStateInitializer::Literal(0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn stateful_primitives_compile_state_metadata() {
+        let registry = DefinitionRegistry::new();
+
+        let cases = [
+            (
+                PrimitiveElementKind::Capacitor,
+                FailedTickStateTransition::Preserve,
+            ),
+            (
+                PrimitiveElementKind::Inductor,
+                FailedTickStateTransition::Preserve,
+            ),
+            (
+                PrimitiveElementKind::TickDelay,
+                FailedTickStateTransition::Literal(0.0),
+            ),
+            (
+                PrimitiveElementKind::SchmittBuffer,
+                FailedTickStateTransition::Preserve,
+            ),
+        ];
+
+        for (kind, expected_failed_transition) in cases {
+            let definition = registry.get(DefinitionId::from(kind)).unwrap();
+            let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
+
+            assert_eq!(
+                compiled.state_initializers(),
+                &[DefinitionStateInitializer::Literal(0.0)],
+                "{kind:?}",
+            );
+
+            assert_eq!(
+                compiled.failed_tick_transitions(),
+                &[expected_failed_transition],
+                "{kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn stateless_primitives_compile_empty_state_metadata() {
+        let registry = DefinitionRegistry::new();
+
+        for kind in PrimitiveElementKind::ALL {
+            if kind.state_count() != 0 {
+                continue;
+            }
+
+            let definition = registry.get(DefinitionId::from(kind)).unwrap();
+            let compiled = CompiledDefinition::compile(&registry, definition).unwrap();
+
+            assert!(compiled.state_initializers().is_empty(), "{kind:?}");
+            assert!(compiled.failed_tick_transitions().is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn composite_failed_tick_transitions_preserve_child_state_order() {
+        let registry = DefinitionRegistry::new();
+
+        let definition = {
+            let mut builder = DeviceDefinitionBuilder::new(&registry);
+
+            let capacitor_terminals = [
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+            ];
+
+            let delay_terminals = [
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+                builder.add_terminal().unwrap(),
+            ];
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Capacitor.into(),
+                    capacitor_terminals.to_vec(),
+                    vec![ValueRef::Literal(1.0)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::TickDelay.into(),
+                    delay_terminals.to_vec(),
+                    Vec::new(),
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(definition.state_count(), 2);
+
+        let compiled = CompiledDefinition::compile(&registry, &definition).unwrap();
+
+        assert_eq!(
+            compiled.state_initializers(),
+            &[
+                DefinitionStateInitializer::Literal(0.0),
+                DefinitionStateInitializer::Literal(0.0),
+            ],
+        );
+
+        assert_eq!(
+            compiled.failed_tick_transitions(),
+            &[
+                FailedTickStateTransition::Preserve,
+                FailedTickStateTransition::Literal(0.0),
             ],
         );
     }
