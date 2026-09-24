@@ -28,11 +28,23 @@ pub enum SubscriptionError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionValueStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishedObservation {
+    Available(u64),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObserverSubscription {
     id: SubscriptionId,
     observer: DeviceObserver,
     partition: DevicePartitionId,
-    published_bits: Option<u64>,
+    published: Option<PublishedObservation>,
 }
 
 impl ObserverSubscription {
@@ -46,7 +58,7 @@ impl ObserverSubscription {
             id,
             observer,
             partition,
-            published_bits: None,
+            published: None,
         }
     }
 
@@ -66,13 +78,13 @@ impl ObserverSubscription {
     }
 
     #[inline]
-    pub(crate) const fn published_bits(self) -> Option<u64> {
-        self.published_bits
+    pub(crate) const fn published(self) -> Option<PublishedObservation> {
+        self.published
     }
 
     #[inline]
-    pub(crate) fn set_published_bits(&mut self, bits: u64) {
-        self.published_bits = Some(bits);
+    pub(crate) fn set_published(&mut self, published: PublishedObservation) {
+        self.published = Some(published);
     }
 }
 
@@ -146,21 +158,37 @@ impl SubscriptionRegistry {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SubscriptionUpdate {
     subscription: SubscriptionId,
+    status: SubscriptionValueStatus,
     value: f64,
 }
 
 impl SubscriptionUpdate {
     #[inline]
-    pub(crate) const fn new(subscription: SubscriptionId, value: f64) -> Self {
+    pub(crate) const fn available(subscription: SubscriptionId, value: f64) -> Self {
         Self {
             subscription,
+            status: SubscriptionValueStatus::Available,
             value,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn unavailable(subscription: SubscriptionId) -> Self {
+        Self {
+            subscription,
+            status: SubscriptionValueStatus::Unavailable,
+            value: 0.0,
         }
     }
 
     #[inline]
     pub const fn subscription(self) -> SubscriptionId {
         self.subscription
+    }
+
+    #[inline]
+    pub const fn status(self) -> SubscriptionValueStatus {
+        self.status
     }
 
     #[inline]

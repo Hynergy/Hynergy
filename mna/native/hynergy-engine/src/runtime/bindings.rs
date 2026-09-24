@@ -1,5 +1,5 @@
 use super::island::IslandRuntimeError;
-use crate::compile::definition::DefinitionStateInitializer;
+use crate::compile::definition::{DefinitionStateInitializer, FailedTickStateTransition};
 use crate::compile::island::{CompiledPartitionInputs, DeviceState, IslandStateLayout};
 use crate::state::{PhysicalStateAddress, PhysicalStateError, PhysicalStateStore};
 use hynergy_ir::{InputSlot, StateSlot, StateWrite, ValueSlot, ValueWorkspace};
@@ -89,14 +89,7 @@ impl StateInputBinding {
     ) -> Result<f64, IslandRuntimeError> {
         physical_state
             .read_logical_at(network, self.state.device(), self.address, self.initializer)
-            .map_err(|error| match error {
-                PhysicalStateError::StateNotInitialized { state } => {
-                    IslandRuntimeError::MissingState {
-                        device: state.device(),
-                        state: state.state(),
-                    }
-                }
-            })
+            .map_err(map_physical_state_error)
     }
 
     #[inline]
@@ -127,20 +120,40 @@ impl StateInputBinding {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[inline]
+fn map_physical_state_error(error: PhysicalStateError) -> IslandRuntimeError {
+    match error {
+        PhysicalStateError::StateNotInitialized { state } => IslandRuntimeError::MissingState {
+            device: state.device(),
+            state: state.state(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct StateOutputBinding {
     state: DeviceState,
     source: ValueSlot,
     address: PhysicalStateAddress,
+    initializer: DefinitionStateInitializer,
+    failed_tick_transition: FailedTickStateTransition,
 }
 
 impl StateOutputBinding {
     #[inline]
-    const fn new(state: DeviceState, source: ValueSlot, address: PhysicalStateAddress) -> Self {
+    const fn new(
+        state: DeviceState,
+        source: ValueSlot,
+        address: PhysicalStateAddress,
+        initializer: DefinitionStateInitializer,
+        failed_tick_transition: FailedTickStateTransition,
+    ) -> Self {
         Self {
             state,
             source,
             address,
+            initializer,
+            failed_tick_transition,
         }
     }
 
@@ -154,6 +167,62 @@ impl StateOutputBinding {
         }
 
         Ok(())
+    }
+
+    #[inline]
+    pub(super) fn validate_destination(
+        &self,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<(), IslandRuntimeError> {
+        physical_state
+            .validate_address(self.state, self.address)
+            .map_err(map_physical_state_error)
+    }
+
+    #[inline]
+    pub(super) fn validate_failed(
+        &self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<(), IslandRuntimeError> {
+        match self.failed_tick_transition {
+            FailedTickStateTransition::Preserve => {
+                let value = physical_state
+                    .read_logical_at(network, self.state.device(), self.address, self.initializer)
+                    .map_err(map_physical_state_error)?;
+
+                debug_assert!(
+                    value.is_finite(),
+                    "preserved logical physical state must remain finite",
+                );
+
+                Ok(())
+            }
+
+            FailedTickStateTransition::Literal(value) => {
+                debug_assert!(
+                    value.is_finite(),
+                    "compiled failed-tick literal must be finite",
+                );
+
+                self.validate_destination(physical_state)
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn failed_value_prevalidated(
+        &self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> f64 {
+        match self.failed_tick_transition {
+            FailedTickStateTransition::Preserve => physical_state
+                .read_logical_at(network, self.state.device(), self.address, self.initializer)
+                .expect("validated failed-state destination must remain readable until scatter"),
+
+            FailedTickStateTransition::Literal(value) => value,
+        }
     }
 
     #[inline]
@@ -180,6 +249,18 @@ impl StateOutputBinding {
     #[inline]
     fn set_address(&mut self, address: PhysicalStateAddress) {
         self.address = address;
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(super) const fn initializer(&self) -> DefinitionStateInitializer {
+        self.initializer
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(super) const fn failed_tick_transition(&self) -> FailedTickStateTransition {
+        self.failed_tick_transition
     }
 }
 
@@ -274,6 +355,14 @@ impl IslandBindings {
                 .device_state(slot)
                 .expect("compiled state output must have a semantic state");
 
+            let initializer = states
+                .state_initializer(slot)
+                .expect("compiled state output must have an initializer");
+
+            let failed_tick_transition = states
+                .failed_tick_transition(slot)
+                .expect("compiled state output must have a failed-tick transition");
+
             let device = state.device();
 
             let location = network
@@ -284,6 +373,8 @@ impl IslandBindings {
                 state,
                 write.source(),
                 PhysicalStateAddress::new(location, state.state().index()),
+                initializer,
+                failed_tick_transition,
             ));
         }
 
@@ -456,6 +547,7 @@ mod tests {
     use super::*;
     use crate::compile::definition::{
         CompiledDefinition, DefinitionStateId, DefinitionStateInitializer,
+        FailedTickStateTransition,
     };
     use crate::compile::island::{
         IslandNode, IslandPartitionSpec, compile_island_parts, compile_topology_island,
@@ -537,6 +629,7 @@ mod tests {
             moved,
             partition,
             compiled_definition.state_initializers(),
+            compiled_definition.failed_tick_transitions(),
             &terminal_nodes,
         );
 
@@ -890,6 +983,7 @@ mod tests {
             device,
             partition,
             compiled_definition.state_initializers(),
+            compiled_definition.failed_tick_transitions(),
             &terminal_nodes,
         );
 
@@ -928,6 +1022,170 @@ mod tests {
         let workspace = parts.ir.value_program().new_workspace();
 
         assert_eq!(binding.value(&workspace), workspace.value(write.source()),);
+
+        assert_eq!(
+            binding.initializer(),
+            DefinitionStateInitializer::Literal(0.0),
+        );
+
+        assert_eq!(
+            binding.failed_tick_transition(),
+            FailedTickStateTransition::Preserve,
+        );
+    }
+
+    #[test]
+    fn tick_delay_state_output_binding_carries_literal_zero_failed_transition() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
+
+        let device = device(1);
+        let definition = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            device,
+            definition,
+        );
+
+        let topology = DerivedTopology::from_network(&network, &definitions);
+
+        let island = topology.component_island(
+            &network,
+            DeviceComponent::new(device, DevicePartitionId::new(0)),
+        );
+
+        let compiled = compile_topology_island(&definitions, &network, &topology, island).unwrap();
+
+        let parts = compiled.into_parts();
+
+        let bindings = IslandBindings::new(
+            &network,
+            &parts.states,
+            &parts.partition_inputs,
+            parts.ir.state_inputs(),
+            parts.ir.state_transition().writes(),
+        )
+        .unwrap();
+
+        assert_eq!(bindings.state_outputs().len(), 1);
+
+        let binding = &bindings.state_outputs()[0];
+
+        assert_eq!(
+            binding.initializer(),
+            DefinitionStateInitializer::Literal(0.0),
+        );
+
+        assert_eq!(
+            binding.failed_tick_transition(),
+            FailedTickStateTransition::Literal(0.0),
+        );
+    }
+
+    #[test]
+    fn failed_literal_state_output_ignores_non_finite_workspace_source() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
+
+        let device = device(1);
+        let definition = DefinitionId::from(PrimitiveElementKind::TickDelay);
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            device,
+            definition,
+        );
+
+        let location = network.device_location(device).unwrap();
+        let state = DeviceState::new(device, DefinitionStateId::new(0));
+
+        let mut values = ValueProgramBuilder::new();
+        let source = values.constant(f64::NAN).unwrap();
+        let workspace = values.finish().new_workspace();
+
+        let binding = StateOutputBinding {
+            state,
+            source,
+            address: PhysicalStateAddress::new(location, 0),
+            initializer: DefinitionStateInitializer::Literal(0.0),
+            failed_tick_transition: FailedTickStateTransition::Literal(0.0),
+        };
+
+        assert_eq!(
+            binding.validate_source(&workspace),
+            Err(IslandRuntimeError::NonFiniteState { state }),
+        );
+
+        assert_eq!(binding.validate_failed(&network, &physical_state), Ok(()),);
+
+        assert_eq!(
+            binding.failed_value_prevalidated(&network, &physical_state),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn failed_preserve_state_output_uses_committed_physical_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut network = Network::new();
+        let mut physical_state = PhysicalStateStore::default();
+
+        let device = device(1);
+        let definition = DefinitionId::from(PrimitiveElementKind::Capacitor);
+
+        add_device_with_physical_state(
+            &definitions,
+            &mut network,
+            &mut physical_state,
+            device,
+            definition,
+        );
+
+        let location = network.device_location(device).unwrap();
+        let address = PhysicalStateAddress::new(location, 0);
+        let state = DeviceState::new(device, DefinitionStateId::new(0));
+
+        let mut values = ValueProgramBuilder::new();
+        let source = values.constant(f64::NAN).unwrap();
+        let workspace = values.finish().new_workspace();
+
+        let binding = StateOutputBinding {
+            state,
+            source,
+            address,
+            initializer: DefinitionStateInitializer::Literal(0.0),
+            failed_tick_transition: FailedTickStateTransition::Preserve,
+        };
+
+        assert_eq!(
+            binding.validate_source(&workspace),
+            Err(IslandRuntimeError::NonFiniteState { state }),
+        );
+
+        assert_eq!(binding.validate_failed(&network, &physical_state), Ok(()),);
+
+        assert_eq!(
+            binding.failed_value_prevalidated(&network, &physical_state),
+            0.0,
+        );
+
+        physical_state.validate_address(state, address).unwrap();
+        physical_state.write_prevalidated(address, 7.25);
+        physical_state.mark_initialized_prevalidated(location);
+
+        assert_eq!(binding.validate_failed(&network, &physical_state), Ok(()),);
+
+        assert_eq!(
+            binding.failed_value_prevalidated(&network, &physical_state),
+            7.25,
+        );
     }
 
     #[test]
@@ -957,6 +1215,8 @@ mod tests {
             state,
             source,
             address: PhysicalStateAddress::new(location, 0),
+            initializer: DefinitionStateInitializer::Literal(0.0),
+            failed_tick_transition: FailedTickStateTransition::Literal(0.0),
         };
 
         assert_eq!(

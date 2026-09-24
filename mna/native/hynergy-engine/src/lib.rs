@@ -6,13 +6,11 @@ mod state;
 mod topology;
 
 use crate::compile::island::{DeviceObserver, IslandCompileError, compile_topology_island};
-#[cfg(feature = "solver-profiling")]
-pub use crate::profiling::{
-    SolverDiscreteProfile, SolverIslandProfile, SolverIterationProfile, SolverTickProfile,
+use crate::runtime::island::{IslandRuntime, IslandRuntimeError, IslandTickStatus};
+use crate::runtime::subscription::{
+    PublishedObservation, SubscriptionRegistry, SubscriptionUpdate,
 };
-use crate::runtime::island::{IslandRuntime, IslandRuntimeError};
-pub use crate::runtime::subscription::{SubscriptionError, SubscriptionId};
-use crate::runtime::subscription::{SubscriptionRegistry, SubscriptionUpdate};
+
 use crate::state::{PhysicalStateError, PhysicalStateStore};
 use crate::topology::{DerivedTopology, TraversalScratch};
 use hynergy_mna::system::MnaError;
@@ -24,6 +22,14 @@ use hynergy_model::network::{Network, NetworkModelError, WireId};
 use hynergy_model::parameter::ParameterId;
 use std::num::NonZeroU32;
 use thiserror::Error;
+
+#[cfg(feature = "solver-profiling")]
+pub use crate::profiling::{
+    SolverDiscreteProfile, SolverIslandProfile, SolverIterationProfile, SolverTickProfile,
+};
+pub use crate::runtime::subscription::{
+    SubscriptionError, SubscriptionId, SubscriptionValueStatus,
+};
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum EngineTickError {
@@ -477,7 +483,17 @@ impl World {
                     .and_then(Option::as_mut)
                     .expect("live island must have a runtime after synchronization");
 
-                runtime.prepare_tick_state_inputs(network, physical_state)?;
+                runtime.begin_tick();
+
+                match runtime.prepare_tick_state_inputs(network, physical_state) {
+                    Ok(()) => {}
+
+                    Err(error) if error.is_localizable_tick_failure() => {
+                        runtime.mark_unavailable();
+                    }
+
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
 
@@ -492,7 +508,25 @@ impl World {
                     .and_then(Option::as_mut)
                     .expect("live island must have a runtime after synchronization");
 
-                runtime.solve_prepared_tick(network)?;
+                if runtime.tick_status() == IslandTickStatus::Unavailable {
+                    continue;
+                }
+
+                debug_assert_eq!(
+                    runtime.tick_status(),
+                    IslandTickStatus::Pending,
+                    "prepared island must remain pending until solved",
+                );
+
+                match runtime.solve_prepared_tick(network) {
+                    Ok(()) => runtime.mark_available(),
+
+                    Err(error) if error.is_localizable_tick_failure() => {
+                        runtime.mark_unavailable();
+                    }
+
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
 
@@ -545,23 +579,48 @@ impl World {
                     .and_then(Option::as_ref)
                     .expect("live subscription component must have an island runtime");
 
-                if subscription.published_bits().is_some() && !runtime.observer_outputs_dirty() {
-                    continue;
+                match runtime.tick_status() {
+                    IslandTickStatus::Available => {
+                        if matches!(
+                            subscription.published(),
+                            Some(PublishedObservation::Available(_))
+                        ) && !runtime.observer_outputs_dirty()
+                        {
+                            continue;
+                        }
+
+                        let value = runtime
+                            .observer_value(subscription.observer())
+                            .expect("available island must make subscribed observer available");
+
+                        let published = PublishedObservation::Available(value.to_bits());
+
+                        if subscription.published() == Some(published) {
+                            continue;
+                        }
+
+                        subscription.set_published(published);
+
+                        updates.push(SubscriptionUpdate::available(subscription.id(), value));
+                    }
+
+                    IslandTickStatus::Unavailable => {
+                        let published = PublishedObservation::Unavailable;
+
+                        if subscription.published() == Some(published) {
+                            continue;
+                        }
+
+                        subscription.set_published(published);
+                        updates.push(SubscriptionUpdate::unavailable(subscription.id()));
+                    }
+
+                    IslandTickStatus::Pending => {
+                        unreachable!(
+                            "subscription collection requires finalized island tick status",
+                        );
+                    }
                 }
-
-                let value = runtime
-                    .observer_value(subscription.observer())
-                    .expect("successful tick must make subscribed observer available");
-
-                let bits = value.to_bits();
-
-                if subscription.published_bits() == Some(bits) {
-                    continue;
-                }
-
-                subscription.set_published_bits(bits);
-
-                updates.push(SubscriptionUpdate::new(subscription.id(), value));
             }
         }
 
@@ -880,15 +939,43 @@ impl World {
     }
 
     #[inline]
-    fn validate_runtime_state_outputs(&self) -> Result<(), IslandRuntimeError> {
-        for (island, _) in self.derived_topology.islands() {
-            let runtime = self
-                .island_runtimes
-                .get(island.index())
-                .and_then(Option::as_ref)
+    fn validate_runtime_state_outputs(&mut self) -> Result<(), IslandRuntimeError> {
+        let topology = &self.derived_topology;
+        let network = &self.network;
+        let physical_state = &self.physical_state;
+        let runtimes = &mut self.island_runtimes;
+
+        for (island, _) in topology.islands() {
+            let runtime = runtimes
+                .get_mut(island.index())
+                .and_then(Option::as_mut)
                 .expect("live island must have a runtime after synchronization");
 
-            runtime.validate_state_outputs(&self.physical_state)?;
+            match runtime.tick_status() {
+                IslandTickStatus::Available => {
+                    match runtime.validate_successful_state_outputs(physical_state) {
+                        Ok(()) => {}
+
+                        Err(IslandRuntimeError::NonFiniteState { .. }) => {
+                            runtime.mark_unavailable();
+
+                            runtime.validate_failed_state_outputs(network, physical_state)?;
+                        }
+
+                        Err(error) => return Err(error),
+                    }
+                }
+
+                IslandTickStatus::Unavailable => {
+                    runtime.validate_failed_state_outputs(network, physical_state)?;
+                }
+
+                IslandTickStatus::Pending => {
+                    unreachable!(
+                        "every live island must be available or unavailable before state validation"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -897,6 +984,7 @@ impl World {
     #[inline]
     fn scatter_runtime_state_outputs(&mut self) {
         let topology = &self.derived_topology;
+        let network = &self.network;
         let runtimes = &self.island_runtimes;
         let physical_state = &mut self.physical_state;
 
@@ -906,7 +994,19 @@ impl World {
                 .and_then(Option::as_ref)
                 .expect("live island must have a runtime after synchronization");
 
-            runtime.scatter_state_outputs(physical_state);
+            match runtime.tick_status() {
+                IslandTickStatus::Available => {
+                    runtime.scatter_successful_state_outputs(physical_state);
+                }
+
+                IslandTickStatus::Unavailable => {
+                    runtime.scatter_failed_state_outputs(network, physical_state);
+                }
+
+                IslandTickStatus::Pending => {
+                    unreachable!("state scatter requires a finalized island tick status");
+                }
+            }
         }
     }
 
@@ -961,6 +1061,7 @@ mod tests {
     use super::*;
     use crate::compile::definition::{DefinitionStateId, DefinitionStateInitializer};
     use crate::compile::island::{DeviceState, IslandNode};
+    use crate::runtime::subscription::SubscriptionValueStatus;
     use crate::state::{PhysicalStateAddress, PhysicalStateStore};
     use crate::topology::DeviceComponent;
     use hynergy_model::circuit::{Element, ValueRef};
@@ -980,6 +1081,51 @@ mod tests {
 
     fn device(raw: u32) -> DeviceId {
         DeviceId::try_from(raw).unwrap()
+    }
+
+    fn add_unset_conductance(
+        world: &mut World,
+        definitions: &DefinitionRegistry,
+        blocker: DeviceId,
+        a: WireId,
+        b: WireId,
+    ) {
+        world
+            .add_device(
+                definitions,
+                blocker,
+                PrimitiveElementKind::Conductance.into(),
+            )
+            .unwrap();
+
+        world
+            .attach_terminal(definitions, a, blocker, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(definitions, b, blocker, TerminalId::new(1))
+            .unwrap();
+    }
+
+    fn tick_delay_output_voltage(
+        world: &World,
+        delay: DeviceId,
+        output_positive: WireId,
+        output_negative: WireId,
+    ) -> f64 {
+        let output_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(1)),
+        );
+
+        let positive = IslandNode::net(world.derived_topology.wire_net(output_positive));
+        let negative = IslandNode::net(world.derived_topology.wire_net(output_negative));
+
+        let runtime = world.island_runtimes[output_island.index()]
+            .as_ref()
+            .unwrap();
+
+        runtime.node_voltage(positive).unwrap() - runtime.node_voltage(negative).unwrap()
     }
 
     fn admittance() -> DefinitionId {
@@ -1297,6 +1443,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].subscription(), subscription);
+        assert_eq!(updates[0].status(), SubscriptionValueStatus::Available,);
         assert_eq!(updates[0].value().to_bits(), 5.0f64.to_bits(),);
 
         engine.tick_world(world).unwrap();
@@ -1337,6 +1484,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].subscription(), subscription);
+        assert_eq!(updates[0].status(), SubscriptionValueStatus::Available,);
         assert_eq!(updates[0].value().to_bits(), 7.0f64.to_bits(),);
 
         engine.tick_world(world).unwrap();
@@ -1345,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_tick_does_not_advance_subscription_baseline() {
+    fn localized_failure_does_not_block_healthy_subscription_update() {
         let (mut engine, world, observed, source, observer) = observed_voltage_world();
 
         let subscription = engine
@@ -1427,15 +1575,16 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            engine.tick_world(world),
-            Err(EngineTickError::MissingParameter {
-                device: failing_source,
-                parameter: ParameterId::new(0),
-            }),
-        );
+        engine.tick_world(world).unwrap();
 
-        assert!(engine.subscription_updates(world).unwrap().is_empty());
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].status(), SubscriptionValueStatus::Available,);
+            assert_eq!(updates[0].value().to_bits(), 7.0f64.to_bits());
+        }
 
         engine
             .apply_world_command(
@@ -1450,11 +1599,7 @@ mod tests {
 
         engine.tick_world(world).unwrap();
 
-        let updates = engine.subscription_updates(world).unwrap();
-
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].subscription(), subscription);
-        assert_eq!(updates[0].value().to_bits(), 7.0f64.to_bits(),);
+        assert!(engine.subscription_updates(world).unwrap().is_empty());
     }
 
     #[test]
@@ -1478,6 +1623,7 @@ mod tests {
             .apply_world_command(world_id, WorldCommand::AddWire { wire: added })
             .unwrap();
     }
+
     #[test]
     fn world_updates_network_and_topology_consistently() {
         let definitions = DefinitionRegistry::new();
@@ -1974,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_tick_does_not_initialize_tick_delay_before_zero_initialized_retry() {
+    fn localized_failure_does_not_block_independent_tick_delay_state_commit() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::new(world_config());
 
@@ -2061,53 +2207,46 @@ mod tests {
             .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
             .unwrap();
 
-        assert_eq!(
-            world.tick(&definitions),
-            Err(WorldTickError::Runtime(
-                IslandRuntimeError::MissingParameter {
-                    device: blocker,
-                    parameter: ParameterId::new(0),
-                },
-            )),
+        let blocker_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(blocker, DevicePartitionId::new(0)),
+        );
+
+        let delay_writer_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(0)),
         );
 
         let location = world.network.device_location(delay).unwrap();
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
 
         assert!(
             !world.physical_state.is_initialized_at(location),
-            "a failed tick must not commit first-time state initialization",
+            "TickDelay state must start uninitialized",
         );
 
-        world.remove_device(&definitions, blocker).unwrap();
+        assert_eq!(world.tick(&definitions), Ok(()));
 
-        let output_island = world.derived_topology.component_island(
-            world.network(),
-            DeviceComponent::new(delay, DevicePartitionId::new(1)),
+        assert_eq!(
+            world.island_runtimes[blocker_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
         );
 
-        let positive_node = IslandNode::net(world.derived_topology.wire_net(output_positive));
-        let negative_node = IslandNode::net(world.derived_topology.wire_net(output_negative));
-
-        world.tick(&definitions).unwrap();
-
-        let runtime = world.island_runtimes[output_island.index()]
-            .as_ref()
-            .unwrap();
-
-        let output = runtime.node_voltage(positive_node).unwrap()
-            - runtime.node_voltage(negative_node).unwrap();
-
-        assert!(
-            output.abs() < 1.0e-12,
-            "TickDelay must expose zero before its first committed sample",
+        assert_eq!(
+            world.island_runtimes[delay_writer_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Available,
         );
 
         assert!(
             world.physical_state.is_initialized_at(location),
-            "successful tick must commit the state row",
+            "a localized failure must not prevent an independent writer from committing",
         );
-
-        let state = DeviceState::new(delay, DefinitionStateId::new(0));
 
         assert_eq!(world.physical_state.get(&world.network, state), Some(5.0),);
     }
@@ -2280,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn nonconvergent_stateless_switch_reports_convergence_failure() {
+    fn nonconvergent_stateless_switch_marks_island_unavailable() {
         let definitions = DefinitionRegistry::new();
         let mut world = World::new(world_config());
 
@@ -2343,24 +2482,24 @@ mod tests {
             .set_device_parameter(&definitions, source, ParameterId::new(0), 8.0)
             .unwrap();
 
-        let error = world.tick(&definitions).unwrap_err();
+        let island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(switch, DevicePartitionId::new(0)),
+        );
 
-        assert!(matches!(
-            error,
-            WorldTickError::Runtime(IslandRuntimeError::NonlinearDidNotConverge { .. })
-        ));
+        assert_eq!(world.tick(&definitions), Ok(()));
 
         assert_eq!(
-            world.physical_state.get(
-                &world.network,
-                DeviceState::new(switch, DefinitionStateId::new(0))
-            ),
-            None,
+            world.island_runtimes[island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
         );
     }
 
     #[test]
-    fn engine_tick_reports_missing_device_parameter() {
+    fn engine_tick_localizes_missing_device_parameter() {
         let mut engine = Engine::default();
 
         let world_id = engine.new_world(world_config()).unwrap();
@@ -2376,12 +2515,21 @@ mod tests {
             )
             .unwrap();
 
+        assert_eq!(engine.tick_world(world_id), Ok(()));
+
+        let world = engine.world(world_id).unwrap();
+
+        let island = world.derived_topology.component_island(
+            &world.network,
+            DeviceComponent::new(device, DevicePartitionId::new(0)),
+        );
+
         assert_eq!(
-            engine.tick_world(world_id),
-            Err(EngineTickError::MissingParameter {
-                device,
-                parameter: ParameterId::new(0),
-            }),
+            world.island_runtimes[island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
         );
     }
 
@@ -3315,6 +3463,10 @@ mod tests {
 
         world.sync_island_runtimes(&definitions).unwrap();
 
+        for runtime in world.island_runtimes.iter_mut().flatten() {
+            runtime.mark_available();
+        }
+
         let first_state = DeviceState::new(first_capacitor, DefinitionStateId::new(0));
         let first_location = world.network.device_location(first_capacitor).unwrap();
         let first_address = PhysicalStateAddress::new(first_location, 0);
@@ -3360,6 +3512,1292 @@ mod tests {
         assert!(
             !world.physical_state.is_initialized_at(first_location),
             "failed global validation must not finalize any earlier row",
+        );
+    }
+
+    #[test]
+    fn singular_island_does_not_block_independent_healthy_island() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let healthy = device(1);
+        let singular = device(2);
+
+        world
+            .add_device(
+                &definitions,
+                healthy,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                singular,
+                PrimitiveElementKind::CurrentSource.into(),
+            )
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, healthy, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, singular, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let healthy_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(healthy, DevicePartitionId::new(0)),
+        );
+
+        let singular_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(singular, DevicePartitionId::new(0)),
+        );
+
+        assert_ne!(healthy_island, singular_island);
+
+        assert_eq!(world.tick(&definitions), Ok(()));
+
+        let healthy_runtime = world.island_runtimes[healthy_island.index()]
+            .as_ref()
+            .unwrap();
+
+        let singular_runtime = world.island_runtimes[singular_island.index()]
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(healthy_runtime.tick_status(), IslandTickStatus::Available,);
+
+        assert_eq!(
+            singular_runtime.tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        let positive = IslandNode::terminal(healthy, TerminalId::new(0));
+        let negative = IslandNode::terminal(healthy, TerminalId::new(1));
+
+        let voltage = healthy_runtime.node_voltage(positive).unwrap()
+            - healthy_runtime.node_voltage(negative).unwrap();
+
+        assert!((voltage - 5.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn mixed_success_and_failure_complete_same_physical_state_row() {
+        let mut definitions = DefinitionRegistry::new();
+
+        let capacitor_definition = DefinitionId::from(PrimitiveElementKind::Capacitor);
+
+        let capacitor_constraint = definitions.get(capacitor_definition).unwrap().parameters()[0];
+
+        let composite = {
+            let mut builder = DeviceDefinitionBuilder::new(&definitions);
+
+            let capacitor_positive = builder.add_terminal().unwrap();
+            let capacitor_negative = builder.add_terminal().unwrap();
+
+            let delay_input_positive = builder.add_terminal().unwrap();
+            let delay_input_negative = builder.add_terminal().unwrap();
+            let delay_output_positive = builder.add_terminal().unwrap();
+            let delay_output_negative = builder.add_terminal().unwrap();
+
+            let capacitance = builder.add_parameter(capacitor_constraint).unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::Capacitor.into(),
+                    vec![capacitor_positive, capacitor_negative],
+                    vec![ValueRef::Parameter(capacitance)],
+                ))
+                .unwrap();
+
+            builder
+                .add_element(Element::new(
+                    PrimitiveElementKind::TickDelay.into(),
+                    vec![
+                        delay_input_positive,
+                        delay_input_negative,
+                        delay_output_positive,
+                        delay_output_negative,
+                    ],
+                    Vec::new(),
+                ))
+                .unwrap();
+
+            builder.build_definition().unwrap()
+        };
+
+        assert_eq!(composite.state_count(), 2);
+
+        let composite = definitions.register(composite).unwrap();
+
+        let mut world = World::new(world_config());
+
+        let negative = wire(1);
+        let positive = wire(2);
+
+        world.add_wire(negative).unwrap();
+        world.add_wire(positive).unwrap();
+
+        let device = device(1);
+        let source = tests::device(2);
+
+        world.add_device(&definitions, device, composite).unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        // Composite terminals:
+        // 0,1 = capacitor
+        // 2,3 = TickDelay input
+        // 4,5 = TickDelay output
+        world
+            .attach_terminal(&definitions, positive, device, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, negative, device, TerminalId::new(3))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        // Deliberately DO NOT set composite parameter 0.
+        // The capacitor writer therefore fails locally.
+
+        let location = world.network.device_location(device).unwrap();
+
+        assert!(!world.physical_state.is_initialized_at(location));
+
+        assert_eq!(world.tick(&definitions), Ok(()));
+
+        assert!(
+            world.physical_state.is_initialized_at(location),
+            "the row must be finalized after both successful and fallback values are scattered",
+        );
+
+        assert_eq!(
+            world.physical_state.get(
+                &world.network,
+                DeviceState::new(device, DefinitionStateId::new(0)),
+            ),
+            Some(0.0),
+            "failed capacitor state must Preserve its logical initial zero",
+        );
+
+        assert_eq!(
+            world.physical_state.get(
+                &world.network,
+                DeviceState::new(device, DefinitionStateId::new(1)),
+            ),
+            Some(5.0),
+            "healthy TickDelay writer must commit its sampled input",
+        );
+    }
+
+    #[test]
+    fn fatal_island_failure_prevents_all_state_commit() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let negative = wire(1);
+        let positive = wire(2);
+
+        world.add_wire(negative).unwrap();
+        world.add_wire(positive).unwrap();
+
+        let source = device(1);
+        let delay = device(2);
+        let fatal = device(3);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                fatal,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, positive, delay, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, negative, delay, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, fatal, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        world.sync_island_runtimes(&definitions).unwrap();
+
+        let fatal_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(fatal, DevicePartitionId::new(0)),
+        );
+
+        world.island_runtimes[fatal_island.index()]
+            .as_mut()
+            .unwrap()
+            .force_backend_failure_for_test();
+
+        let delay_location = world.network.device_location(delay).unwrap();
+
+        assert!(!world.physical_state.is_initialized_at(delay_location));
+
+        assert_eq!(
+            world.tick(&definitions),
+            Err(WorldTickError::Runtime(IslandRuntimeError::Mna(
+                MnaError::BackendFailure
+            ),)),
+        );
+
+        assert!(
+            !world.physical_state.is_initialized_at(delay_location),
+            "fatal tick failure must publish no state snapshot",
+        );
+    }
+
+    #[test]
+    fn tick_delay_writer_failure_uses_old_state_for_current_tick_then_commits_zero() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let input_negative = wire(1);
+        let input_positive = wire(2);
+        let output_negative = wire(3);
+        let output_positive = wire(4);
+
+        for wire in [
+            input_negative,
+            input_positive,
+            output_negative,
+            output_positive,
+        ] {
+            world.add_wire(wire).unwrap();
+        }
+
+        let source = device(1);
+        let delay = device(2);
+        let load = device(3);
+        let blocker = device(4);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        world
+            .add_device(&definitions, load, PrimitiveElementKind::Conductance.into())
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, delay, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, delay, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, delay, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, delay, TerminalId::new(3))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, load, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, load, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 9.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+        let location = world.network.device_location(delay).unwrap();
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(9.0),);
+
+        assert!(
+            (tick_delay_output_voltage(&world, delay, output_positive, output_negative,) - 0.0)
+                .abs()
+                < 1.0e-12,
+        );
+
+        assert!(world.physical_state.is_initialized_at(location));
+
+        add_unset_conductance(
+            &mut world,
+            &definitions,
+            blocker,
+            input_positive,
+            input_negative,
+        );
+
+        let writer_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(0)),
+        );
+
+        let reader_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(1)),
+        );
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.island_runtimes[writer_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        assert_eq!(
+            world.island_runtimes[reader_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Available,
+        );
+
+        assert!(
+            (tick_delay_output_voltage(&world, delay, output_positive, output_negative,) - 9.0)
+                .abs()
+                < 1.0e-12,
+            "reader may consume the old committed S[n] during the writer-failure tick",
+        );
+
+        assert_eq!(
+            world.physical_state.get(&world.network, state),
+            Some(0.0),
+            "failed TickDelay writer must publish zero as S[n+1]",
+        );
+    }
+
+    #[test]
+    fn repeated_tick_delay_writer_failure_does_not_replay_old_nonzero_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let input_negative = wire(1);
+        let input_positive = wire(2);
+        let output_negative = wire(3);
+        let output_positive = wire(4);
+
+        for wire in [
+            input_negative,
+            input_positive,
+            output_negative,
+            output_positive,
+        ] {
+            world.add_wire(wire).unwrap();
+        }
+
+        let source = device(1);
+        let delay = device(2);
+        let load = device(3);
+        let blocker = device(4);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        world
+            .add_device(&definitions, load, PrimitiveElementKind::Conductance.into())
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, delay, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, delay, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, delay, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, delay, TerminalId::new(3))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, load, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, load, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 7.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+
+        // Establish S[n] = 7.
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(7.0),);
+
+        add_unset_conductance(
+            &mut world,
+            &definitions,
+            blocker,
+            input_positive,
+            input_negative,
+        );
+
+        world.tick(&definitions).unwrap();
+
+        assert!(
+            (tick_delay_output_voltage(&world, delay, output_positive, output_negative,) - 7.0)
+                .abs()
+                < 1.0e-12,
+        );
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0),);
+
+        world.tick(&definitions).unwrap();
+
+        assert!(
+            tick_delay_output_voltage(&world, delay, output_positive, output_negative,).abs()
+                < 1.0e-12,
+            "old nonzero TickDelay state must not be replayed repeatedly",
+        );
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0),);
+
+        world.tick(&definitions).unwrap();
+
+        assert!(
+            tick_delay_output_voltage(&world, delay, output_positive, output_negative,).abs()
+                < 1.0e-12,
+        );
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0),);
+    }
+
+    #[test]
+    fn first_tick_delay_writer_failure_initializes_state_to_zero() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let input_negative = wire(1);
+        let input_positive = wire(2);
+        let output_negative = wire(3);
+        let output_positive = wire(4);
+
+        for wire in [
+            input_negative,
+            input_positive,
+            output_negative,
+            output_positive,
+        ] {
+            world.add_wire(wire).unwrap();
+        }
+
+        let source = device(1);
+        let delay = device(2);
+        let load = device(3);
+        let blocker = device(4);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        world
+            .add_device(&definitions, load, PrimitiveElementKind::Conductance.into())
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, delay, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, delay, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, delay, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, delay, TerminalId::new(3))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, load, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, load, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        add_unset_conductance(
+            &mut world,
+            &definitions,
+            blocker,
+            input_positive,
+            input_negative,
+        );
+
+        let location = world.network.device_location(delay).unwrap();
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+
+        assert!(!world.physical_state.is_initialized_at(location));
+
+        world.tick(&definitions).unwrap();
+
+        let writer_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(0)),
+        );
+
+        assert_eq!(
+            world.island_runtimes[writer_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        assert!(
+            world.physical_state.is_initialized_at(location),
+            "a completed failed transition still initializes the physical state row",
+        );
+
+        assert_eq!(world.physical_state.get(&world.network, state), Some(0.0),);
+
+        assert!(
+            tick_delay_output_voltage(&world, delay, output_positive, output_negative,).abs()
+                < 1.0e-12,
+        );
+    }
+
+    #[test]
+    fn tick_delay_reader_failure_does_not_block_writer_state_commit() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let input_negative = wire(1);
+        let input_positive = wire(2);
+        let output_negative = wire(3);
+        let output_positive = wire(4);
+
+        for wire in [
+            input_negative,
+            input_positive,
+            output_negative,
+            output_positive,
+        ] {
+            world.add_wire(wire).unwrap();
+        }
+
+        let source = device(1);
+        let delay = device(2);
+        let load = device(3);
+        let blocker = device(4);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(&definitions, delay, PrimitiveElementKind::TickDelay.into())
+            .unwrap();
+
+        world
+            .add_device(&definitions, load, PrimitiveElementKind::Conductance.into())
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, source, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_positive, delay, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, input_negative, delay, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, delay, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, delay, TerminalId::new(3))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_positive, load, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, output_negative, load, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 6.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, load, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        add_unset_conductance(
+            &mut world,
+            &definitions,
+            blocker,
+            output_positive,
+            output_negative,
+        );
+
+        let writer_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(0)),
+        );
+
+        let reader_island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(delay, DevicePartitionId::new(1)),
+        );
+
+        assert_ne!(writer_island, reader_island);
+
+        let state = DeviceState::new(delay, DefinitionStateId::new(0));
+        let location = world.network.device_location(delay).unwrap();
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.island_runtimes[writer_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Available,
+        );
+
+        assert_eq!(
+            world.island_runtimes[reader_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        assert!(world.physical_state.is_initialized_at(location));
+
+        assert_eq!(
+            world.physical_state.get(&world.network, state),
+            Some(6.0),
+            "failed reader must not erase a successful writer's S[n+1]",
+        );
+
+        world
+            .set_device_parameter(&definitions, blocker, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.island_runtimes[reader_island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Available,
+        );
+
+        assert!(
+            (tick_delay_output_voltage(&world, delay, output_positive, output_negative,) - 6.0)
+                .abs()
+                < 1.0e-12,
+            "recovered reader must consume the sample committed while it was unavailable",
+        );
+    }
+
+    #[test]
+    fn capacitor_writer_failure_preserves_committed_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let negative = wire(1);
+        let positive = wire(2);
+
+        world.add_wire(negative).unwrap();
+        world.add_wire(positive).unwrap();
+
+        let source = device(1);
+        let capacitor = device(2);
+        let blocker = device(3);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                capacitor,
+                PrimitiveElementKind::Capacitor.into(),
+            )
+            .unwrap();
+
+        for device in [source, capacitor] {
+            world
+                .attach_terminal(&definitions, positive, device, TerminalId::new(0))
+                .unwrap();
+
+            world
+                .attach_terminal(&definitions, negative, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, capacitor, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let state = DeviceState::new(capacitor, DefinitionStateId::new(0));
+
+        // Establish a non-default committed capacitor voltage.
+        world.tick(&definitions).unwrap();
+
+        let established = world.physical_state.get(&world.network, state).unwrap();
+
+        assert_eq!(established.to_bits(), 5.0f64.to_bits());
+
+        // Make the capacitor's sole writer island unavailable.
+        add_unset_conductance(&mut world, &definitions, blocker, positive, negative);
+
+        let island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(capacitor, DevicePartitionId::new(0)),
+        );
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.island_runtimes[island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        let after_failure = world.physical_state.get(&world.network, state).unwrap();
+
+        assert_eq!(
+            after_failure.to_bits(),
+            established.to_bits(),
+            "failed capacitor writer must Preserve the previously committed voltage",
+        );
+    }
+
+    #[test]
+    fn inductor_writer_failure_preserves_committed_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let negative = wire(1);
+        let positive = wire(2);
+
+        world.add_wire(negative).unwrap();
+        world.add_wire(positive).unwrap();
+
+        let source = device(1);
+        let inductor = device(2);
+        let blocker = device(3);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                inductor,
+                PrimitiveElementKind::Inductor.into(),
+            )
+            .unwrap();
+
+        for device in [source, inductor] {
+            world
+                .attach_terminal(&definitions, positive, device, TerminalId::new(0))
+                .unwrap();
+
+            world
+                .attach_terminal(&definitions, negative, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, inductor, ParameterId::new(0), 1.0)
+            .unwrap();
+
+        let state = DeviceState::new(inductor, DefinitionStateId::new(0));
+
+        // Establish a nonzero committed inductor current.
+        world.tick(&definitions).unwrap();
+
+        let established = world.physical_state.get(&world.network, state).unwrap();
+
+        assert!(
+            established.abs() > 1.0e-12,
+            "fixture must establish a nonzero inductor current",
+        );
+
+        add_unset_conductance(&mut world, &definitions, blocker, positive, negative);
+
+        let island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(inductor, DevicePartitionId::new(0)),
+        );
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.island_runtimes[island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        let after_failure = world.physical_state.get(&world.network, state).unwrap();
+
+        assert_eq!(
+            after_failure.to_bits(),
+            established.to_bits(),
+            "failed inductor writer must Preserve the previously committed current",
+        );
+    }
+
+    #[test]
+    fn schmitt_buffer_writer_failure_preserves_committed_state() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+
+        let ground = wire(1);
+        let high = wire(2);
+        let output = wire(3);
+
+        world.add_wire(ground).unwrap();
+        world.add_wire(high).unwrap();
+        world.add_wire(output).unwrap();
+
+        let source = device(1);
+        let schmitt = device(2);
+        let blocker = device(3);
+
+        world
+            .add_device(
+                &definitions,
+                source,
+                PrimitiveElementKind::VoltageSource.into(),
+            )
+            .unwrap();
+
+        world
+            .add_device(
+                &definitions,
+                schmitt,
+                PrimitiveElementKind::SchmittBuffer.into(),
+            )
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, high, source, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, ground, source, TerminalId::new(1))
+            .unwrap();
+
+        // SchmittBuffer:
+        // 0 = output
+        // 1 = VDD
+        // 2 = VSS
+        // 3 = input
+        world
+            .attach_terminal(&definitions, output, schmitt, TerminalId::new(0))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, high, schmitt, TerminalId::new(1))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, ground, schmitt, TerminalId::new(2))
+            .unwrap();
+
+        world
+            .attach_terminal(&definitions, high, schmitt, TerminalId::new(3))
+            .unwrap();
+
+        world
+            .set_device_parameter(&definitions, source, ParameterId::new(0), 5.0)
+            .unwrap();
+
+        // threshold
+        world
+            .set_device_parameter(&definitions, schmitt, ParameterId::new(0), 2.5)
+            .unwrap();
+
+        // hysteresis width
+        world
+            .set_device_parameter(&definitions, schmitt, ParameterId::new(1), 1.0)
+            .unwrap();
+
+        // G_max
+        world
+            .set_device_parameter(&definitions, schmitt, ParameterId::new(2), 1.0)
+            .unwrap();
+
+        // G_min
+        world
+            .set_device_parameter(&definitions, schmitt, ParameterId::new(3), 0.0)
+            .unwrap();
+
+        let state = DeviceState::new(schmitt, DefinitionStateId::new(0));
+
+        // Input = 5 V is above the upper threshold, so establish state = 1.
+        world.tick(&definitions).unwrap();
+
+        let established = world.physical_state.get(&world.network, state).unwrap();
+
+        assert_eq!(
+            established.to_bits(),
+            1.0f64.to_bits(),
+            "fixture must establish the SchmittBuffer high state",
+        );
+
+        // The blocker shares the supply/input nets, therefore it belongs to
+        // the same island as the SchmittBuffer.
+        add_unset_conductance(&mut world, &definitions, blocker, high, ground);
+
+        let island = world.derived_topology.component_island(
+            world.network(),
+            DeviceComponent::new(schmitt, DevicePartitionId::new(0)),
+        );
+
+        world.tick(&definitions).unwrap();
+
+        assert_eq!(
+            world.island_runtimes[island.index()]
+                .as_ref()
+                .unwrap()
+                .tick_status(),
+            IslandTickStatus::Unavailable,
+        );
+
+        let after_failure = world.physical_state.get(&world.network, state).unwrap();
+
+        assert_eq!(
+            after_failure.to_bits(),
+            established.to_bits(),
+            "failed SchmittBuffer writer must Preserve its committed hysteresis state",
+        );
+    }
+
+    #[test]
+    fn observer_subscription_tracks_unavailable_and_recovery_transitions() {
+        let (mut engine, world, observed, _, observer) = observed_voltage_world();
+
+        let subscription = engine
+            .subscribe_observer(world, observed, observer)
+            .unwrap();
+
+        // Tick 1:
+        // no baseline -> Available(5)
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].status(), SubscriptionValueStatus::Available,);
+            assert_eq!(updates[0].value().to_bits(), 5.0f64.to_bits(),);
+        }
+
+        // Add an unset conductance directly to the observed island.
+        //
+        // observed_voltage_world() uses:
+        //   wire 1 = negative
+        //   wire 2 = positive
+        let negative = wire(1);
+        let positive = wire(2);
+        let blocker = device(3);
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AddDevice {
+                    device: blocker,
+                    definition: PrimitiveElementKind::Conductance.into(),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AttachTerminal {
+                    wire: positive,
+                    device: blocker,
+                    terminal: TerminalId::new(0),
+                },
+            )
+            .unwrap();
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::AttachTerminal {
+                    wire: negative,
+                    device: blocker,
+                    terminal: TerminalId::new(1),
+                },
+            )
+            .unwrap();
+
+        // Deliberately leave blocker parameter 0 unset.
+
+        // Tick 2:
+        // Available(5) -> Unavailable
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].status(), SubscriptionValueStatus::Unavailable,);
+            assert_eq!(
+                updates[0].value().to_bits(),
+                0.0f64.to_bits(),
+                "Unavailable must carry deterministic zero payload",
+            );
+        }
+
+        // The topology change rebuilt this runtime. More importantly,
+        // subscription publication must not ask it for a stale observer
+        // value while its final tick status is Unavailable.
+        {
+            let world_ref = engine.world(world).unwrap();
+
+            let island = world_ref.derived_topology.component_island(
+                world_ref.network(),
+                DeviceComponent::new(observed, DevicePartitionId::new(0)),
+            );
+
+            let runtime = world_ref.island_runtimes[island.index()].as_ref().unwrap();
+
+            assert_eq!(runtime.tick_status(), IslandTickStatus::Unavailable,);
+
+            assert_eq!(
+                runtime.observer_read_count(),
+                0,
+                "Unavailable publication must not read a stale observer value",
+            );
+        }
+
+        // Tick 3:
+        // Unavailable -> Unavailable: suppress.
+        engine.tick_world(world).unwrap();
+
+        assert!(
+            engine.subscription_updates(world).unwrap().is_empty(),
+            "repeated Unavailable status must not republish",
+        );
+
+        {
+            let world_ref = engine.world(world).unwrap();
+
+            let island = world_ref.derived_topology.component_island(
+                world_ref.network(),
+                DeviceComponent::new(observed, DevicePartitionId::new(0)),
+            );
+
+            assert_eq!(
+                world_ref.island_runtimes[island.index()]
+                    .as_ref()
+                    .unwrap()
+                    .observer_read_count(),
+                0,
+                "repeated Unavailable collection must still avoid observer reads",
+            );
+        }
+
+        engine
+            .apply_world_command(
+                world,
+                WorldCommand::SetDeviceParameter {
+                    device: blocker,
+                    parameter: ParameterId::new(0),
+                    value: 1.0,
+                },
+            )
+            .unwrap();
+
+        engine.tick_world(world).unwrap();
+
+        {
+            let updates = engine.subscription_updates(world).unwrap();
+
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].subscription(), subscription);
+            assert_eq!(updates[0].status(), SubscriptionValueStatus::Available,);
+            assert_eq!(updates[0].value().to_bits(), 5.0f64.to_bits(),);
+        }
+
+        engine.tick_world(world).unwrap();
+
+        assert!(
+            engine.subscription_updates(world).unwrap().is_empty(),
+            "identical Available value bits must remain suppressed",
         );
     }
 }

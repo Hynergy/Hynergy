@@ -19,7 +19,7 @@ use crate::runtime::discrete::{
     ClosureOutcome, DiscreteScratch, prepare_discrete_closure_frontier,
     run_discrete_closure_seeded_evaluated,
 };
-use crate::state::{PhysicalStateError, PhysicalStateStore};
+use crate::state::PhysicalStateStore;
 
 #[cfg(test)]
 use crate::state::PhysicalStateAddress;
@@ -145,6 +145,28 @@ pub(crate) enum IslandRuntimeError {
     NonFiniteState { state: DeviceState },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IslandTickStatus {
+    Pending,
+    Available,
+    Unavailable,
+}
+
+impl IslandRuntimeError {
+    #[inline]
+    pub(crate) const fn is_localizable_tick_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingParameter { .. }
+                | Self::Mna(MnaError::Singular { .. })
+                | Self::NonlinearDidNotConverge { .. }
+                | Self::NonFiniteMatrix
+                | Self::NonFiniteSolution
+                | Self::NonFiniteState { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct IslandRuntime {
     system: MnaSystem,
@@ -163,6 +185,7 @@ pub(crate) struct IslandRuntime {
     sleepable: bool,
     needs_solve: bool,
     nonlinear_scratch: Option<Box<NonlinearScratch>>,
+    tick_status: IslandTickStatus,
 
     #[cfg(feature = "solver-profiling")]
     solver_tick_profile: SolverIslandProfile,
@@ -179,6 +202,8 @@ pub(crate) struct IslandRuntime {
     binding_rebind_count: usize,
     #[cfg(test)]
     unknowns: IslandUnknownLayout,
+    #[cfg(test)]
+    force_backend_failure: bool,
 }
 
 impl IslandRuntime {
@@ -255,6 +280,7 @@ impl IslandRuntime {
             sleepable,
             needs_solve: true,
             nonlinear_scratch,
+            tick_status: IslandTickStatus::Pending,
 
             #[cfg(feature = "solver-profiling")]
             solver_tick_profile: SolverIslandProfile::default(),
@@ -271,36 +297,58 @@ impl IslandRuntime {
             binding_rebind_count: 0,
             #[cfg(test)]
             unknowns,
+            #[cfg(test)]
+            force_backend_failure: false,
         })
     }
 
     #[inline]
-    pub(crate) fn validate_state_outputs(
+    pub(crate) fn validate_successful_state_outputs(
         &self,
         physical_state: &PhysicalStateStore,
     ) -> Result<(), IslandRuntimeError> {
         for binding in self.bindings.state_outputs() {
             binding.validate_source(&self.workspace)?;
-
-            physical_state
-                .validate_address(binding.state(), binding.address())
-                .map_err(|error| match error {
-                    PhysicalStateError::StateNotInitialized { state } => {
-                        IslandRuntimeError::MissingState {
-                            device: state.device(),
-                            state: state.state(),
-                        }
-                    }
-                })?;
+            binding.validate_destination(physical_state)?;
         }
 
         Ok(())
     }
 
     #[inline]
-    pub(crate) fn scatter_state_outputs(&self, physical_state: &mut PhysicalStateStore) {
+    pub(crate) fn validate_failed_state_outputs(
+        &self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<(), IslandRuntimeError> {
+        for binding in self.bindings.state_outputs() {
+            binding.validate_failed(network, physical_state)?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn scatter_successful_state_outputs(&self, physical_state: &mut PhysicalStateStore) {
         for binding in self.bindings.state_outputs() {
             physical_state.write_prevalidated(binding.address(), binding.value(&self.workspace));
+        }
+    }
+
+    pub(crate) fn scatter_failed_state_outputs(
+        &self,
+        network: &Network,
+        physical_state: &mut PhysicalStateStore,
+    ) {
+        for binding in self.bindings.state_outputs() {
+            let value = binding.failed_value_prevalidated(network, physical_state);
+
+            debug_assert!(
+                value.is_finite(),
+                "validated failed-tick state output must be finite",
+            );
+
+            physical_state.write_prevalidated(binding.address(), value);
         }
     }
 
@@ -311,12 +359,13 @@ impl IslandRuntime {
         }
     }
 
+    #[inline]
     pub(crate) fn observer_value(&self, observer: DeviceObserver) -> Option<f64> {
         #[cfg(test)]
         self.observer_read_count
             .set(self.observer_read_count.get() + 1);
 
-        if !self.solution_valid {
+        if self.tick_status != IslandTickStatus::Available || !self.solution_valid {
             return None;
         }
 
@@ -389,6 +438,11 @@ impl IslandRuntime {
         &mut self,
         network: &Network,
     ) -> Result<(), IslandRuntimeError> {
+        #[cfg(test)]
+        if self.force_backend_failure {
+            return Err(IslandRuntimeError::Mna(MnaError::BackendFailure));
+        }
+
         #[cfg(feature = "solver-profiling")]
         {
             let nonlinear = self.nonlinear_scratch.is_some();
@@ -755,9 +809,6 @@ impl IslandRuntime {
         }
 
         let stability_matches = self.iteration_stability_matches(&scratch.stability);
-
-        // If the candidate reproduces the exact matrix, RHS, and stability state used to
-        // produce it, another verification solve would solve the identical linear system.
         let exact_system_matches = self.discrete_linear_system_matches(scratch);
 
         let exact_fixed_point = stability_matches && exact_system_matches;
@@ -868,39 +919,6 @@ impl IslandRuntime {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn solve_tick(
-        &mut self,
-        network: &Network,
-        physical_state: &PhysicalStateStore,
-    ) -> Result<(), IslandRuntimeError> {
-        self.prepare_tick_state_inputs(network, physical_state)?;
-        self.solve_prepared_tick(network)
-    }
-
-    #[cfg(test)]
-    fn solve_tick_with_state_reader<F>(
-        &mut self,
-        network: &Network,
-        mut old_state: F,
-    ) -> Result<(), IslandRuntimeError>
-    where
-        F: FnMut(PhysicalStateAddress) -> Option<f64>,
-    {
-        for binding in self.bindings.state_inputs() {
-            let state = binding.state();
-
-            let value = old_state(binding.address()).ok_or(IslandRuntimeError::MissingState {
-                device: state.device(),
-                state: state.state(),
-            })?;
-
-            self.workspace.set_input(binding.input(), value);
-        }
-
-        self.solve_prepared_tick(network)
-    }
-
     fn load_parameters(&mut self, network: &Network) -> Result<StaticChanges, IslandRuntimeError> {
         let mut changes = StaticChanges::default();
 
@@ -1001,6 +1019,38 @@ impl IslandRuntime {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) const fn observer_outputs_dirty(&self) -> bool {
+        self.observer_outputs_dirty
+    }
+
+    #[inline]
+    pub(crate) fn mark_observer_outputs_clean(&mut self) {
+        self.observer_outputs_dirty = false;
+    }
+
+    #[inline]
+    pub(crate) const fn tick_status(&self) -> IslandTickStatus {
+        self.tick_status
+    }
+
+    #[inline]
+    pub(crate) fn begin_tick(&mut self) {
+        self.tick_status = IslandTickStatus::Pending;
+    }
+
+    #[inline]
+    pub(crate) fn mark_available(&mut self) {
+        self.tick_status = IslandTickStatus::Available;
+    }
+
+    #[inline]
+    pub(crate) fn mark_unavailable(&mut self) {
+        self.tick_status = IslandTickStatus::Unavailable;
+
+        self.observer_outputs_dirty = true;
+    }
+
     #[cfg(debug_assertions)]
     #[inline]
     pub(crate) fn debug_assert_bindings_valid(
@@ -1016,18 +1066,10 @@ impl IslandRuntime {
     pub(crate) fn solver_tick_profile(&self) -> &SolverIslandProfile {
         &self.solver_tick_profile
     }
+}
 
-    #[inline]
-    pub(crate) const fn observer_outputs_dirty(&self) -> bool {
-        self.observer_outputs_dirty
-    }
-
-    #[inline]
-    pub(crate) fn mark_observer_outputs_clean(&mut self) {
-        self.observer_outputs_dirty = false;
-    }
-
-    #[cfg(test)]
+#[cfg(test)]
+impl IslandRuntime {
     pub(crate) fn set_state_output_address_for_test(
         &mut self,
         index: usize,
@@ -1036,28 +1078,64 @@ impl IslandRuntime {
         self.bindings
             .set_state_output_address_for_test(index, address);
     }
-}
 
-#[cfg(test)]
-impl IslandRuntime {
-    #[inline]
+    pub(crate) fn solve_tick(
+        &mut self,
+        network: &Network,
+        physical_state: &PhysicalStateStore,
+    ) -> Result<(), IslandRuntimeError> {
+        self.begin_tick();
+        self.prepare_tick_state_inputs(network, physical_state)?;
+        self.solve_prepared_tick(network)?;
+        self.mark_available();
+        Ok(())
+    }
+
+    fn solve_tick_with_state_reader<F>(
+        &mut self,
+        network: &Network,
+        mut old_state: F,
+    ) -> Result<(), IslandRuntimeError>
+    where
+        F: FnMut(PhysicalStateAddress) -> Option<f64>,
+    {
+        self.begin_tick();
+
+        for binding in self.bindings.state_inputs() {
+            let state = binding.state();
+
+            let value = old_state(binding.address()).ok_or(IslandRuntimeError::MissingState {
+                device: state.device(),
+                state: state.state(),
+            })?;
+
+            self.workspace.set_input(binding.input(), value);
+        }
+
+        self.solve_prepared_tick(network)?;
+        self.mark_available();
+
+        Ok(())
+    }
+
+    pub(crate) fn force_backend_failure_for_test(&mut self) {
+        self.force_backend_failure = true;
+    }
+
     pub(crate) fn observer_read_count(&self) -> usize {
         self.observer_read_count.get()
     }
 
-    #[inline]
     fn matrix_stamp_count(&self) -> usize {
         self.matrix_stamp_count
     }
 
-    #[inline]
     fn solve_count(&self) -> usize {
         self.solve_count
     }
 
-    #[inline]
     pub(crate) fn node_voltage(&self, node: IslandNode) -> Option<f64> {
-        if !self.solution_valid {
+        if self.tick_status != IslandTickStatus::Available || !self.solution_valid {
             return None;
         }
 
@@ -1068,17 +1146,14 @@ impl IslandRuntime {
         })
     }
 
-    #[inline]
     fn reset_parameter_read_count(&mut self) {
         self.physical_parameter_read_count = 0;
     }
 
-    #[inline]
     fn physical_parameter_read_count(&self) -> usize {
         self.physical_parameter_read_count
     }
 
-    #[inline]
     pub(crate) fn binding_rebind_count(&self) -> usize {
         self.binding_rebind_count
     }
@@ -1276,13 +1351,14 @@ mod test {
     };
     use crate::compile::island_ir::IslandIrBuilder;
     use crate::runtime::island::{
-        IslandRuntime, advance_iteration_latches, initialize_iteration_latches,
+        IslandRuntime, IslandRuntimeError, advance_iteration_latches, initialize_iteration_latches,
         iteration_stability_matches, solutions_converged,
     };
     use crate::state::{PhysicalStateAddress, PhysicalStateStore};
     use crate::topology::{DerivedTopology, DeviceComponent};
     use hynergy_ir::StateSlot;
     use hynergy_mna::pattern::PatternBuilder;
+    use hynergy_mna::system::MnaError;
     use hynergy_model::circuit::{Element, ValueRef};
     use hynergy_model::device::builder::DeviceDefinitionBuilder;
     use hynergy_model::device::definition::{
@@ -1340,6 +1416,7 @@ mod test {
             device,
             partition,
             compiled_definition.state_initializers(),
+            compiled_definition.failed_tick_transitions(),
             &terminal_nodes,
         )];
 
@@ -2577,18 +2654,21 @@ mod test {
                 gate,
                 gate_partition,
                 gate_definition.state_initializers(),
+                gate_definition.failed_tick_transitions(),
                 &gate_nodes,
             ),
             IslandPartitionSpec::new(
                 vdd_source,
                 source_partition,
                 source_definition.state_initializers(),
+                source_definition.failed_tick_transitions(),
                 &vdd_source_nodes,
             ),
             IslandPartitionSpec::new(
                 input_source,
                 source_partition,
                 source_definition.state_initializers(),
+                source_definition.failed_tick_transitions(),
                 &input_source_nodes,
             ),
         ];
@@ -3266,7 +3346,9 @@ mod test {
             capacitor_runtime_with_physical_state();
 
         runtime.solve_tick(&network, &physical_state).unwrap();
-        runtime.validate_state_outputs(&physical_state).unwrap();
+        runtime
+            .validate_successful_state_outputs(&physical_state)
+            .unwrap();
     }
 
     #[test]
@@ -3275,11 +3357,13 @@ mod test {
             capacitor_runtime_with_physical_state();
 
         runtime.solve_tick(&network, &physical_state).unwrap();
-        runtime.validate_state_outputs(&physical_state).unwrap();
+        runtime
+            .validate_successful_state_outputs(&physical_state)
+            .unwrap();
 
         assert!(!physical_state.is_initialized_at(state.location(),),);
 
-        runtime.scatter_state_outputs(&mut physical_state);
+        runtime.scatter_successful_state_outputs(&mut physical_state);
 
         assert!(
             (physical_state.get_at(state).unwrap() - 0.4).abs() < 1.0e-12,
@@ -3298,8 +3382,10 @@ mod test {
             capacitor_runtime_with_physical_state();
 
         runtime.solve_tick(&network, &physical_state).unwrap();
-        runtime.validate_state_outputs(&physical_state).unwrap();
-        runtime.scatter_state_outputs(&mut physical_state);
+        runtime
+            .validate_successful_state_outputs(&physical_state)
+            .unwrap();
+        runtime.scatter_successful_state_outputs(&mut physical_state);
 
         assert!(!physical_state.is_initialized_at(state.location(),),);
 
@@ -3314,5 +3400,58 @@ mod test {
             (physical_state.get_at(state).unwrap() - 0.4).abs() < 1.0e-12,
             "finalization must not modify the already-scattered scalar",
         );
+    }
+
+    #[test]
+    fn expected_island_failures_are_localizable() {
+        let device = DeviceId::try_from(1).unwrap();
+        let state = DeviceState::new(device, DefinitionStateId::new(0));
+
+        let errors = [
+            IslandRuntimeError::MissingParameter {
+                device,
+                parameter: ParameterId::new(0),
+            },
+            IslandRuntimeError::Mna(MnaError::Singular { index: 0 }),
+            IslandRuntimeError::NonlinearDidNotConverge { iterations: 128 },
+            IslandRuntimeError::NonFiniteMatrix,
+            IslandRuntimeError::NonFiniteSolution,
+            IslandRuntimeError::NonFiniteState { state },
+        ];
+
+        for error in errors {
+            assert!(
+                error.is_localizable_tick_failure(),
+                "{error:?} must be localizable",
+            );
+        }
+    }
+
+    #[test]
+    fn invariant_resource_and_backend_failures_are_fatal() {
+        let device = DeviceId::try_from(1).unwrap();
+
+        let errors = [
+            IslandRuntimeError::Mna(MnaError::IndexOverflow),
+            IslandRuntimeError::Mna(MnaError::OutOfMemory),
+            IslandRuntimeError::Mna(MnaError::BackendFailure),
+            IslandRuntimeError::Mna(MnaError::NotFactorized),
+            IslandRuntimeError::Mna(MnaError::RhsLengthMismatch {
+                expected: 1,
+                actual: 0,
+            }),
+            IslandRuntimeError::MissingDevice { device },
+            IslandRuntimeError::MissingState {
+                device,
+                state: DefinitionStateId::new(0),
+            },
+        ];
+
+        for error in errors {
+            assert!(
+                !error.is_localizable_tick_failure(),
+                "{error:?} must remain fatal",
+            );
+        }
     }
 }

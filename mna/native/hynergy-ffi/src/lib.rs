@@ -1,6 +1,6 @@
 use hynergy_engine::{
-    Engine, EngineConfig, EngineTickError, SubscriptionError, SubscriptionId, WorldConfig,
-    WorldManagementError,
+    Engine, EngineConfig, EngineTickError, SubscriptionError, SubscriptionId,
+    SubscriptionValueStatus, WorldConfig, WorldManagementError,
 };
 use hynergy_model::device::definition::{DefinitionObserverId, DeviceId};
 use hynergy_protocol::{
@@ -10,8 +10,8 @@ use hynergy_protocol::{
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-pub const ABI_VERSION: u32 = 1;
-pub const ABI_REVISION: u32 = 2;
+pub const ABI_VERSION: u32 = 2;
+pub const ABI_REVISION: u32 = 0;
 
 /// Returns the ABI major version implemented by this library.
 ///
@@ -684,8 +684,15 @@ fn map_tick_error(error: EngineTickError, required_capacity: u32) -> TickResult 
 
 /// Advances a world by one tick and writes subscription updates to `records`.
 ///
-/// The first successful tick reports each subscribed observer. Later ticks
-/// report an observer only when the bit pattern of its value changes.
+/// The first completed tick reports each subscribed observer. Later ticks
+/// report an observer when its availability changes, or when an available
+/// observer's value bit pattern changes.
+///
+/// [`SubscriptionStatusCode::Available`] records contain the observer value.
+/// [`SubscriptionStatusCode::Unavailable`] records contain a deterministic
+/// `0.0` payload; callers must use `status` to determine whether `value` is
+/// valid.
+///
 /// On success, `record_count` gives the number of records written.
 ///
 /// `record_capacity` must be at least the number of active subscriptions.
@@ -755,12 +762,20 @@ pub unsafe extern "C" fn hynergy_world_tick(
             debug_assert!(updates.len() <= required as usize);
 
             for (index, update) in updates.iter().enumerate() {
+                let (status, value) = match update.status() {
+                    SubscriptionValueStatus::Available => {
+                        (SubscriptionStatusCode::Available, update.value())
+                    }
+
+                    SubscriptionValueStatus::Unavailable => {
+                        (SubscriptionStatusCode::Unavailable, 0.0)
+                    }
+                };
+
                 let record = SubscriptionRecord {
                     subscription_id: update.subscription().get(),
-
-                    status: SubscriptionStatusCode::Available as u32,
-
-                    value: update.value(),
+                    status: status as u32,
+                    value,
                 };
 
                 unsafe {
@@ -842,6 +857,7 @@ fn map_subscription_error(error: SubscriptionError) -> SubscriptionCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionStatusCode {
     Available = 0,
+    Unavailable = 1,
 }
 
 #[repr(C)]
@@ -1929,6 +1945,7 @@ mod tests {
 
         assert_codes!(SubscriptionStatusCode {
             Available = 0,
+            Unavailable = 1,
         });
 
         assert_codes!(TickCode {
@@ -2269,6 +2286,144 @@ mod tests {
         );
 
         assert_eq!(result.record_count, 0);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn tick_publishes_unavailable_and_recovery_subscription_status() {
+        const ADD_DEVICE: u16 = 5;
+        const ATTACH_TERMINAL: u16 = 7;
+        const SET_DEVICE_PARAMETER: u16 = 9;
+
+        const NEGATIVE_WIRE: u32 = 1;
+        const POSITIVE_WIRE: u32 = 2;
+
+        const BLOCKER: u32 = 3;
+
+        let engine = hynergy_engine_create(1);
+        let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
+        let subscription = subscribe_first_observer(engine, world, observed);
+
+        let mut record = subscription_record_sentinel();
+        let mut result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.code, TickCode::Success as u32);
+        assert_eq!(result.record_count, 1);
+        assert_eq!(result.required_capacity, 1);
+
+        assert_eq!(record.subscription_id, subscription);
+        assert_eq!(record.status, SubscriptionStatusCode::Available as u32,);
+        assert_eq!(record.value.to_bits(), 5.0f64.to_bits());
+
+        let commands = [
+            world_command(
+                ADD_DEVICE,
+                &u32_payload(&[
+                    BLOCKER,
+                    DefinitionId::from(PrimitiveElementKind::Conductance).get(),
+                ]),
+            ),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[POSITIVE_WIRE, BLOCKER, 0])),
+            world_command(ATTACH_TERMINAL, &u32_payload(&[NEGATIVE_WIRE, BLOCKER, 1])),
+        ];
+
+        let mut command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &world_buffer(&commands), &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        record = subscription_record_sentinel();
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(
+            result,
+            TickResult {
+                code: TickCode::Success as u32,
+                record_count: 1,
+                required_capacity: 1,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        assert_eq!(record.subscription_id, subscription);
+        assert_eq!(record.status, SubscriptionStatusCode::Unavailable as u32,);
+
+        assert_eq!(
+            record.value.to_bits(),
+            0.0f64.to_bits(),
+            "Unavailable FFI records must carry deterministic zero",
+        );
+
+        record = subscription_record_sentinel();
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 0);
+        assert_eq!(result.required_capacity, 1);
+
+        assert_eq!(
+            record,
+            subscription_record_sentinel(),
+            "suppressed update must not touch caller storage",
+        );
+
+        let bytes = world_buffer(&[world_command(
+            SET_DEVICE_PARAMETER,
+            &set_parameter_payload(BLOCKER, 0, 1.0),
+        )]);
+
+        command_result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &bytes, &mut command_result,),
+            CommandCode::Success as u32,
+        );
+
+        record = subscription_record_sentinel();
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 1);
+        assert_eq!(result.required_capacity, 1);
+        assert_eq!(record.subscription_id, subscription);
+        assert_eq!(record.status, SubscriptionStatusCode::Available as u32,);
+        assert_eq!(record.value.to_bits(), 5.0f64.to_bits(),);
+
+        record = subscription_record_sentinel();
+        result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { hynergy_world_tick(engine, world, &mut record, 1, &mut result,) },
+            TickCode::Success as u32,
+        );
+
+        assert_eq!(result.record_count, 0);
+        assert_eq!(record, subscription_record_sentinel(),);
 
         unsafe {
             hynergy_engine_destroy(engine);
