@@ -1,6 +1,6 @@
 use crate::compile::definition::{
     CompiledDefinition, CompiledPartitionTemplate, DefinitionCompileError, DefinitionStateId,
-    DefinitionStateInitializer,
+    DefinitionStateInitializer, FailedTickStateTransition,
 };
 use crate::compile::discrete::{
     BoundDiscreteMetadata, CompiledDiscretePlan, compile_discrete_plan,
@@ -169,6 +169,7 @@ impl DeviceState {
 pub(crate) struct IslandStateLayout {
     states: SmallVec<[DeviceState; 2]>,
     initializers: SmallVec<[DefinitionStateInitializer; 2]>,
+    failed_tick_transitions: SmallVec<[FailedTickStateTransition; 2]>,
 }
 
 impl IslandStateLayout {
@@ -182,6 +183,7 @@ impl IslandStateLayout {
         device: DeviceId,
         definition_states: &[DefinitionStateId],
         definition_initializers: &[DefinitionStateInitializer],
+        definition_failed_tick_transitions: &[FailedTickStateTransition],
     ) -> Result<BoundStateSlots, StateAllocationError> {
         let mut slots = SmallVec::<[StateSlot; 4]>::with_capacity(definition_states.len());
 
@@ -192,12 +194,21 @@ impl IslandStateLayout {
                 .get(state.index())
                 .expect("compiled definition state must have an initializer");
 
+            let failed_tick_transition = *definition_failed_tick_transitions
+                .get(state.index())
+                .expect("compiled definition state must have a failed-tick transition");
+
             let slot = if let Some(index) =
                 self.states.iter().position(|&candidate| candidate == key)
             {
                 debug_assert_eq!(
                     self.initializers[index], initializer,
                     "shared logical state must have one initializer",
+                );
+
+                debug_assert_eq!(
+                    self.failed_tick_transitions[index], failed_tick_transition,
+                    "shared logical state must have one failed-tick transition",
                 );
 
                 StateSlot::new(u32::try_from(index).expect("island state index must fit StateSlot"))
@@ -213,6 +224,7 @@ impl IslandStateLayout {
 
                 self.states.push(key);
                 self.initializers.push(initializer);
+                self.failed_tick_transitions.push(failed_tick_transition);
 
                 slot
             };
@@ -220,7 +232,8 @@ impl IslandStateLayout {
             slots.push(slot);
         }
 
-        debug_assert_eq!(self.states.len(), self.initializers.len(),);
+        debug_assert_eq!(self.states.len(), self.initializers.len());
+        debug_assert_eq!(self.states.len(), self.failed_tick_transitions.len());
 
         Ok(BoundStateSlots::new(slots))
     }
@@ -228,6 +241,14 @@ impl IslandStateLayout {
     #[inline]
     pub(crate) fn state_initializer(&self, slot: StateSlot) -> Option<DefinitionStateInitializer> {
         self.initializers.get(slot.index()).copied()
+    }
+
+    #[inline]
+    pub(crate) fn failed_tick_transition(
+        &self,
+        slot: StateSlot,
+    ) -> Option<FailedTickStateTransition> {
+        self.failed_tick_transitions.get(slot.index()).copied()
     }
 
     #[inline]
@@ -248,6 +269,7 @@ pub(crate) struct IslandPartitionSpec<'a> {
     partition: &'a CompiledPartitionTemplate,
     state_initializers: &'a [DefinitionStateInitializer],
     terminal_nodes: &'a [IslandNode],
+    failed_tick_transitions: &'a [FailedTickStateTransition],
 }
 
 impl<'a> IslandPartitionSpec<'a> {
@@ -256,12 +278,14 @@ impl<'a> IslandPartitionSpec<'a> {
         device: DeviceId,
         partition: &'a CompiledPartitionTemplate,
         state_initializers: &'a [DefinitionStateInitializer],
+        failed_tick_transitions: &'a [FailedTickStateTransition],
         terminal_nodes: &'a [IslandNode],
     ) -> Self {
         Self {
             device,
             partition,
             state_initializers,
+            failed_tick_transitions,
             terminal_nodes,
         }
     }
@@ -414,6 +438,7 @@ pub(crate) fn compile_island_parts(
             partition.device,
             partition.partition.definition_states(),
             partition.state_initializers,
+            partition.failed_tick_transitions,
         )?;
 
         bound_partitions.push(BoundIslandPartition {
@@ -630,6 +655,7 @@ pub(crate) fn compile_topology_island(
             component.device(),
             partition,
             compiled.state_initializers(),
+            compiled.failed_tick_transitions(),
             &terminal_nodes[index],
         ));
     }
@@ -639,10 +665,14 @@ pub(crate) fn compile_topology_island(
 
 #[cfg(test)]
 mod test {
-    use crate::compile::definition::CompiledDefinition;
+    use crate::compile::definition::{
+        CompiledDefinition, DefinitionStateId, DefinitionStateInitializer,
+        FailedTickStateTransition,
+    };
     use crate::compile::island::{
-        IslandNode, IslandPartitionSpec, IslandUnknownLayout, bind_partition_unknowns,
-        build_island_pattern, compile_island_parts, compile_topology_island,
+        IslandNode, IslandPartitionSpec, IslandStateLayout, IslandUnknownLayout,
+        bind_partition_unknowns, build_island_pattern, compile_island_parts,
+        compile_topology_island,
     };
     use crate::compile::unknown::UnknownAllocator;
     use crate::topology::{DerivedTopology, DeviceComponent, NetId};
@@ -915,7 +945,6 @@ mod test {
         let device = DeviceId::try_from(1).unwrap();
 
         let node_a = IslandNode::terminal(device, TerminalId::new(0));
-
         let node_b = IslandNode::terminal(device, TerminalId::new(1));
 
         let terminal_nodes = [node_a, node_b];
@@ -924,6 +953,7 @@ mod test {
             device,
             partition,
             compiled_definition.state_initializers(),
+            compiled_definition.failed_tick_transitions(),
             &terminal_nodes,
         )];
 
@@ -965,6 +995,7 @@ mod test {
             device,
             partition,
             compiled_definition.state_initializers(),
+            compiled_definition.failed_tick_transitions(),
             &terminal_nodes,
         )];
 
@@ -1015,12 +1046,14 @@ mod test {
                 gate_device,
                 gate_partition,
                 compiled_gate.state_initializers(),
+                compiled_gate.failed_tick_transitions(),
                 &gate_terminals,
             ),
             IslandPartitionSpec::new(
                 switch_device,
                 switch_partition,
                 compiled_switch.state_initializers(),
+                compiled_switch.failed_tick_transitions(),
                 &switch_terminals,
             ),
         ];
@@ -1087,5 +1120,49 @@ mod test {
         assert_eq!(island.partition_inputs()[0].device(), device,);
 
         assert_eq!(island.state_count(), 0,);
+    }
+
+    #[test]
+    fn island_state_layout_preserves_failed_tick_metadata_for_shared_state() {
+        let device = DeviceId::try_from(1).unwrap();
+
+        let definition_states = [DefinitionStateId::new(0)];
+        let initializers = [DefinitionStateInitializer::Literal(0.0)];
+        let failed_tick_transitions = [FailedTickStateTransition::Literal(0.0)];
+
+        let mut layout = IslandStateLayout::new();
+
+        let first = layout
+            .bind_partition_states(
+                device,
+                &definition_states,
+                &initializers,
+                &failed_tick_transitions,
+            )
+            .unwrap();
+
+        let second = layout
+            .bind_partition_states(
+                device,
+                &definition_states,
+                &initializers,
+                &failed_tick_transitions,
+            )
+            .unwrap();
+
+        let slot = first.get(0).unwrap();
+
+        assert_eq!(second.get(0), Some(slot));
+        assert_eq!(layout.state_count(), 1);
+
+        assert_eq!(
+            layout.state_initializer(slot),
+            Some(DefinitionStateInitializer::Literal(0.0)),
+        );
+
+        assert_eq!(
+            layout.failed_tick_transition(slot),
+            Some(FailedTickStateTransition::Literal(0.0)),
+        );
     }
 }
