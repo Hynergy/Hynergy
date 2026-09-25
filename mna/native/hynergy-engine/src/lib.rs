@@ -7,6 +7,7 @@ mod topology;
 
 use crate::compile::island::{DeviceObserver, IslandCompileError, compile_topology_island};
 use crate::runtime::island::{IslandRuntime, IslandRuntimeError, IslandTickStatus};
+use crate::runtime::store::IslandRuntimeStore;
 use crate::runtime::subscription::{
     PublishedObservation, SubscriptionRegistry, SubscriptionUpdate,
 };
@@ -448,7 +449,7 @@ pub struct World {
     derived_topology: DerivedTopology,
     topology_scratch: TraversalScratch,
     physical_state: PhysicalStateStore,
-    island_runtimes: Vec<Option<IslandRuntime>>,
+    island_runtimes: IslandRuntimeStore,
     subscription_updates: Vec<SubscriptionUpdate>,
 }
 
@@ -461,7 +462,7 @@ impl World {
             derived_topology: DerivedTopology::default(),
             topology_scratch: TraversalScratch::default(),
             physical_state: PhysicalStateStore::default(),
-            island_runtimes: Vec::new(),
+            island_runtimes: IslandRuntimeStore::default(),
             subscription_updates: Vec::new(),
         }
     }
@@ -479,8 +480,7 @@ impl World {
 
             for (island, _) in topology.islands() {
                 let runtime = runtimes
-                    .get_mut(island.index())
-                    .and_then(Option::as_mut)
+                    .get_mut(island)
                     .expect("live island must have a runtime after synchronization");
 
                 runtime.begin_tick();
@@ -504,8 +504,7 @@ impl World {
 
             for (island, _) in topology.islands() {
                 let runtime = runtimes
-                    .get_mut(island.index())
-                    .and_then(Option::as_mut)
+                    .get_mut(island)
                     .expect("live island must have a runtime after synchronization");
 
                 if runtime.tick_status() == IslandTickStatus::Unavailable {
@@ -547,15 +546,12 @@ impl World {
             .derived_topology
             .islands()
             .filter_map(|(island, _)| {
-                self.island_runtimes
-                    .get(island.index())
-                    .and_then(Option::as_ref)
-                    .map(|runtime| {
-                        runtime
-                            .solver_tick_profile()
-                            .clone()
-                            .with_island_index(island.index())
-                    })
+                self.island_runtimes.get(island).map(|runtime| {
+                    runtime
+                        .solver_tick_profile()
+                        .clone()
+                        .with_island_index(island.index())
+                })
             })
             .collect();
 
@@ -575,8 +571,7 @@ impl World {
                 let island = topology.component_island(network, subscription.component());
 
                 let runtime = runtimes
-                    .get(island.index())
-                    .and_then(Option::as_ref)
+                    .get(island)
                     .expect("live subscription component must have an island runtime");
 
                 match runtime.tick_status() {
@@ -624,7 +619,7 @@ impl World {
             }
         }
 
-        for runtime in self.island_runtimes.iter_mut().flatten() {
+        for runtime in self.island_runtimes.iter_mut() {
             runtime.mark_observer_outputs_clean();
         }
     }
@@ -874,35 +869,24 @@ impl World {
             #[cfg(debug_assertions)]
             for (island, _) in topology.islands() {
                 debug_assert!(
-                    topology_dirty.contains(&island)
-                        || runtimes
-                            .get(island.index())
-                            .and_then(Option::as_ref)
-                            .is_some(),
+                    topology_dirty.contains(&island) || runtimes.get(island).is_some(),
                     "clean live island must already have a runtime before synchronization",
                 );
             }
 
             for &island in retired {
-                if let Some(runtime) = runtimes.get_mut(island.index()) {
-                    *runtime = None;
-                }
+                runtimes.remove(island);
             }
 
             for &island in topology_dirty {
-                if runtimes.len() <= island.index() {
-                    runtimes.resize_with(island.index() + 1, || None);
-                }
-
                 let compiled = compile_topology_island(definitions, network, topology, island)?;
                 let runtime = IslandRuntime::new(compiled, network, timestep)?;
 
-                runtimes[island.index()] = Some(runtime);
+                runtimes.insert(island, runtime);
             }
 
             for &island in binding_dirty {
-                let Some(runtime) = runtimes.get_mut(island.index()).and_then(Option::as_mut)
-                else {
+                let Some(runtime) = runtimes.get_mut(island) else {
                     continue;
                 };
 
@@ -910,8 +894,7 @@ impl World {
             }
 
             for &island in numerical_dirty {
-                let Some(runtime) = runtimes.get_mut(island.index()).and_then(Option::as_mut)
-                else {
+                let Some(runtime) = runtimes.get_mut(island) else {
                     continue;
                 };
 
@@ -924,8 +907,7 @@ impl World {
 
                 for (island, _) in topology.islands() {
                     let runtime = runtimes
-                        .get(island.index())
-                        .and_then(Option::as_ref)
+                        .get(island)
                         .expect("live island must have a runtime after synchronization");
 
                     runtime.debug_assert_bindings_valid(network, physical_state);
@@ -947,8 +929,7 @@ impl World {
 
         for (island, _) in topology.islands() {
             let runtime = runtimes
-                .get_mut(island.index())
-                .and_then(Option::as_mut)
+                .get_mut(island)
                 .expect("live island must have a runtime after synchronization");
 
             match runtime.tick_status() {
@@ -990,8 +971,7 @@ impl World {
 
         for (island, _) in topology.islands() {
             let runtime = runtimes
-                .get(island.index())
-                .and_then(Option::as_ref)
+                .get(island)
                 .expect("live island must have a runtime after synchronization");
 
             match runtime.tick_status() {
@@ -1018,8 +998,7 @@ impl World {
 
         for (island, _) in topology.islands() {
             let runtime = runtimes
-                .get(island.index())
-                .and_then(Option::as_ref)
+                .get(island)
                 .expect("live island must have a runtime after synchronization");
 
             runtime.finalize_state_outputs(physical_state);
@@ -1121,9 +1100,7 @@ mod tests {
         let positive = IslandNode::net(world.derived_topology.wire_net(output_positive));
         let negative = IslandNode::net(world.derived_topology.wire_net(output_negative));
 
-        let runtime = world.island_runtimes[output_island.index()]
-            .as_ref()
-            .unwrap();
+        let runtime = world.island_runtimes.get(output_island).unwrap();
 
         runtime.node_voltage(positive).unwrap() - runtime.node_voltage(negative).unwrap()
     }
@@ -1318,8 +1295,11 @@ mod tests {
         engine.tick_world(world_id).unwrap();
 
         {
-            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-                .as_ref()
+            let runtime = engine
+                .world(world_id)
+                .unwrap()
+                .island_runtimes
+                .get(island)
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
@@ -1331,8 +1311,11 @@ mod tests {
 
         assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
-        let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-            .as_ref()
+        let runtime = engine
+            .world(world_id)
+            .unwrap()
+            .island_runtimes
+            .get(island)
             .unwrap();
 
         assert_eq!(
@@ -2093,9 +2076,7 @@ mod tests {
 
         world.tick(&definitions).unwrap();
 
-        let runtime = world.island_runtimes[output_island.index()]
-            .as_ref()
-            .unwrap();
+        let runtime = world.island_runtimes.get(output_island).unwrap();
 
         let first_output = runtime.node_voltage(positive_node).unwrap()
             - runtime.node_voltage(negative_node).unwrap();
@@ -2109,9 +2090,7 @@ mod tests {
 
         world.tick(&definitions).unwrap();
 
-        let runtime = world.island_runtimes[output_island.index()]
-            .as_ref()
-            .unwrap();
+        let runtime = world.island_runtimes.get(output_island).unwrap();
 
         let second_output = runtime.node_voltage(positive_node).unwrap()
             - runtime.node_voltage(negative_node).unwrap();
@@ -2228,16 +2207,18 @@ mod tests {
         assert_eq!(world.tick(&definitions), Ok(()));
 
         assert_eq!(
-            world.island_runtimes[blocker_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(blocker_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Unavailable,
         );
 
         assert_eq!(
-            world.island_runtimes[delay_writer_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(delay_writer_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Available,
@@ -2360,7 +2341,7 @@ mod tests {
         let positive_node = IslandNode::net(world.derived_topology.wire_net(positive));
         let negative_node = IslandNode::net(world.derived_topology.wire_net(negative));
 
-        let runtime = world.island_runtimes[island.index()].as_ref().unwrap();
+        let runtime = world.island_runtimes.get(island).unwrap();
 
         let voltage = runtime.node_voltage(positive_node).unwrap()
             - runtime.node_voltage(negative_node).unwrap();
@@ -2373,7 +2354,7 @@ mod tests {
 
         world.tick(&definitions).unwrap();
 
-        let runtime = world.island_runtimes[island.index()].as_ref().unwrap();
+        let runtime = world.island_runtimes.get(island).unwrap();
 
         let voltage = runtime.node_voltage(positive_node).unwrap()
             - runtime.node_voltage(negative_node).unwrap();
@@ -2490,10 +2471,7 @@ mod tests {
         assert_eq!(world.tick(&definitions), Ok(()));
 
         assert_eq!(
-            world.island_runtimes[island.index()]
-                .as_ref()
-                .unwrap()
-                .tick_status(),
+            world.island_runtimes.get(island).unwrap().tick_status(),
             IslandTickStatus::Unavailable,
         );
     }
@@ -2525,10 +2503,7 @@ mod tests {
         );
 
         assert_eq!(
-            world.island_runtimes[island.index()]
-                .as_ref()
-                .unwrap()
-                .tick_status(),
+            world.island_runtimes.get(island).unwrap().tick_status(),
             IslandTickStatus::Unavailable,
         );
     }
@@ -2644,11 +2619,7 @@ mod tests {
 
         world.tick(&definitions).unwrap();
 
-        let output_runtime = world
-            .island_runtimes
-            .get(output_island.index())
-            .and_then(Option::as_ref)
-            .unwrap();
+        let output_runtime = world.island_runtimes.get(output_island).unwrap();
 
         let voltage = output_runtime.node_voltage(output_positive_node).unwrap()
             - output_runtime.node_voltage(output_negative_node).unwrap();
@@ -2658,11 +2629,7 @@ mod tests {
 
         world.tick(&definitions).unwrap();
 
-        let output_runtime = world
-            .island_runtimes
-            .get(output_island.index())
-            .and_then(Option::as_ref)
-            .unwrap();
+        let output_runtime = world.island_runtimes.get(output_island).unwrap();
 
         let voltage = output_runtime.node_voltage(output_positive_node).unwrap()
             - output_runtime.node_voltage(output_negative_node).unwrap();
@@ -2704,8 +2671,11 @@ mod tests {
         engine.tick_world(world_id).unwrap();
 
         {
-            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-                .as_ref()
+            let runtime = engine
+                .world(world_id)
+                .unwrap()
+                .island_runtimes
+                .get(island)
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 0);
@@ -2726,8 +2696,11 @@ mod tests {
         }
 
         {
-            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-                .as_ref()
+            let runtime = engine
+                .world(world_id)
+                .unwrap()
+                .island_runtimes
+                .get(island)
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
@@ -2737,8 +2710,11 @@ mod tests {
 
         assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
-        let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-            .as_ref()
+        let runtime = engine
+            .world(world_id)
+            .unwrap()
+            .island_runtimes
+            .get(island)
             .unwrap();
 
         assert_eq!(runtime.observer_read_count(), 1);
@@ -2931,8 +2907,11 @@ mod tests {
         }
 
         {
-            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-                .as_ref()
+            let runtime = engine
+                .world(world_id)
+                .unwrap()
+                .island_runtimes
+                .get(island)
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
@@ -2943,8 +2922,11 @@ mod tests {
         assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
         {
-            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-                .as_ref()
+            let runtime = engine
+                .world(world_id)
+                .unwrap()
+                .island_runtimes
+                .get(island)
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 1);
@@ -2972,8 +2954,11 @@ mod tests {
         }
 
         {
-            let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-                .as_ref()
+            let runtime = engine
+                .world(world_id)
+                .unwrap()
+                .island_runtimes
+                .get(island)
                 .unwrap();
 
             assert_eq!(runtime.observer_read_count(), 2);
@@ -2983,8 +2968,11 @@ mod tests {
 
         assert!(engine.subscription_updates(world_id).unwrap().is_empty(),);
 
-        let runtime = engine.world(world_id).unwrap().island_runtimes[island.index()]
-            .as_ref()
+        let runtime = engine
+            .world(world_id)
+            .unwrap()
+            .island_runtimes
+            .get(island)
             .unwrap();
 
         assert_eq!(runtime.observer_read_count(), 2);
@@ -3127,8 +3115,9 @@ mod tests {
             .unwrap()
             .revision();
 
-        let rebinds_before = world.island_runtimes[moved_island.index()]
-            .as_ref()
+        let rebinds_before = world
+            .island_runtimes
+            .get(moved_island)
             .unwrap()
             .binding_rebind_count();
 
@@ -3174,8 +3163,9 @@ mod tests {
         );
 
         assert_eq!(
-            world.island_runtimes[moved_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(moved_island)
                 .unwrap()
                 .binding_rebind_count(),
             rebinds_before + 1,
@@ -3252,8 +3242,9 @@ mod tests {
             islands.map(|island| world.derived_topology.island(island).unwrap().revision());
 
         let rebinds = islands.map(|island| {
-            world.island_runtimes[island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(island)
                 .unwrap()
                 .binding_rebind_count()
         });
@@ -3293,8 +3284,9 @@ mod tests {
             );
 
             assert_eq!(
-                world.island_runtimes[island.index()]
-                    .as_ref()
+                world
+                    .island_runtimes
+                    .get(island)
                     .unwrap()
                     .binding_rebind_count(),
                 rebinds[index] + 1,
@@ -3463,7 +3455,7 @@ mod tests {
 
         world.sync_island_runtimes(&definitions).unwrap();
 
-        for runtime in world.island_runtimes.iter_mut().flatten() {
+        for runtime in world.island_runtimes.iter_mut() {
             runtime.mark_available();
         }
 
@@ -3488,8 +3480,9 @@ mod tests {
 
         let second_location = world.network.device_location(second_capacitor).unwrap();
 
-        world.island_runtimes[second_island.index()]
-            .as_mut()
+        world
+            .island_runtimes
+            .get_mut(second_island)
             .unwrap()
             .set_state_output_address_for_test(0, PhysicalStateAddress::new(second_location, 1));
 
@@ -3513,6 +3506,99 @@ mod tests {
             !world.physical_state.is_initialized_at(first_location),
             "failed global validation must not finalize any earlier row",
         );
+    }
+
+    #[test]
+    fn island_runtime_entries_stay_bounded_across_merge_split_churn() {
+        let definitions = DefinitionRegistry::new();
+        let mut world = World::new(world_config());
+        let wires = [wire(1), wire(2), wire(3), wire(4)];
+        let devices = [device(1), device(2)];
+
+        for &wire in &wires {
+            world.add_wire(wire).unwrap();
+        }
+
+        for (index, &device) in devices.iter().enumerate() {
+            let first_wire = wires[index * 2];
+            let second_wire = wires[index * 2 + 1];
+            world
+                .add_device(
+                    &definitions,
+                    device,
+                    PrimitiveElementKind::Conductance.into(),
+                )
+                .unwrap();
+            world
+                .set_device_parameter(&definitions, device, ParameterId::new(0), 1.0)
+                .unwrap();
+            world
+                .attach_terminal(&definitions, first_wire, device, TerminalId::new(0))
+                .unwrap();
+            world
+                .attach_terminal(&definitions, second_wire, device, TerminalId::new(1))
+                .unwrap();
+        }
+
+        world.tick(&definitions).unwrap();
+        assert_eq!(world.derived_topology.islands().len(), 2);
+        assert_eq!(world.island_runtimes.len(), 2);
+
+        for cycle in 0..8 {
+            let separate_ids = devices.map(|device| {
+                world.derived_topology.component_island(
+                    &world.network,
+                    DeviceComponent::new(device, DevicePartitionId::new(0)),
+                )
+            });
+            assert_ne!(separate_ids[0], separate_ids[1]);
+
+            world
+                .connect_wires(&definitions, wires[1], wires[3])
+                .unwrap();
+            world.tick(&definitions).unwrap();
+
+            assert_eq!(world.derived_topology.islands().len(), 1);
+            assert_eq!(
+                world.island_runtimes.len(),
+                1,
+                "merge cycle {cycle} must retain only the live island runtime",
+            );
+
+            let merged_id = world.derived_topology.component_island(
+                &world.network,
+                DeviceComponent::new(devices[0], DevicePartitionId::new(0)),
+            );
+            assert!(separate_ids.contains(&merged_id));
+            let merged_runtime = world
+                .island_runtimes
+                .get(merged_id)
+                .expect("surviving island ID must resolve to its runtime");
+            assert_eq!(merged_runtime.tick_status(), IslandTickStatus::Available);
+
+            world
+                .disconnect_wires(&definitions, wires[1], wires[3])
+                .unwrap();
+            world.tick(&definitions).unwrap();
+
+            assert_eq!(world.derived_topology.islands().len(), 2);
+            assert_eq!(
+                world.island_runtimes.len(),
+                2,
+                "split cycle {cycle} must retain both live island runtimes",
+            );
+            for device in devices {
+                let island = world.derived_topology.component_island(
+                    &world.network,
+                    DeviceComponent::new(device, DevicePartitionId::new(0)),
+                );
+                let runtime = world
+                    .island_runtimes
+                    .get(island)
+                    .expect("split island ID must resolve to its runtime");
+                assert_eq!(runtime.tick_status(), IslandTickStatus::Available);
+            }
+        }
     }
 
     #[test]
@@ -3561,13 +3647,9 @@ mod tests {
 
         assert_eq!(world.tick(&definitions), Ok(()));
 
-        let healthy_runtime = world.island_runtimes[healthy_island.index()]
-            .as_ref()
-            .unwrap();
+        let healthy_runtime = world.island_runtimes.get(healthy_island).unwrap();
 
-        let singular_runtime = world.island_runtimes[singular_island.index()]
-            .as_ref()
-            .unwrap();
+        let singular_runtime = world.island_runtimes.get(singular_island).unwrap();
 
         assert_eq!(healthy_runtime.tick_status(), IslandTickStatus::Available,);
 
@@ -3778,8 +3860,9 @@ mod tests {
             DeviceComponent::new(fatal, DevicePartitionId::new(0)),
         );
 
-        world.island_runtimes[fatal_island.index()]
-            .as_mut()
+        world
+            .island_runtimes
+            .get_mut(fatal_island)
             .unwrap()
             .force_backend_failure_for_test();
 
@@ -3916,16 +3999,18 @@ mod tests {
         world.tick(&definitions).unwrap();
 
         assert_eq!(
-            world.island_runtimes[writer_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(writer_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Unavailable,
         );
 
         assert_eq!(
-            world.island_runtimes[reader_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(reader_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Available,
@@ -4171,8 +4256,9 @@ mod tests {
         );
 
         assert_eq!(
-            world.island_runtimes[writer_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(writer_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Unavailable,
@@ -4297,16 +4383,18 @@ mod tests {
         world.tick(&definitions).unwrap();
 
         assert_eq!(
-            world.island_runtimes[writer_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(writer_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Available,
         );
 
         assert_eq!(
-            world.island_runtimes[reader_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(reader_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Unavailable,
@@ -4327,8 +4415,9 @@ mod tests {
         world.tick(&definitions).unwrap();
 
         assert_eq!(
-            world.island_runtimes[reader_island.index()]
-                .as_ref()
+            world
+                .island_runtimes
+                .get(reader_island)
                 .unwrap()
                 .tick_status(),
             IslandTickStatus::Available,
@@ -4411,10 +4500,7 @@ mod tests {
         world.tick(&definitions).unwrap();
 
         assert_eq!(
-            world.island_runtimes[island.index()]
-                .as_ref()
-                .unwrap()
-                .tick_status(),
+            world.island_runtimes.get(island).unwrap().tick_status(),
             IslandTickStatus::Unavailable,
         );
 
@@ -4498,10 +4584,7 @@ mod tests {
         world.tick(&definitions).unwrap();
 
         assert_eq!(
-            world.island_runtimes[island.index()]
-                .as_ref()
-                .unwrap()
-                .tick_status(),
+            world.island_runtimes.get(island).unwrap().tick_status(),
             IslandTickStatus::Unavailable,
         );
 
@@ -4625,10 +4708,7 @@ mod tests {
         world.tick(&definitions).unwrap();
 
         assert_eq!(
-            world.island_runtimes[island.index()]
-                .as_ref()
-                .unwrap()
-                .tick_status(),
+            world.island_runtimes.get(island).unwrap().tick_status(),
             IslandTickStatus::Unavailable,
         );
 
@@ -4733,7 +4813,7 @@ mod tests {
                 DeviceComponent::new(observed, DevicePartitionId::new(0)),
             );
 
-            let runtime = world_ref.island_runtimes[island.index()].as_ref().unwrap();
+            let runtime = world_ref.island_runtimes.get(island).unwrap();
 
             assert_eq!(runtime.tick_status(), IslandTickStatus::Unavailable,);
 
@@ -4762,8 +4842,9 @@ mod tests {
             );
 
             assert_eq!(
-                world_ref.island_runtimes[island.index()]
-                    .as_ref()
+                world_ref
+                    .island_runtimes
+                    .get(island)
                     .unwrap()
                     .observer_read_count(),
                 0,
