@@ -2006,10 +2006,10 @@ mod tests {
     #[test]
     fn abi_version_and_revision_are_stable() {
         assert_eq!(hynergy_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 1);
+        assert_eq!(ABI_VERSION, 2);
 
         assert_eq!(hynergy_abi_revision(), ABI_REVISION);
-        assert_eq!(ABI_REVISION, 2);
+        assert_eq!(ABI_REVISION, 0);
     }
 
     #[test]
