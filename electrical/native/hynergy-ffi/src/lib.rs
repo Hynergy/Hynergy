@@ -14,7 +14,7 @@ use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, RwLock};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const ABI_REVISION: u32 = 0;
 
 #[derive(Clone)]
@@ -373,32 +373,6 @@ pub enum WorldCode {
     InternalPanic = u32::MAX,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorldCreationResult {
-    pub code: u32,
-    pub reserved: u32,
-    pub world: *mut WorldHandle,
-}
-
-impl WorldCreationResult {
-    const fn success(world: *mut WorldHandle) -> Self {
-        Self {
-            code: WorldCode::Success as u32,
-            reserved: 0,
-            world,
-        }
-    }
-
-    const fn failure(code: WorldCode) -> Self {
-        Self {
-            code: code as u32,
-            reserved: 0,
-            world: std::ptr::null_mut(),
-        }
-    }
-}
-
 /// Creates an independently addressable world handle.
 ///
 /// The returned world retains the engine-global definition store. It remains
@@ -406,57 +380,51 @@ impl WorldCreationResult {
 ///
 /// # Safety
 ///
-/// `engine` must point to a live [`EngineHandle`]. `result` must point to
-/// writable storage for one [`WorldCreationResult`]. The result and engine
+/// `engine` must point to a live [`EngineHandle`]. `world` must point to
+/// writable storage for one `*mut WorldHandle`. The output storage and engine
 /// storage must not overlap. The caller must prevent concurrent destruction
 /// of this same engine handle during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_create_world(
     engine: *mut EngineHandle,
     tick_frequency_hz: u32,
-    result: *mut WorldCreationResult,
+    world: *mut *mut WorldHandle,
 ) -> u32 {
-    if result.is_null() {
+    if world.is_null() {
         return WorldCode::NullResult as u32;
     }
 
-    let Some(tick_frequency_hz) = NonZeroU32::new(tick_frequency_hz) else {
-        let output = WorldCreationResult::failure(WorldCode::InvalidTickFrequency);
-
-        let code = output.code;
-
-        unsafe {
-            result.write(output);
-        }
-
-        return code;
-    };
-
-    let output = if engine.is_null() {
-        WorldCreationResult::failure(WorldCode::NullEngine)
-    } else {
-        let creation = catch_unwind(AssertUnwindSafe(|| {
-            let engine = unsafe { &*engine };
-
-            Box::into_raw(Box::new(WorldHandle {
-                definitions: engine.definitions.clone(),
-                world: World::new(WorldConfig::new(tick_frequency_hz)),
-            }))
-        }));
-
-        match creation {
-            Ok(world) => WorldCreationResult::success(world),
-            Err(_) => WorldCreationResult::failure(WorldCode::InternalPanic),
-        }
-    };
-
-    let code = output.code;
-
     unsafe {
-        result.write(output);
+        world.write(std::ptr::null_mut());
     }
 
-    code
+    let Some(tick_frequency_hz) = NonZeroU32::new(tick_frequency_hz) else {
+        return WorldCode::InvalidTickFrequency as u32;
+    };
+
+    if engine.is_null() {
+        return WorldCode::NullEngine as u32;
+    }
+
+    let creation = catch_unwind(AssertUnwindSafe(|| {
+        let engine = unsafe { &*engine };
+
+        Box::into_raw(Box::new(WorldHandle {
+            definitions: engine.definitions.clone(),
+            world: World::new(WorldConfig::new(tick_frequency_hz)),
+        }))
+    }));
+
+    match creation {
+        Ok(created_world) => {
+            unsafe {
+                world.write(created_world);
+            }
+
+            WorldCode::Success as u32
+        }
+        Err(_) => WorldCode::InternalPanic as u32,
+    }
 }
 
 /// Destroys a world handle and all world-local resources.
@@ -1659,14 +1627,6 @@ mod tests {
         }
     }
 
-    fn world_result_sentinel() -> WorldCreationResult {
-        WorldCreationResult {
-            code: 0xaaaa_aaaa,
-            reserved: 0xbbbb_bbbb,
-            world: 0xcccc_ccccusize as *mut WorldHandle,
-        }
-    }
-
     #[derive(Clone, Copy)]
     struct TestWorldCreationResult {
         world_id: *mut WorldHandle,
@@ -1692,18 +1652,16 @@ mod tests {
     }
 
     fn create_world(engine: *mut EngineHandle) -> TestWorldCreationResult {
-        let mut result = world_result_sentinel();
+        let mut world = std::ptr::null_mut();
 
         assert_eq!(
-            unsafe { hynergy_engine_create_world(engine, 30, &mut result) },
+            unsafe { hynergy_engine_create_world(engine, 30, &mut world) },
             WorldCode::Success as u32
         );
 
-        assert!(!result.world.is_null());
+        assert!(!world.is_null());
 
-        TestWorldCreationResult {
-            world_id: result.world,
-        }
+        TestWorldCreationResult { world_id: world }
     }
 
     fn apply(
@@ -1883,7 +1841,7 @@ mod tests {
             *mut DefinitionRegistrationResult,
         ) -> u32 = hynergy_engine_register_definition;
 
-        let _: unsafe extern "C" fn(*mut EngineHandle, u32, *mut WorldCreationResult) -> u32 =
+        let _: unsafe extern "C" fn(*mut EngineHandle, u32, *mut *mut WorldHandle) -> u32 =
             hynergy_engine_create_world;
 
         let _: unsafe extern "C" fn(*mut WorldHandle) = hynergy_world_destroy;
@@ -2104,20 +2062,6 @@ mod tests {
         assert_eq!(offset_of!(DefinitionRegistrationResult, byte_offset), 8,);
         assert_eq!(offset_of!(DefinitionRegistrationResult, definition_id), 12,);
     }
-    #[test]
-    fn world_creation_result_layout_is_stable() {
-        assert_eq!(
-            size_of::<WorldCreationResult>(),
-            8 + size_of::<*mut WorldHandle>(),
-        );
-        assert_eq!(
-            align_of::<WorldCreationResult>(),
-            align_of::<*mut WorldHandle>(),
-        );
-        assert_eq!(offset_of!(WorldCreationResult, code), 0,);
-        assert_eq!(offset_of!(WorldCreationResult, reserved), 4,);
-        assert_eq!(offset_of!(WorldCreationResult, world), 8,);
-    }
 
     #[test]
     fn command_result_layout_is_stable() {
@@ -2132,7 +2076,7 @@ mod tests {
     #[test]
     fn abi_version_and_revision_are_stable() {
         assert_eq!(hynergy_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 3);
+        assert_eq!(ABI_VERSION, 4);
 
         assert_eq!(hynergy_abi_revision(), ABI_REVISION);
         assert_eq!(ABI_REVISION, 0);
@@ -2186,26 +2130,6 @@ mod tests {
                 command_index: 3,
                 byte_offset: 12,
                 definition_id: u32::MAX,
-            },
-        );
-
-        let world = std::ptr::NonNull::<WorldHandle>::dangling().as_ptr();
-
-        assert_eq!(
-            WorldCreationResult::success(world),
-            WorldCreationResult {
-                code: WorldCode::Success as u32,
-                reserved: 0,
-                world,
-            },
-        );
-
-        assert_eq!(
-            WorldCreationResult::failure(WorldCode::NullEngine),
-            WorldCreationResult {
-                code: WorldCode::NullEngine as u32,
-                reserved: 0,
-                world: std::ptr::null_mut(),
             },
         );
 
@@ -2298,25 +2222,28 @@ mod tests {
             },
         );
 
-        let mut creation = WorldCreationResult {
-            code: 0xaaaa_aaaa,
-            reserved: 0xbbbb_bbbb,
-            world: std::ptr::NonNull::<WorldHandle>::dangling().as_ptr(),
-        };
+        let mut world = 0xcccc_ccccusize as *mut WorldHandle;
 
         assert_eq!(
-            unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 20, &mut creation) },
+            unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 30, &mut world,) },
             WorldCode::NullEngine as u32,
         );
 
+        assert!(world.is_null());
+
+        let engine = hynergy_engine_create(1);
+        let mut world = 0xcccc_ccccusize as *mut WorldHandle;
+
         assert_eq!(
-            creation,
-            WorldCreationResult {
-                code: WorldCode::NullEngine as u32,
-                reserved: 0,
-                world: std::ptr::null_mut(),
-            },
+            unsafe { hynergy_engine_create_world(engine, 0, &mut world,) },
+            WorldCode::InvalidTickFrequency as u32,
         );
+
+        assert!(world.is_null());
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
 
         let mut command = CommandResult {
             code: 0xaaaa_aaaa,
@@ -3195,19 +3122,27 @@ mod tests {
 
     #[test]
     fn create_world_reports_null_engine() {
-        let mut result = world_result_sentinel();
+        let mut world = 0xcccc_ccccusize as *mut WorldHandle;
 
-        let code = unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 30, &mut result) };
+        let code = unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 30, &mut world) };
 
         assert_eq!(code, WorldCode::NullEngine as u32);
-        assert_eq!(
-            result,
-            WorldCreationResult {
-                code: WorldCode::NullEngine as u32,
-                reserved: 0,
-                world: std::ptr::null_mut(),
-            }
-        );
+        assert!(world.is_null());
+    }
+
+    #[test]
+    fn create_world_reports_invalid_tick_frequency() {
+        let engine = hynergy_engine_create(1);
+        let mut world = 0xcccc_ccccusize as *mut WorldHandle;
+
+        let code = unsafe { hynergy_engine_create_world(engine, 0, &mut world) };
+
+        assert_eq!(code, WorldCode::InvalidTickFrequency as u32);
+        assert!(world.is_null());
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
     }
 
     #[test]
