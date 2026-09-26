@@ -33,8 +33,7 @@ public final class ElectricalEngine implements AutoCloseable {
         }
 
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment worldResult =
-                    arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment worldResult = arena.allocate(ValueLayout.ADDRESS);
 
             int code = NativeBindings.createWorld(
                     requireOpen(),
@@ -46,13 +45,13 @@ public final class ElectricalEngine implements AutoCloseable {
                 case NativeLayouts.WORLD_SUCCESS -> {
                 }
                 case NativeLayouts.WORLD_NULL_ENGINE -> throw new IllegalStateException(
-                        "Native engine handle is null"
+                        "Native ABI reported a null engine handle"
                 );
                 case NativeLayouts.WORLD_NULL_RESULT -> throw new IllegalStateException(
-                        "Native world result pointer is null"
+                        "Native ABI reported a null world output pointer"
                 );
                 case NativeLayouts.WORLD_INVALID_TICK_FREQUENCY -> throw new IllegalStateException(
-                        "Native engine rejected the tick frequency"
+                        "Native ABI rejected a validated tick frequency"
                 );
                 case NativeLayouts.WORLD_INTERNAL_PANIC -> throw new IllegalStateException(
                         "Native engine panicked while creating a world"
@@ -68,7 +67,7 @@ public final class ElectricalEngine implements AutoCloseable {
                     0
             );
 
-            if (worldHandle.equals(MemorySegment.NULL)) {
+            if (MemorySegment.NULL.equals(worldHandle)) {
                 throw new IllegalStateException(
                         "Native world creation succeeded with a null handle"
                 );
