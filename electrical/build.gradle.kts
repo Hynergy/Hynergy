@@ -32,7 +32,7 @@ tasks.test {
 }
 
 val cargoPackage = "hynergy-ffi"
-val nativeLibraryName = "hynergy_mna"
+val nativeLibraryName = "hynergy_electrical_engine"
 
 val nativeOs: String = run {
     val osName = System.getProperty("os.name")

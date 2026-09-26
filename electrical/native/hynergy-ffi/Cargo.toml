@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "hynergy_mna"
+name = "hynergy_electrical"
 crate-type = ["cdylib"]
 
 [dependencies]
