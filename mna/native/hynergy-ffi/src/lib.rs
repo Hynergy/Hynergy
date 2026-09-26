@@ -926,7 +926,7 @@ pub struct SubscriptionRecord {
 
 /// Creates a subscription to a device observer in a world.
 ///
-/// `device_id` identifies a device in `world_id`. `observer_id` identifies an
+/// `device_id` identifies a device in this world. `observer_id` identifies an
 /// observer in that device's definition. On success, `subscription_id` in
 /// `result` contains the new subscription ID. On failure, it contains `u32::MAX`.
 ///
@@ -1001,7 +1001,7 @@ pub unsafe extern "C" fn hynergy_world_subscribe_observer(
 
 /// Removes a subscription from a world.
 ///
-/// `subscription_id` identifies a subscription in `world_id`. After this call
+/// `subscription_id` identifies a subscription in this world. After this call
 /// succeeds, later ticks do not report updates for the removed subscription.
 /// The function returns a [`SubscriptionCode`] value.
 ///
@@ -2139,6 +2139,322 @@ mod tests {
     }
 
     #[test]
+    fn abi_code_representations_are_stable() {
+        macro_rules! assert_u32_repr {
+            ($($ty:ty),+ $(,)?) => {
+                $(
+                    assert_eq!(
+                        size_of::<$ty>(),
+                        size_of::<u32>(),
+                        concat!(stringify!($ty), " size"),
+                    );
+                    assert_eq!(
+                        align_of::<$ty>(),
+                        align_of::<u32>(),
+                        concat!(stringify!($ty), " alignment"),
+                    );
+                )+
+            };
+        }
+
+        assert_u32_repr!(
+            DefinitionRegistrationCode,
+            WorldCode,
+            CommandCode,
+            TickCode,
+            SubscriptionCode,
+            SubscriptionStatusCode,
+        );
+    }
+
+    #[test]
+    fn abi_result_sentinels_are_stable() {
+        assert_eq!(
+            DefinitionRegistrationResult::success(17),
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::Success as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                definition_id: 17,
+            },
+        );
+
+        assert_eq!(
+            DefinitionRegistrationResult::failure(DefinitionRegistrationCode::InvalidMagic, 3, 12,),
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::InvalidMagic as u32,
+                command_index: 3,
+                byte_offset: 12,
+                definition_id: u32::MAX,
+            },
+        );
+
+        let world = std::ptr::NonNull::<WorldHandle>::dangling().as_ptr();
+
+        assert_eq!(
+            WorldCreationResult::success(world),
+            WorldCreationResult {
+                code: WorldCode::Success as u32,
+                reserved: 0,
+                world,
+            },
+        );
+
+        assert_eq!(
+            WorldCreationResult::failure(WorldCode::NullEngine),
+            WorldCreationResult {
+                code: WorldCode::NullEngine as u32,
+                reserved: 0,
+                world: std::ptr::null_mut(),
+            },
+        );
+
+        assert_eq!(
+            CommandResult::success(),
+            CommandResult {
+                code: CommandCode::Success as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            },
+        );
+
+        assert_eq!(
+            CommandResult::failure(CommandCode::InvalidId, 4, 28),
+            CommandResult {
+                code: CommandCode::InvalidId as u32,
+                command_index: 4,
+                byte_offset: 28,
+                reserved: 0,
+            },
+        );
+
+        assert_eq!(
+            TickResult::success(2, 5),
+            TickResult {
+                code: TickCode::Success as u32,
+                record_count: 2,
+                required_capacity: 5,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        assert_eq!(
+            TickResult::failure(TickCode::BackendFailure, 5),
+            TickResult {
+                code: TickCode::BackendFailure as u32,
+                record_count: 0,
+                required_capacity: 5,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        assert_eq!(
+            SubscriptionCreationResult::success(9),
+            SubscriptionCreationResult {
+                code: SubscriptionCode::Success as u32,
+                subscription_id: 9,
+            },
+        );
+
+        assert_eq!(
+            SubscriptionCreationResult::failure(SubscriptionCode::UnknownDevice),
+            SubscriptionCreationResult {
+                code: SubscriptionCode::UnknownDevice as u32,
+                subscription_id: u32::MAX,
+            },
+        );
+    }
+
+    #[test]
+    fn null_handle_results_are_deterministic() {
+        let byte = 0_u8;
+
+        let mut definition = DefinitionRegistrationResult {
+            code: 0xaaaa_aaaa,
+            command_index: 0xbbbb_bbbb,
+            byte_offset: 0xcccc_cccc,
+            definition_id: 0xdddd_dddd,
+        };
+
+        assert_eq!(
+            unsafe {
+                hynergy_engine_register_definition(std::ptr::null_mut(), &byte, 1, &mut definition)
+            },
+            DefinitionRegistrationCode::NullEngine as u32,
+        );
+
+        assert_eq!(
+            definition,
+            DefinitionRegistrationResult {
+                code: DefinitionRegistrationCode::NullEngine as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                definition_id: u32::MAX,
+            },
+        );
+
+        let mut creation = WorldCreationResult {
+            code: 0xaaaa_aaaa,
+            reserved: 0xbbbb_bbbb,
+            world: std::ptr::NonNull::<WorldHandle>::dangling().as_ptr(),
+        };
+
+        assert_eq!(
+            unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 20, &mut creation) },
+            WorldCode::NullEngine as u32,
+        );
+
+        assert_eq!(
+            creation,
+            WorldCreationResult {
+                code: WorldCode::NullEngine as u32,
+                reserved: 0,
+                world: std::ptr::null_mut(),
+            },
+        );
+
+        let mut command = CommandResult {
+            code: 0xaaaa_aaaa,
+            command_index: 0xbbbb_bbbb,
+            byte_offset: 0xcccc_cccc,
+            reserved: 0xdddd_dddd,
+        };
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_apply_commands(std::ptr::null_mut(), &byte, 1, &mut command)
+            },
+            CommandCode::NullWorld as u32,
+        );
+
+        assert_eq!(
+            command,
+            CommandResult {
+                code: CommandCode::NullWorld as u32,
+                command_index: u32::MAX,
+                byte_offset: u32::MAX,
+                reserved: 0,
+            },
+        );
+
+        let mut tick = TickResult {
+            code: 0xaaaa_aaaa,
+            record_count: 0xbbbb_bbbb,
+            required_capacity: 0xcccc_cccc,
+            device_id: 0xdddd_dddd,
+            parameter_id: 0xeeee_eeee,
+            iterations: 0xffff_ffff,
+        };
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_tick(std::ptr::null_mut(), std::ptr::null_mut(), 0, &mut tick)
+            },
+            TickCode::NullWorld as u32,
+        );
+
+        assert_eq!(
+            tick,
+            TickResult {
+                code: TickCode::NullWorld as u32,
+                record_count: 0,
+                required_capacity: 0,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::MAX,
+            },
+        );
+
+        let mut subscription = subscription_result_sentinel();
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_subscribe_observer(
+                    std::ptr::null_mut(),
+                    1,
+                    0,
+                    &mut subscription,
+                )
+            },
+            SubscriptionCode::NullWorld as u32,
+        );
+
+        assert_eq!(
+            subscription,
+            SubscriptionCreationResult {
+                code: SubscriptionCode::NullWorld as u32,
+                subscription_id: u32::MAX,
+            },
+        );
+
+        assert_eq!(
+            unsafe { super::hynergy_world_unsubscribe(std::ptr::null_mut(), 1) },
+            SubscriptionCode::NullWorld as u32,
+        );
+    }
+
+    #[test]
+    fn null_result_pointers_take_precedence() {
+        assert_eq!(
+            unsafe {
+                hynergy_engine_register_definition(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            DefinitionRegistrationCode::NullResult as u32,
+        );
+
+        assert_eq!(
+            unsafe { hynergy_engine_create_world(std::ptr::null_mut(), 0, std::ptr::null_mut(),) },
+            WorldCode::NullResult as u32,
+        );
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_apply_commands(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            CommandCode::NullResult as u32,
+        );
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_tick(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            TickCode::NullResult as u32,
+        );
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_subscribe_observer(
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SubscriptionCode::NullResult as u32,
+        );
+    }
+
+    #[test]
     fn observer_subscription_lifecycle_is_exposed_through_ffi() {
         let engine = hynergy_engine_create(1);
 
@@ -3137,7 +3453,7 @@ mod tests {
         let second = create_world(engine).world_id;
 
         unsafe {
-            super::hynergy_engine_destroy(engine);
+            hynergy_engine_destroy(engine);
         }
 
         let first = unsafe { Box::from_raw(first) };
@@ -3317,7 +3633,7 @@ mod tests {
         );
 
         unsafe {
-            super::hynergy_world_destroy(world);
+            hynergy_world_destroy(world);
             hynergy_engine_destroy(engine);
         }
     }
