@@ -26,13 +26,11 @@ dependencies {
 tasks.test {
     useJUnitPlatform()
 
-    // FFM downcalls are restricted methods. Without this the JVM prints a warning on every run;
-    // the flag makes the intent explicit instead of leaving noise in the test output.
     jvmArgs("--enable-native-access=ALL-UNNAMED")
 }
 
 val cargoPackage = "hynergy-ffi"
-val nativeLibraryName = "hynergy_electrical_engine"
+val nativeLibraryName = "hynergy_electrical"
 
 val nativeOs: String = run {
     val osName = System.getProperty("os.name")
@@ -90,7 +88,7 @@ val cargoOutputLibrary = File(
 
 val cargoBuildNative = tasks.register<Exec>("cargoBuildNative") {
     group = "build"
-    description = "Builds the Rust MNA native library for the current platform"
+    description = "Builds the Rust electrical native library for the current platform"
 
     workingDir(file("native"))
 
