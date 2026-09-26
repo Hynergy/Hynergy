@@ -230,7 +230,7 @@ impl Engine {
             .and_then(Option::as_mut)
             .ok_or(EngineTickError::UnknownWorld)?;
 
-        world.tick(definitions).map_err(EngineTickError::from)
+        world.tick(definitions)
     }
 
     #[inline]
@@ -307,52 +307,7 @@ impl Engine {
             .and_then(Option::as_mut)
             .ok_or(WorldCommandApplyError::UnknownWorld)?;
 
-        match command {
-            WorldCommand::AddWire { wire } => {
-                world.add_wire(wire)?;
-            }
-            WorldCommand::RemoveWire { wire } => {
-                world.remove_wire(definitions, wire)?;
-            }
-            WorldCommand::ConnectWires { wire_a, wire_b } => {
-                world.connect_wires(definitions, wire_a, wire_b)?;
-            }
-            WorldCommand::DisconnectWires { wire_a, wire_b } => {
-                world.disconnect_wires(definitions, wire_a, wire_b)?;
-            }
-            WorldCommand::AddDevice { device, definition } => {
-                world.add_device(definitions, device, definition)?;
-            }
-            WorldCommand::RemoveDevice { device } => {
-                world.remove_device(definitions, device)?;
-            }
-            WorldCommand::AttachTerminal {
-                wire,
-                device,
-                terminal,
-            } => {
-                world.attach_terminal(definitions, wire, device, terminal)?;
-            }
-            WorldCommand::DetachTerminal {
-                wire,
-                device,
-                terminal,
-            } => {
-                world.detach_terminal(definitions, wire, device, terminal)?;
-            }
-            WorldCommand::SetDeviceParameter {
-                device,
-                parameter,
-                value,
-            } => {
-                world.set_device_parameter(definitions, device, parameter, value)?;
-            }
-        }
-
-        #[cfg(debug_assertions)]
-        world.debug_validate_storage(definitions);
-
-        Ok(())
+        world.apply_command(definitions, command)
     }
 
     #[inline]
@@ -454,7 +409,7 @@ pub struct World {
 }
 
 impl World {
-    fn new(config: WorldConfig) -> Self {
+    pub fn new(config: WorldConfig) -> Self {
         Self {
             config,
             network: Network::new(),
@@ -467,7 +422,11 @@ impl World {
         }
     }
 
-    pub(crate) fn tick(&mut self, definitions: &DefinitionRegistry) -> Result<(), WorldTickError> {
+    pub fn tick(&mut self, definitions: &DefinitionRegistry) -> Result<(), EngineTickError> {
+        self.tick_inner(definitions).map_err(EngineTickError::from)
+    }
+
+    fn tick_inner(&mut self, definitions: &DefinitionRegistry) -> Result<(), WorldTickError> {
         self.subscription_updates.clear();
 
         self.sync_island_runtimes(definitions)?;
@@ -533,6 +492,11 @@ impl World {
         self.collect_subscription_updates();
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.subscriptions().len()
     }
 
     #[inline]
@@ -624,7 +588,7 @@ impl World {
         }
     }
 
-    fn subscribe_observer(
+    pub fn subscribe_observer(
         &mut self,
         definitions: &DefinitionRegistry,
         device: DeviceId,
@@ -651,10 +615,63 @@ impl World {
             .ok_or(SubscriptionError::IdExhausted)
     }
 
-    fn unsubscribe(&mut self, subscription: SubscriptionId) -> Result<(), SubscriptionError> {
+    pub fn unsubscribe(&mut self, subscription: SubscriptionId) -> Result<(), SubscriptionError> {
         if !self.subscriptions.remove(subscription) {
             return Err(SubscriptionError::UnknownSubscription { subscription });
         }
+
+        Ok(())
+    }
+
+    pub fn apply_command(
+        &mut self,
+        definitions: &DefinitionRegistry,
+        command: WorldCommand,
+    ) -> Result<(), WorldCommandApplyError> {
+        match command {
+            WorldCommand::AddWire { wire } => {
+                self.add_wire(wire)?;
+            }
+            WorldCommand::RemoveWire { wire } => {
+                self.remove_wire(definitions, wire)?;
+            }
+            WorldCommand::ConnectWires { wire_a, wire_b } => {
+                self.connect_wires(definitions, wire_a, wire_b)?;
+            }
+            WorldCommand::DisconnectWires { wire_a, wire_b } => {
+                self.disconnect_wires(definitions, wire_a, wire_b)?;
+            }
+            WorldCommand::AddDevice { device, definition } => {
+                self.add_device(definitions, device, definition)?;
+            }
+            WorldCommand::RemoveDevice { device } => {
+                self.remove_device(definitions, device)?;
+            }
+            WorldCommand::AttachTerminal {
+                wire,
+                device,
+                terminal,
+            } => {
+                self.attach_terminal(definitions, wire, device, terminal)?;
+            }
+            WorldCommand::DetachTerminal {
+                wire,
+                device,
+                terminal,
+            } => {
+                self.detach_terminal(definitions, wire, device, terminal)?;
+            }
+            WorldCommand::SetDeviceParameter {
+                device,
+                parameter,
+                value,
+            } => {
+                self.set_device_parameter(definitions, device, parameter, value)?;
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        self.debug_validate_storage(definitions);
 
         Ok(())
     }
@@ -3872,9 +3889,7 @@ mod tests {
 
         assert_eq!(
             world.tick(&definitions),
-            Err(WorldTickError::Runtime(IslandRuntimeError::Mna(
-                MnaError::BackendFailure
-            ),)),
+            Err(EngineTickError::BackendFailure),
         );
 
         assert!(
