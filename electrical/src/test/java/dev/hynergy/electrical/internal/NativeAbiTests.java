@@ -5,10 +5,12 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class NativeLayoutTest {
+public class NativeAbiTests
+{
     @Test
-    void nativeAbiIsCompatible() {
-        assertEquals(3, NativeBindings.abiVersion());
+    void nativeAbiIsCompatible()
+    {
+        assertEquals(5, NativeBindings.abiVersion());
         assertTrue(NativeBindings.abiRevision() >= 0);
     }
 }
