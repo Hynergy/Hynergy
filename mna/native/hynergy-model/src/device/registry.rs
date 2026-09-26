@@ -22,6 +22,7 @@ pub enum RegisterDeviceError {
     UnknownDefinition { definition: DefinitionId },
 }
 
+#[derive(Clone)]
 pub struct DefinitionRegistry {
     definitions: Vec<DeviceDefinition>,
 }

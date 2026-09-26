@@ -3,7 +3,7 @@ use hynergy_engine::Engine;
 use hynergy_model::circuit::{Element, ElementId, NodeId, ValueRef};
 use hynergy_model::device::builder::{DeviceDefinitionBuilder, DeviceDefinitionBuilderError};
 use hynergy_model::device::definition::{DefinitionId, DefinitionObserverId, DeviceDefinition};
-use hynergy_model::device::registry::RegisterDeviceError;
+use hynergy_model::device::registry::{DefinitionRegistry, RegisterDeviceError};
 use hynergy_model::parameter::{Bound, ParameterConstraints, ParameterId};
 
 pub const DEFINITION_BUFFER_VERSION: u16 = 1;
@@ -134,15 +134,22 @@ pub fn register_definition_buffer(
     engine: &mut Engine,
     input: &[u8],
 ) -> Result<DefinitionId, DefinitionRegistrationError> {
-    let definition = decode_definition(engine, input)?;
+    let definition = decode_definition_buffer(engine.definitions(), input)?;
 
     engine
         .register_definition(definition)
         .map_err(map_registry_error)
 }
 
-fn decode_definition(
-    engine: &Engine,
+pub fn register_decoded_definition(
+    definitions: &mut DefinitionRegistry,
+    definition: DeviceDefinition,
+) -> Result<DefinitionId, DefinitionRegistrationError> {
+    definitions.register(definition).map_err(map_registry_error)
+}
+
+pub fn decode_definition_buffer(
+    definitions: &DefinitionRegistry,
     input: &[u8],
 ) -> Result<DeviceDefinition, DefinitionRegistrationError> {
     let mut decoder = Decoder::new(input, 0);
@@ -186,7 +193,7 @@ fn decode_definition(
     let command_count = decoder.read_u32().map_err(truncated_header)?;
     debug_assert_eq!(decoder.offset(), DEFINITION_HEADER_LENGTH);
 
-    let mut builder = DeviceDefinitionBuilder::new(engine.definitions());
+    let mut builder = DeviceDefinitionBuilder::new(definitions);
     for command_index in 0..command_count {
         let command_offset = decoder.offset();
 
