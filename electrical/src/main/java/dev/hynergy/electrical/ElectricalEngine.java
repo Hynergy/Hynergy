@@ -1,14 +1,20 @@
 package dev.hynergy.electrical;
 
 import dev.hynergy.electrical.internal.NativeBindings;
-import dev.hynergy.electrical.internal.NativeLayouts;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
-
 public final class ElectricalEngine implements AutoCloseable {
+    private static final class WorldCode {
+        static final int SUCCESS = 0;
+        static final int NULL_ENGINE = 1;
+        static final int NULL_RESULT = 2;
+        static final int INVALID_TICK_FREQUENCY = 5;
+        static final int INTERNAL_PANIC = -1;
+    }
+
     private MemorySegment handle;
 
     private ElectricalEngine(MemorySegment handle) {
@@ -19,7 +25,8 @@ public final class ElectricalEngine implements AutoCloseable {
         MemorySegment handle = NativeBindings.createEngine(1);
 
         if (handle.equals(MemorySegment.NULL)) {
-            throw new IllegalStateException("Native electrical engine creation returned a null handle");
+            throw new IllegalStateException(
+                "Native electrical engine creation returned a null handle");
         }
 
         return new ElectricalEngine(handle);
@@ -27,50 +34,40 @@ public final class ElectricalEngine implements AutoCloseable {
 
     public ElectricalWorld createWorld(int tickFrequencyHz) {
         if (tickFrequencyHz <= 0) {
-            throw new IllegalArgumentException(
-                    "Tick frequency must be greater than zero"
-            );
+            throw new IllegalArgumentException("Tick frequency must be greater than zero");
         }
 
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment worldResult = arena.allocate(ValueLayout.ADDRESS);
 
-            int code = NativeBindings.createWorld(
-                    requireOpen(),
-                    tickFrequencyHz,
-                    worldResult
-            );
+            int code = NativeBindings.createWorld(requireOpen(), tickFrequencyHz, worldResult);
 
             switch (code) {
-                case NativeLayouts.WORLD_SUCCESS -> {
+                case WorldCode.SUCCESS -> {
                 }
-                case NativeLayouts.WORLD_NULL_ENGINE -> throw new IllegalStateException(
-                        "Native ABI reported a null engine handle"
-                );
-                case NativeLayouts.WORLD_NULL_RESULT -> throw new IllegalStateException(
-                        "Native ABI reported a null world output pointer"
-                );
-                case NativeLayouts.WORLD_INVALID_TICK_FREQUENCY -> throw new IllegalStateException(
-                        "Native ABI rejected a validated tick frequency"
-                );
-                case NativeLayouts.WORLD_INTERNAL_PANIC -> throw new IllegalStateException(
-                        "Native engine panicked while creating a world"
-                );
+                case WorldCode.NULL_ENGINE ->
+                    throw new IllegalStateException("Native ABI reported a null engine handle");
+
+                case WorldCode.NULL_RESULT -> throw new IllegalStateException(
+                    "Native ABI reported a null world output pointer");
+
+                case WorldCode.INVALID_TICK_FREQUENCY ->
+                    throw new IllegalStateException("Native ABI rejected a validated tick "
+                        + "frequency");
+
+                case WorldCode.INTERNAL_PANIC ->
+                    throw new IllegalStateException("Native engine panicked while creating a "
+                        + "world");
+
                 default -> throw new IllegalStateException(
-                        "Unknown native world creation status: "
-                                + Integer.toUnsignedLong(code)
-                );
+                    "Unknown native world creation status: " + Integer.toUnsignedLong(code));
             }
 
-            MemorySegment worldHandle = worldResult.get(
-                    ValueLayout.ADDRESS,
-                    0
-            );
+            MemorySegment worldHandle = worldResult.get(ValueLayout.ADDRESS, 0);
 
             if (MemorySegment.NULL.equals(worldHandle)) {
-                throw new IllegalStateException(
-                        "Native world creation succeeded with a null handle"
-                );
+                throw new IllegalStateException("Native world creation succeeded with a null "
+                    + "handle");
             }
 
             return new ElectricalWorld(worldHandle);
