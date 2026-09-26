@@ -1,17 +1,90 @@
+#[cfg(test)]
+use hynergy_engine::Engine;
 use hynergy_engine::{
-    Engine, EngineConfig, EngineTickError, SubscriptionError, SubscriptionId,
-    SubscriptionValueStatus, WorldConfig, WorldManagementError,
+    EngineConfig, EngineTickError, SubscriptionError, SubscriptionId, SubscriptionValueStatus,
+    World, WorldConfig,
 };
-use hynergy_model::device::definition::{DefinitionObserverId, DeviceId};
+use hynergy_model::device::definition::{DefinitionObserverId, DeviceDefinition, DeviceId};
+use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_protocol::{
     DefinitionRegistrationError, DefinitionRegistrationErrorKind, WorldCommandError,
     WorldCommandErrorKind,
 };
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex, RwLock};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 pub const ABI_REVISION: u32 = 0;
+
+#[derive(Clone)]
+struct DefinitionStore {
+    state: Arc<DefinitionStoreState>,
+}
+
+struct DefinitionStoreState {
+    published: RwLock<Arc<DefinitionRegistry>>,
+    registration: Mutex<()>,
+}
+
+impl DefinitionStore {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(DefinitionStoreState {
+                published: RwLock::new(Arc::new(DefinitionRegistry::new())),
+                registration: Mutex::new(()),
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<DefinitionRegistry> {
+        self.state
+            .published
+            .read()
+            .expect("definition publication lock poisoned")
+            .clone()
+    }
+
+    fn register(
+        &self,
+        definition: DeviceDefinition,
+    ) -> Result<hynergy_model::device::definition::DefinitionId, DefinitionRegistrationError> {
+        let _registration = self
+            .state
+            .registration
+            .lock()
+            .expect("definition registration lock poisoned");
+
+        let current = self.snapshot();
+        let mut next = (*current).clone();
+        let id = hynergy_protocol::register_decoded_definition(&mut next, definition)?;
+
+        let mut published = self
+            .state
+            .published
+            .write()
+            .expect("definition publication lock poisoned");
+
+        debug_assert!(
+            Arc::ptr_eq(&current, &*published),
+            "definition publication must be serialized by the registration lock",
+        );
+
+        *published = Arc::new(next);
+
+        Ok(id)
+    }
+}
+
+pub struct EngineHandle {
+    _config: EngineConfig,
+    definitions: DefinitionStore,
+}
+
+pub struct WorldHandle {
+    definitions: DefinitionStore,
+    world: World,
+}
 
 /// Returns the ABI major version implemented by this library.
 ///
@@ -23,7 +96,7 @@ pub extern "C" fn hynergy_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Returns the additive revision of ABI major version 1.
+/// Returns the additive revision of the current ABI major version.
 ///
 /// The ABI revision increases only when backward-compatible ABI features are
 /// added. Existing callers may continue using an ABI with a newer revision.
@@ -107,26 +180,31 @@ impl DefinitionRegistrationResult {
     }
 }
 
-/// Creates an engine.
+/// Creates an engine handle.
 ///
-/// The returned pointer owns the engine. The caller must pass the pointer to
-/// [`hynergy_engine_destroy`] when the engine is no longer necessary.
+/// The returned pointer owns the engine handle. Worlds created from this
+/// handle retain the engine-global definition store independently.
 #[unsafe(no_mangle)]
-pub extern "C" fn hynergy_engine_create(max_worker_threads: u32) -> *mut Engine {
-    Box::into_raw(Box::new(Engine::new(EngineConfig::new(max_worker_threads))))
+pub extern "C" fn hynergy_engine_create(max_worker_threads: u32) -> *mut EngineHandle {
+    Box::into_raw(Box::new(EngineHandle {
+        _config: EngineConfig::new(max_worker_threads),
+        definitions: DefinitionStore::new(),
+    }))
 }
 
-/// Destroys an engine and all resources that it owns.
+/// Destroys an engine handle.
 ///
-/// This function has no effect if `engine` is null.
+/// Existing world handles remain valid because they retain their own reference
+/// to the engine-global definition store. This function has no effect if
+/// `engine` is null.
 ///
 /// # Safety
 ///
-/// `engine` must have been returned by `hynergy_engine_create`,
-/// and it must not have been destroyed previously. The caller must prevent
-/// concurrent access to the engine during this call.
+/// `engine` must have been returned by `hynergy_engine_create`, and it must
+/// not have been destroyed previously. The caller must prevent concurrent
+/// access to this same engine handle during destruction.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut Engine) {
+pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut EngineHandle) {
     if !engine.is_null() {
         unsafe {
             drop(Box::from_raw(engine));
@@ -145,15 +223,16 @@ pub unsafe extern "C" fn hynergy_engine_destroy(engine: *mut Engine) {
 ///
 /// # Safety
 ///
-/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
-/// access for this call. If `input` is not null, it must point to `input_len`
-/// readable bytes. If `result` is not null, it must point to writable storage
-/// for one [`DefinitionRegistrationResult`]. The input, result, and engine
-/// storage must not overlap. The caller must prevent concurrent use of the
-/// same engine.
+/// If `engine` is not null, it must point to a live [`EngineHandle`]. If
+/// `input` is not null, it must point to `input_len` readable bytes. If
+/// `result` is not null, it must point to writable storage for one
+/// [`DefinitionRegistrationResult`]. The input, result, and engine storage
+/// must not overlap. Registration may run concurrently with operations on
+/// distinct [`WorldHandle`] values created from this engine. The caller must
+/// still prevent concurrent destruction of this same engine handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_register_definition(
-    engine: *mut Engine,
+    engine: *mut EngineHandle,
     input: *const u8,
     input_len: u32,
     result: *mut DefinitionRegistrationResult,
@@ -176,9 +255,11 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
         )
     } else {
         let registration = catch_unwind(AssertUnwindSafe(|| {
-            let engine = unsafe { &mut *engine };
+            let engine = unsafe { &*engine };
             let input = unsafe { std::slice::from_raw_parts(input, input_len as usize) };
-            hynergy_protocol::register_definition_buffer(engine, input)
+            let definitions = engine.definitions.snapshot();
+            let definition = hynergy_protocol::decode_definition_buffer(&definitions, input)?;
+            engine.definitions.register(definition)
         }));
         match registration {
             Ok(Ok(definition_id)) => DefinitionRegistrationResult::success(definition_id.get()),
@@ -287,8 +368,7 @@ pub enum WorldCode {
     Success = 0,
     NullEngine = 1,
     NullResult = 2,
-    UnknownWorld = 3,
-    WorldIdExhausted = 4,
+    // 3-4 are reserved; ABI 2 used them for engine-owned world IDs.
     InvalidTickFrequency = 5,
     InternalPanic = u32::MAX,
 }
@@ -297,39 +377,42 @@ pub enum WorldCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldCreationResult {
     pub code: u32,
-    pub world_id: u32,
+    pub reserved: u32,
+    pub world: *mut WorldHandle,
 }
 
 impl WorldCreationResult {
-    const fn success(world_id: u32) -> Self {
+    const fn success(world: *mut WorldHandle) -> Self {
         Self {
             code: WorldCode::Success as u32,
-            world_id,
+            reserved: 0,
+            world,
         }
     }
 
     const fn failure(code: WorldCode) -> Self {
         Self {
             code: code as u32,
-            world_id: u32::MAX,
+            reserved: 0,
+            world: std::ptr::null_mut(),
         }
     }
 }
 
-/// Creates a world and returns its engine-assigned ID in `result`.
+/// Creates an independently addressable world handle.
 ///
-/// The engine owns the new world. The caller must use the returned world ID
-/// for later world operations.
+/// The returned world retains the engine-global definition store. It remains
+/// valid if the originating engine handle is later destroyed.
 ///
 /// # Safety
 ///
-/// `engine` must point to a live [`Engine`] with exclusive access for this
-/// call. `result` must point to writable storage for one
-/// [`WorldCreationResult`]. The result and engine storage must not overlap.
-/// The caller must prevent concurrent use of the same engine.
+/// `engine` must point to a live [`EngineHandle`]. `result` must point to
+/// writable storage for one [`WorldCreationResult`]. The result and engine
+/// storage must not overlap. The caller must prevent concurrent destruction
+/// of this same engine handle during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_engine_create_world(
-    engine: *mut Engine,
+    engine: *mut EngineHandle,
     tick_frequency_hz: u32,
     result: *mut WorldCreationResult,
 ) -> u32 {
@@ -353,22 +436,16 @@ pub unsafe extern "C" fn hynergy_engine_create_world(
         WorldCreationResult::failure(WorldCode::NullEngine)
     } else {
         let creation = catch_unwind(AssertUnwindSafe(|| {
-            let engine = unsafe { &mut *engine };
-            engine.new_world(WorldConfig::new(tick_frequency_hz))
+            let engine = unsafe { &*engine };
+
+            Box::into_raw(Box::new(WorldHandle {
+                definitions: engine.definitions.clone(),
+                world: World::new(WorldConfig::new(tick_frequency_hz)),
+            }))
         }));
 
         match creation {
-            Ok(Ok(world_id)) => WorldCreationResult::success(world_id),
-
-            Ok(Err(WorldManagementError::WorldIdExhausted)) => {
-                WorldCreationResult::failure(WorldCode::WorldIdExhausted)
-            }
-
-            // Creation cannot produce UnknownWorld.
-            Ok(Err(WorldManagementError::UnknownWorld)) => {
-                WorldCreationResult::failure(WorldCode::InternalPanic)
-            }
-
+            Ok(world) => WorldCreationResult::success(world),
             Err(_) => WorldCreationResult::failure(WorldCode::InternalPanic),
         }
     };
@@ -382,34 +459,21 @@ pub unsafe extern "C" fn hynergy_engine_create_world(
     code
 }
 
-/// Destroys a world and all resources that the world owns.
+/// Destroys a world handle and all world-local resources.
 ///
-/// `world_id` must identify a live world that belongs to `engine`. The ID is
-/// invalid after this call succeeds.
+/// This function has no effect if `world` is null.
 ///
 /// # Safety
 ///
-/// `engine` must point to a live [`Engine`] with exclusive access for this
-/// call. The caller must prevent concurrent use of the same engine.
+/// `world` must have been returned by `hynergy_engine_create_world`, and it
+/// must not have been destroyed previously. The caller must prevent concurrent
+/// access to this same world handle during destruction.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hynergy_engine_destroy_world(engine: *mut Engine, world_id: u32) -> u32 {
-    if engine.is_null() {
-        return WorldCode::NullEngine as u32;
-    }
-
-    let destruction = catch_unwind(AssertUnwindSafe(|| {
-        let engine = unsafe { &mut *engine };
-        engine.destroy_world(world_id)
-    }));
-
-    match destruction {
-        Ok(Ok(())) => WorldCode::Success as u32,
-
-        Ok(Err(WorldManagementError::UnknownWorld)) => WorldCode::UnknownWorld as u32,
-
-        Ok(Err(WorldManagementError::WorldIdExhausted)) => WorldCode::InternalPanic as u32,
-
-        Err(_) => WorldCode::InternalPanic as u32,
+pub unsafe extern "C" fn hynergy_world_destroy(world: *mut WorldHandle) {
+    if !world.is_null() {
+        unsafe {
+            drop(Box::from_raw(world));
+        }
     }
 }
 
@@ -418,7 +482,7 @@ pub unsafe extern "C" fn hynergy_engine_destroy_world(engine: *mut Engine, world
 pub enum CommandCode {
     Success = 0,
 
-    NullEngine = 1,
+    NullWorld = 1,
     NullInput = 2,
     NullResult = 3,
     InputTooLarge = 4,
@@ -432,8 +496,7 @@ pub enum CommandCode {
     InvalidCommandLength = 11,
     InvalidId = 12,
     TrailingBytes = 13,
-    UnknownWorld = 14,
-
+    // 14 is reserved; ABI 2 used it for an unknown engine-owned world.
     IdOutOfBound = 20,
     IdExceeds31Bit = 21,
     IdAlreadyAssigned = 22,
@@ -489,15 +552,14 @@ impl CommandResult {
 ///
 /// # Safety
 ///
-/// `engine` must point to a live [`Engine`] with exclusive access for this
-/// call. `input` must point to `input_len` readable bytes. `result` must point
-/// to writable storage for one [`CommandResult`]. The input, result, and
-/// engine storage must not overlap. The caller must prevent concurrent use of
-/// the same engine.
+/// `world` must point to a live [`WorldHandle`] with exclusive access for
+/// this call. `input` must point to `input_len` readable bytes. `result` must
+/// point to writable storage for one [`CommandResult`]. The input, result, and
+/// world storage must not overlap. The same world handle must not be used
+/// concurrently; distinct world handles may be used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_world_apply_commands(
-    engine: *mut Engine,
-    world_id: u32,
+    world: *mut WorldHandle,
     input: *const u8,
     input_len: u32,
     result: *mut CommandResult,
@@ -506,16 +568,21 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
         return CommandCode::NullResult as u32;
     }
 
-    let output = if engine.is_null() {
-        CommandResult::failure(CommandCode::NullEngine, u32::MAX, u32::MAX)
+    let output = if world.is_null() {
+        CommandResult::failure(CommandCode::NullWorld, u32::MAX, u32::MAX)
     } else if input.is_null() {
         CommandResult::failure(CommandCode::NullInput, u32::MAX, u32::MAX)
     } else {
         let application = catch_unwind(AssertUnwindSafe(|| {
-            let engine = unsafe { &mut *engine };
+            let world = unsafe { &mut *world };
             let input = unsafe { std::slice::from_raw_parts(input, input_len as usize) };
+            let definitions = world.definitions.snapshot();
 
-            hynergy_protocol::apply_world_command_buffer(engine, world_id, input)
+            hynergy_protocol::apply_world_command_buffer_to_world(
+                &mut world.world,
+                &definitions,
+                input,
+            )
         }));
 
         match application {
@@ -547,7 +614,7 @@ fn map_world_command_error(error: WorldCommandError) -> CommandResult {
         WorldCommandErrorKind::InvalidCommandLength => CommandCode::InvalidCommandLength,
         WorldCommandErrorKind::InvalidId => CommandCode::InvalidId,
         WorldCommandErrorKind::TrailingBytes => CommandCode::TrailingBytes,
-        WorldCommandErrorKind::UnknownWorld => CommandCode::UnknownWorld,
+        WorldCommandErrorKind::UnknownWorld => CommandCode::InternalPanic,
 
         WorldCommandErrorKind::IdOutOfBound => CommandCode::IdOutOfBound,
         WorldCommandErrorKind::IdExceeds31Bit => CommandCode::IdExceeds31Bit,
@@ -574,10 +641,10 @@ fn map_world_command_error(error: WorldCommandError) -> CommandResult {
 pub enum TickCode {
     Success = 0,
 
-    NullEngine = 1,
+    NullWorld = 1,
     NullResult = 2,
     NullOutput = 3,
-    UnknownWorld = 4,
+    // 4 is reserved; ABI 2 used it for an unknown engine-owned world.
     BufferTooSmall = 5,
 
     MissingParameter = 20,
@@ -633,7 +700,7 @@ impl TickResult {
 fn map_tick_error(error: EngineTickError, required_capacity: u32) -> TickResult {
     match error {
         EngineTickError::UnknownWorld => {
-            TickResult::failure(TickCode::UnknownWorld, required_capacity)
+            TickResult::failure(TickCode::InternalInvariant, required_capacity)
         }
 
         EngineTickError::MissingParameter { device, parameter } => TickResult {
@@ -705,16 +772,16 @@ fn map_tick_error(error: EngineTickError, required_capacity: u32) -> TickResult 
 ///
 /// # Safety
 ///
-/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
-/// access for this call. If `records` is not null, it must point to aligned,
-/// writable storage for `record_capacity` consecutive [`SubscriptionRecord`]
-/// values. If `result` is not null, it must point to aligned, writable storage
-/// for one [`TickResult`]. The records, result, and engine storage must not
-/// overlap. The caller must prevent concurrent use of the same engine.
+/// `world` must point to a live [`WorldHandle`] with exclusive access for
+/// this call. If `records` is not null, it must point to aligned, writable
+/// storage for `record_capacity` consecutive [`SubscriptionRecord`] values.
+/// If `result` is not null, it must point to aligned, writable storage for one
+/// [`TickResult`]. The records, result, and world storage must not overlap.
+/// The same world handle must not be used concurrently; distinct world handles
+/// may be used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_world_tick(
-    engine: *mut Engine,
-    world_id: u32,
+    world: *mut WorldHandle,
     records: *mut SubscriptionRecord,
     record_capacity: u32,
     result: *mut TickResult,
@@ -723,25 +790,14 @@ pub unsafe extern "C" fn hynergy_world_tick(
         return TickCode::NullResult as u32;
     }
 
-    let output = if engine.is_null() {
-        TickResult::failure(TickCode::NullEngine, 0)
+    let output = if world.is_null() {
+        TickResult::failure(TickCode::NullWorld, 0)
     } else {
         let execution = catch_unwind(AssertUnwindSafe(|| {
-            let engine = unsafe { &mut *engine };
+            let world = unsafe { &mut *world };
 
-            let required = match engine.subscription_count(world_id) {
-                Ok(required) => required,
-
-                Err(SubscriptionError::UnknownWorld) => {
-                    return TickResult::failure(TickCode::UnknownWorld, 0);
-                }
-
-                Err(_) => {
-                    return TickResult::failure(TickCode::InternalInvariant, 0);
-                }
-            };
-
-            let required = u32::try_from(required).expect("active subscription count must fit u32");
+            let required = u32::try_from(world.world.subscription_count())
+                .expect("active subscription count must fit u32");
 
             if record_capacity < required {
                 return TickResult::failure(TickCode::BufferTooSmall, required);
@@ -751,13 +807,13 @@ pub unsafe extern "C" fn hynergy_world_tick(
                 return TickResult::failure(TickCode::NullOutput, required);
             }
 
-            if let Err(error) = engine.tick_world(world_id) {
+            let definitions = world.definitions.snapshot();
+
+            if let Err(error) = world.world.tick(&definitions) {
                 return map_tick_error(error, required);
             }
 
-            let updates = engine
-                .subscription_updates(world_id)
-                .expect("world validated before successful tick");
+            let updates = world.world.subscription_updates();
 
             debug_assert!(updates.len() <= required as usize);
 
@@ -806,9 +862,9 @@ pub unsafe extern "C" fn hynergy_world_tick(
 pub enum SubscriptionCode {
     Success = 0,
 
-    NullEngine = 1,
+    NullWorld = 1,
     NullResult = 2,
-    UnknownWorld = 3,
+    // 3 is reserved; ABI 2 used it for an unknown engine-owned world.
     InvalidDeviceId = 4,
     InvalidSubscriptionId = 5,
 
@@ -845,7 +901,7 @@ impl SubscriptionCreationResult {
 
 fn map_subscription_error(error: SubscriptionError) -> SubscriptionCode {
     match error {
-        SubscriptionError::UnknownWorld => SubscriptionCode::UnknownWorld,
+        SubscriptionError::UnknownWorld => SubscriptionCode::InternalPanic,
         SubscriptionError::UnknownDevice { .. } => SubscriptionCode::UnknownDevice,
         SubscriptionError::UnknownObserver { .. } => SubscriptionCode::UnknownObserver,
         SubscriptionError::IdExhausted => SubscriptionCode::IdExhausted,
@@ -883,15 +939,14 @@ pub struct SubscriptionRecord {
 ///
 /// # Safety
 ///
-/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
-/// access for this call. If `result` is not null, it must point to aligned,
-/// writable storage for one [`SubscriptionCreationResult`]. The result and
-/// engine storage must not overlap. The caller must prevent concurrent use
-/// of the same engine.
+/// `world` must point to a live [`WorldHandle`] with exclusive access for
+/// this call. If `result` is not null, it must point to aligned, writable
+/// storage for one [`SubscriptionCreationResult`]. The result and world
+/// storage must not overlap. The same world handle must not be used
+/// concurrently; distinct world handles may be used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_world_subscribe_observer(
-    engine: *mut Engine,
-    world_id: u32,
+    world: *mut WorldHandle,
     device_id: u32,
     observer_id: u32,
     result: *mut SubscriptionCreationResult,
@@ -900,8 +955,8 @@ pub unsafe extern "C" fn hynergy_world_subscribe_observer(
         return SubscriptionCode::NullResult as u32;
     }
 
-    let output = if engine.is_null() {
-        SubscriptionCreationResult::failure(SubscriptionCode::NullEngine)
+    let output = if world.is_null() {
+        SubscriptionCreationResult::failure(SubscriptionCode::NullWorld)
     } else {
         let Ok(device) = DeviceId::try_from(device_id) else {
             let output = SubscriptionCreationResult::failure(SubscriptionCode::InvalidDeviceId);
@@ -918,9 +973,12 @@ pub unsafe extern "C" fn hynergy_world_subscribe_observer(
         let observer = DefinitionObserverId::new(observer_id);
 
         let subscription = catch_unwind(AssertUnwindSafe(|| {
-            let engine = unsafe { &mut *engine };
+            let world = unsafe { &mut *world };
+            let definitions = world.definitions.snapshot();
 
-            engine.subscribe_observer(world_id, device, observer)
+            world
+                .world
+                .subscribe_observer(&definitions, device, observer)
         }));
 
         match subscription {
@@ -949,17 +1007,16 @@ pub unsafe extern "C" fn hynergy_world_subscribe_observer(
 ///
 /// # Safety
 ///
-/// If `engine` is not null, it must point to a live [`Engine`] with exclusive
-/// access for this call. The caller must prevent concurrent use of the same
-/// engine.
+/// `world` must point to a live [`WorldHandle`] with exclusive access for
+/// this call. The same world handle must not be used concurrently; distinct
+/// world handles may be used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_world_unsubscribe(
-    engine: *mut Engine,
-    world_id: u32,
+    world: *mut WorldHandle,
     subscription_id: u32,
 ) -> u32 {
-    if engine.is_null() {
-        return SubscriptionCode::NullEngine as u32;
+    if world.is_null() {
+        return SubscriptionCode::NullWorld as u32;
     }
 
     let Ok(subscription) = SubscriptionId::try_from(subscription_id) else {
@@ -967,9 +1024,9 @@ pub unsafe extern "C" fn hynergy_world_unsubscribe(
     };
 
     let removal = catch_unwind(AssertUnwindSafe(|| {
-        let engine = unsafe { &mut *engine };
+        let world = unsafe { &mut *world };
 
-        engine.unsubscribe(world_id, subscription)
+        world.world.unsubscribe(subscription)
     }));
 
     match removal {
@@ -986,6 +1043,47 @@ mod tests {
     use super::*;
     use hynergy_model::device::definition::{DefinitionId, PrimitiveElementKind};
     use std::mem::{align_of, offset_of, size_of};
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    unsafe fn hynergy_world_apply_commands(
+        _engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        input: *const u8,
+        input_len: u32,
+        result: *mut CommandResult,
+    ) -> u32 {
+        unsafe { super::hynergy_world_apply_commands(world, input, input_len, result) }
+    }
+
+    unsafe fn hynergy_world_tick(
+        _engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        records: *mut SubscriptionRecord,
+        record_capacity: u32,
+        result: *mut TickResult,
+    ) -> u32 {
+        unsafe { super::hynergy_world_tick(world, records, record_capacity, result) }
+    }
+
+    unsafe fn hynergy_world_subscribe_observer(
+        _engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        device_id: u32,
+        observer_id: u32,
+        result: *mut SubscriptionCreationResult,
+    ) -> u32 {
+        unsafe { super::hynergy_world_subscribe_observer(world, device_id, observer_id, result) }
+    }
+
+    unsafe fn hynergy_world_unsubscribe(
+        _engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        subscription_id: u32,
+    ) -> u32 {
+        unsafe { super::hynergy_world_unsubscribe(world, subscription_id) }
+    }
 
     fn definition_buffer() -> Vec<u8> {
         definition_buffer_with_commands(&[])
@@ -1044,7 +1142,12 @@ mod tests {
         }
     }
 
-    fn subscribe_observer(engine: *mut Engine, world: u32, device: u32, observer: u32) -> u32 {
+    fn subscribe_observer(
+        engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        device: u32,
+        observer: u32,
+    ) -> u32 {
         let mut result = subscription_result_sentinel();
 
         assert_eq!(
@@ -1559,8 +1662,14 @@ mod tests {
     fn world_result_sentinel() -> WorldCreationResult {
         WorldCreationResult {
             code: 0xaaaa_aaaa,
-            world_id: 0xbbbb_bbbb,
+            reserved: 0xbbbb_bbbb,
+            world: 0xcccc_ccccusize as *mut WorldHandle,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestWorldCreationResult {
+        world_id: *mut WorldHandle,
     }
 
     fn command_result_sentinel() -> CommandResult {
@@ -1573,7 +1682,7 @@ mod tests {
     }
 
     fn register(
-        engine: *mut Engine,
+        engine: *mut EngineHandle,
         bytes: &[u8],
         result: *mut DefinitionRegistrationResult,
     ) -> u32 {
@@ -1582,7 +1691,7 @@ mod tests {
         }
     }
 
-    fn create_world(engine: *mut Engine) -> WorldCreationResult {
+    fn create_world(engine: *mut EngineHandle) -> TestWorldCreationResult {
         let mut result = world_result_sentinel();
 
         assert_eq!(
@@ -1590,10 +1699,19 @@ mod tests {
             WorldCode::Success as u32
         );
 
-        result
+        assert!(!result.world.is_null());
+
+        TestWorldCreationResult {
+            world_id: result.world,
+        }
     }
 
-    fn apply(engine: *mut Engine, world: u32, bytes: &[u8], result: *mut CommandResult) -> u32 {
+    fn apply(
+        engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        bytes: &[u8],
+        result: *mut CommandResult,
+    ) -> u32 {
         unsafe {
             hynergy_world_apply_commands(engine, world, bytes.as_ptr(), bytes.len() as u32, result)
         }
@@ -1628,7 +1746,7 @@ mod tests {
         }
     }
 
-    fn register_observed_conductance(engine: *mut Engine) -> u32 {
+    fn register_observed_conductance(engine: *mut EngineHandle) -> u32 {
         const ADD_TERMINAL: u16 = 1;
         const ADD_ELEMENT: u16 = 4;
         const ADD_VOLTAGE_OBSERVER: u16 = 5;
@@ -1661,7 +1779,10 @@ mod tests {
         result.definition_id
     }
 
-    fn create_observed_voltage_world(engine: *mut Engine, voltage: f64) -> (u32, u32, u32) {
+    fn create_observed_voltage_world(
+        engine: *mut EngineHandle,
+        voltage: f64,
+    ) -> (*mut WorldHandle, u32, u32) {
         const ADD_WIRE: u16 = 1;
         const ADD_DEVICE: u16 = 5;
         const ATTACH_TERMINAL: u16 = 7;
@@ -1725,7 +1846,11 @@ mod tests {
         (world, OBSERVED_DEVICE, SOURCE_DEVICE)
     }
 
-    fn subscribe_first_observer(engine: *mut Engine, world: u32, device: u32) -> u32 {
+    fn subscribe_first_observer(
+        engine: *mut EngineHandle,
+        world: *mut WorldHandle,
+        device: u32,
+    ) -> u32 {
         let mut result = subscription_result_sentinel();
 
         assert_eq!(
@@ -1747,42 +1872,41 @@ mod tests {
 
         let _: extern "C" fn() -> u32 = hynergy_abi_revision;
 
-        let _: extern "C" fn(u32) -> *mut Engine = hynergy_engine_create;
+        let _: extern "C" fn(u32) -> *mut EngineHandle = hynergy_engine_create;
 
-        let _: unsafe extern "C" fn(*mut Engine) = hynergy_engine_destroy;
+        let _: unsafe extern "C" fn(*mut EngineHandle) = hynergy_engine_destroy;
 
         let _: unsafe extern "C" fn(
-            *mut Engine,
+            *mut EngineHandle,
             *const u8,
             u32,
             *mut DefinitionRegistrationResult,
         ) -> u32 = hynergy_engine_register_definition;
 
-        let _: unsafe extern "C" fn(*mut Engine, u32, *mut WorldCreationResult) -> u32 =
+        let _: unsafe extern "C" fn(*mut EngineHandle, u32, *mut WorldCreationResult) -> u32 =
             hynergy_engine_create_world;
 
-        let _: unsafe extern "C" fn(*mut Engine, u32) -> u32 = hynergy_engine_destroy_world;
+        let _: unsafe extern "C" fn(*mut WorldHandle) = hynergy_world_destroy;
 
-        let _: unsafe extern "C" fn(*mut Engine, u32, *const u8, u32, *mut CommandResult) -> u32 =
-            hynergy_world_apply_commands;
+        let _: unsafe extern "C" fn(*mut WorldHandle, *const u8, u32, *mut CommandResult) -> u32 =
+            super::hynergy_world_apply_commands;
 
         let _: unsafe extern "C" fn(
-            *mut Engine,
-            u32,
+            *mut WorldHandle,
             *mut SubscriptionRecord,
             u32,
             *mut TickResult,
-        ) -> u32 = hynergy_world_tick;
+        ) -> u32 = super::hynergy_world_tick;
 
         let _: unsafe extern "C" fn(
-            *mut Engine,
-            u32,
+            *mut WorldHandle,
             u32,
             u32,
             *mut SubscriptionCreationResult,
-        ) -> u32 = hynergy_world_subscribe_observer;
+        ) -> u32 = super::hynergy_world_subscribe_observer;
 
-        let _: unsafe extern "C" fn(*mut Engine, u32, u32) -> u32 = hynergy_world_unsubscribe;
+        let _: unsafe extern "C" fn(*mut WorldHandle, u32) -> u32 =
+            super::hynergy_world_unsubscribe;
     }
 
     #[test]
@@ -1885,8 +2009,6 @@ mod tests {
             Success = 0,
             NullEngine = 1,
             NullResult = 2,
-            UnknownWorld = 3,
-            WorldIdExhausted = 4,
             InvalidTickFrequency = 5,
             InternalPanic = u32::MAX,
         });
@@ -1894,7 +2016,7 @@ mod tests {
         assert_codes!(CommandCode {
             Success = 0,
 
-            NullEngine = 1,
+            NullWorld = 1,
             NullInput = 2,
             NullResult = 3,
             InputTooLarge = 4,
@@ -1908,7 +2030,6 @@ mod tests {
             InvalidCommandLength = 11,
             InvalidId = 12,
             TrailingBytes = 13,
-            UnknownWorld = 14,
 
             IdOutOfBound = 20,
             IdExceeds31Bit = 21,
@@ -1929,9 +2050,8 @@ mod tests {
         assert_codes!(SubscriptionCode {
             Success = 0,
 
-            NullEngine = 1,
+            NullWorld = 1,
             NullResult = 2,
-            UnknownWorld = 3,
             InvalidDeviceId = 4,
             InvalidSubscriptionId = 5,
 
@@ -1951,10 +2071,9 @@ mod tests {
         assert_codes!(TickCode {
             Success = 0,
 
-            NullEngine = 1,
+            NullWorld = 1,
             NullResult = 2,
             NullOutput = 3,
-            UnknownWorld = 4,
             BufferTooSmall = 5,
 
             MissingParameter = 20,
@@ -1987,10 +2106,17 @@ mod tests {
     }
     #[test]
     fn world_creation_result_layout_is_stable() {
-        assert_eq!(size_of::<WorldCreationResult>(), 8);
-        assert_eq!(align_of::<WorldCreationResult>(), align_of::<u32>(),);
+        assert_eq!(
+            size_of::<WorldCreationResult>(),
+            8 + size_of::<*mut WorldHandle>(),
+        );
+        assert_eq!(
+            align_of::<WorldCreationResult>(),
+            align_of::<*mut WorldHandle>(),
+        );
         assert_eq!(offset_of!(WorldCreationResult, code), 0,);
-        assert_eq!(offset_of!(WorldCreationResult, world_id), 4,);
+        assert_eq!(offset_of!(WorldCreationResult, reserved), 4,);
+        assert_eq!(offset_of!(WorldCreationResult, world), 8,);
     }
 
     #[test]
@@ -2006,7 +2132,7 @@ mod tests {
     #[test]
     fn abi_version_and_revision_are_stable() {
         assert_eq!(hynergy_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 2);
+        assert_eq!(ABI_VERSION, 3);
 
         assert_eq!(hynergy_abi_revision(), ABI_REVISION);
         assert_eq!(ABI_REVISION, 0);
@@ -2743,9 +2869,10 @@ mod tests {
 
         let result = create_world(engine);
 
-        assert_eq!(result.world_id, 0);
+        assert!(!result.world_id.is_null());
 
         unsafe {
+            hynergy_world_destroy(result.world_id);
             hynergy_engine_destroy(engine);
         }
     }
@@ -2761,7 +2888,8 @@ mod tests {
             result,
             WorldCreationResult {
                 code: WorldCode::NullEngine as u32,
-                world_id: u32::MAX,
+                reserved: 0,
+                world: std::ptr::null_mut(),
             }
         );
     }
@@ -2770,36 +2898,43 @@ mod tests {
     fn world_lifecycle_is_exposed_through_ffi() {
         let engine = hynergy_engine_create(1);
 
-        let first = create_world(engine);
-        let second = create_world(engine);
+        let first = create_world(engine).world_id;
+        let second = create_world(engine).world_id;
 
-        assert_eq!(first.world_id, 0);
-        assert_eq!(second.world_id, 1);
-
-        assert_eq!(
-            unsafe { hynergy_engine_destroy_world(engine, first.world_id) },
-            WorldCode::Success as u32
-        );
-
-        assert_eq!(
-            unsafe { hynergy_engine_destroy_world(engine, first.world_id) },
-            WorldCode::UnknownWorld as u32
-        );
-
-        let third = create_world(engine);
-        assert_eq!(third.world_id, 2);
+        assert!(!first.is_null());
+        assert!(!second.is_null());
+        assert_ne!(first, second);
 
         unsafe {
             hynergy_engine_destroy(engine);
         }
+
+        let mut first_result = tick_result_sentinel();
+        let mut second_result = tick_result_sentinel();
+
+        assert_eq!(
+            unsafe { super::hynergy_world_tick(first, std::ptr::null_mut(), 0, &mut first_result) },
+            TickCode::Success as u32
+        );
+
+        assert_eq!(
+            unsafe {
+                super::hynergy_world_tick(second, std::ptr::null_mut(), 0, &mut second_result)
+            },
+            TickCode::Success as u32
+        );
+
+        unsafe {
+            hynergy_world_destroy(first);
+            hynergy_world_destroy(second);
+        }
     }
 
     #[test]
-    fn destroy_world_reports_null_engine() {
-        assert_eq!(
-            unsafe { hynergy_engine_destroy_world(std::ptr::null_mut(), 0,) },
-            WorldCode::NullEngine as u32
-        );
+    fn world_destroy_accepts_null_world() {
+        unsafe {
+            hynergy_world_destroy(std::ptr::null_mut());
+        }
     }
 
     #[test]
@@ -2827,17 +2962,22 @@ mod tests {
     }
 
     #[test]
-    fn apply_commands_reports_null_engine() {
+    fn apply_commands_reports_null_world() {
         let bytes = world_buffer(&[]);
         let mut result = command_result_sentinel();
 
-        let code = apply(std::ptr::null_mut(), 0, &bytes, &mut result);
+        let code = apply(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &bytes,
+            &mut result,
+        );
 
-        assert_eq!(code, CommandCode::NullEngine as u32);
+        assert_eq!(code, CommandCode::NullWorld as u32);
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::NullEngine as u32,
+                code: CommandCode::NullWorld as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 reserved: 0,
@@ -2964,25 +3104,220 @@ mod tests {
     }
 
     #[test]
-    fn unknown_world_is_mapped_through_ffi() {
+    fn distinct_world_handles_are_independent() {
         let engine = hynergy_engine_create(1);
-        let bytes = world_buffer(&[]);
-        let mut result = command_result_sentinel();
+        let first = create_world(engine).world_id;
+        let second = create_world(engine).world_id;
+        let bytes = world_buffer(&[world_command(1, &u32_payload(&[1]))]);
+        let mut first_result = command_result_sentinel();
+        let mut second_result = command_result_sentinel();
 
-        let code = apply(engine, 42, &bytes, &mut result);
-
-        assert_eq!(code, CommandCode::UnknownWorld as u32);
         assert_eq!(
-            result,
-            CommandResult {
-                code: CommandCode::UnknownWorld as u32,
-                command_index: u32::MAX,
-                byte_offset: u32::MAX,
-                reserved: 0,
-            }
+            apply(engine, first, &bytes, &mut first_result),
+            CommandCode::Success as u32
+        );
+        assert_eq!(
+            apply(engine, second, &bytes, &mut second_result),
+            CommandCode::Success as u32
         );
 
         unsafe {
+            hynergy_world_destroy(first);
+            hynergy_world_destroy(second);
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn distinct_world_handles_tick_concurrently() {
+        assert_send::<WorldHandle>();
+
+        let engine = hynergy_engine_create(1);
+        let first = create_world(engine).world_id;
+        let second = create_world(engine).world_id;
+
+        unsafe {
+            super::hynergy_engine_destroy(engine);
+        }
+
+        let first = unsafe { Box::from_raw(first) };
+        let second = unsafe { Box::from_raw(second) };
+
+        let first_thread = std::thread::spawn(move || {
+            let mut world = first;
+            let world_ptr = &mut *world as *mut WorldHandle;
+
+            for _ in 0..64 {
+                let mut result = tick_result_sentinel();
+
+                assert_eq!(
+                    unsafe {
+                        super::hynergy_world_tick(world_ptr, std::ptr::null_mut(), 0, &mut result)
+                    },
+                    TickCode::Success as u32
+                );
+            }
+
+            world
+        });
+
+        let second_thread = std::thread::spawn(move || {
+            let mut world = second;
+            let world_ptr = &mut *world as *mut WorldHandle;
+
+            for _ in 0..64 {
+                let mut result = tick_result_sentinel();
+
+                assert_eq!(
+                    unsafe {
+                        super::hynergy_world_tick(world_ptr, std::ptr::null_mut(), 0, &mut result)
+                    },
+                    TickCode::Success as u32
+                );
+            }
+
+            world
+        });
+
+        drop(first_thread.join().unwrap());
+        drop(second_thread.join().unwrap());
+    }
+    #[test]
+    fn ffi_handle_thread_traits_match_the_concurrency_contract() {
+        assert_send::<WorldHandle>();
+        assert_sync::<EngineHandle>();
+    }
+
+    #[test]
+    fn definition_registration_can_publish_while_world_ticks() {
+        let engine = hynergy_engine_create(1);
+        let world = create_world(engine).world_id;
+        let world_address = world as usize;
+
+        let tick_thread = std::thread::spawn(move || {
+            let world = world_address as *mut WorldHandle;
+
+            for _ in 0..64 {
+                let mut result = tick_result_sentinel();
+
+                assert_eq!(
+                    unsafe {
+                        super::hynergy_world_tick(world, std::ptr::null_mut(), 0, &mut result)
+                    },
+                    TickCode::Success as u32
+                );
+            }
+        });
+
+        let bytes = definition_buffer();
+
+        for _ in 0..16 {
+            let mut result = definition_result_sentinel();
+
+            assert_eq!(
+                register(engine, &bytes, &mut result),
+                DefinitionRegistrationCode::Success as u32
+            );
+        }
+
+        tick_thread.join().unwrap();
+
+        unsafe {
+            hynergy_world_destroy(world);
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn definition_registration_is_thread_safe_on_one_engine() {
+        assert_sync::<EngineHandle>();
+
+        let engine = hynergy_engine_create(1);
+        let engine_ref = unsafe { &*engine };
+        let bytes = definition_buffer();
+
+        let (mut first_ids, second_ids) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let mut ids = Vec::with_capacity(16);
+
+                for _ in 0..16 {
+                    let mut result = definition_result_sentinel();
+                    let engine = engine_ref as *const EngineHandle as *mut EngineHandle;
+
+                    assert_eq!(
+                        register(engine, &bytes, &mut result),
+                        DefinitionRegistrationCode::Success as u32,
+                    );
+
+                    ids.push(result.definition_id);
+                }
+
+                ids
+            });
+
+            let second = scope.spawn(|| {
+                let mut ids = Vec::with_capacity(16);
+
+                for _ in 0..16 {
+                    let mut result = definition_result_sentinel();
+                    let engine = engine_ref as *const EngineHandle as *mut EngineHandle;
+
+                    assert_eq!(
+                        register(engine, &bytes, &mut result),
+                        DefinitionRegistrationCode::Success as u32,
+                    );
+
+                    ids.push(result.definition_id);
+                }
+
+                ids
+            });
+
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        first_ids.extend(second_ids);
+        first_ids.sort_unstable();
+
+        let expected_start = Engine::COMPOSITE_DEFINITION_ID_BASE;
+        let expected: Vec<u32> =
+            (expected_start..expected_start + u32::try_from(first_ids.len()).unwrap()).collect();
+
+        assert_eq!(first_ids, expected);
+
+        unsafe {
+            hynergy_engine_destroy(engine);
+        }
+    }
+
+    #[test]
+    fn existing_world_sees_definition_registered_after_creation() {
+        const ADD_DEVICE: u16 = 5;
+        const DEVICE: u32 = 1;
+
+        let engine = hynergy_engine_create(1);
+        let world = create_world(engine).world_id;
+
+        let mut registration = definition_result_sentinel();
+
+        assert_eq!(
+            register(engine, &definition_buffer(), &mut registration),
+            DefinitionRegistrationCode::Success as u32,
+        );
+
+        let commands = world_buffer(&[world_command(
+            ADD_DEVICE,
+            &u32_payload(&[DEVICE, registration.definition_id]),
+        )]);
+        let mut result = command_result_sentinel();
+
+        assert_eq!(
+            apply(engine, world, &commands, &mut result),
+            CommandCode::Success as u32,
+        );
+
+        unsafe {
+            super::hynergy_world_destroy(world);
             hynergy_engine_destroy(engine);
         }
     }

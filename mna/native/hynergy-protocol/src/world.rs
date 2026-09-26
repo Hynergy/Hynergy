@@ -1,6 +1,7 @@
 use crate::decoder::{Decoder, Truncated};
-use hynergy_engine::{Engine, WorldCommand, WorldCommandApplyError};
+use hynergy_engine::{Engine, World, WorldCommand, WorldCommandApplyError};
 use hynergy_model::device::definition::{DefinitionId, DeviceId, TerminalId};
+use hynergy_model::device::registry::DefinitionRegistry;
 use hynergy_model::network::{NetworkModelError, WireId};
 use hynergy_model::parameter::ParameterId;
 
@@ -98,6 +99,31 @@ pub fn apply_world_command_buffer(
     world_id: u32,
     input: &[u8],
 ) -> Result<(), WorldCommandError> {
+    let world_exists = engine.contains_world(world_id);
+
+    apply_world_command_buffer_inner(input, world_exists, |command| {
+        engine.apply_world_command(world_id, command)
+    })
+}
+
+pub fn apply_world_command_buffer_to_world(
+    world: &mut World,
+    definitions: &DefinitionRegistry,
+    input: &[u8],
+) -> Result<(), WorldCommandError> {
+    apply_world_command_buffer_inner(input, true, |command| {
+        world.apply_command(definitions, command)
+    })
+}
+
+fn apply_world_command_buffer_inner<F>(
+    input: &[u8],
+    world_exists: bool,
+    mut apply: F,
+) -> Result<(), WorldCommandError>
+where
+    F: FnMut(WorldCommand) -> Result<(), WorldCommandApplyError>,
+{
     let mut decoder = Decoder::new(input, 0);
 
     let magic_offset = decoder.offset();
@@ -140,7 +166,7 @@ pub fn apply_world_command_buffer(
 
     debug_assert_eq!(decoder.offset(), WORLD_COMMAND_HEADER_LENGTH);
 
-    if !engine.contains_world(world_id) {
+    if !world_exists {
         return Err(WorldCommandError::world(
             WorldCommandErrorKind::UnknownWorld,
         ));
@@ -190,7 +216,7 @@ pub fn apply_world_command_buffer(
             ));
         }
 
-        if let Err(error) = engine.apply_world_command(world_id, command) {
+        if let Err(error) = apply(command) {
             return Err(map_world_apply_error(error, command_index, command_offset));
         }
     }
