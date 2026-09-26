@@ -33,13 +33,13 @@ public final class ElectricalEngine implements AutoCloseable {
         }
 
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment result =
-                    arena.allocate(NativeLayouts.WORLD_CREATION_RESULT);
+            MemorySegment worldResult =
+                    arena.allocate(ValueLayout.ADDRESS);
 
             int code = NativeBindings.createWorld(
                     requireOpen(),
                     tickFrequencyHz,
-                    result
+                    worldResult
             );
 
             switch (code) {
@@ -63,9 +63,9 @@ public final class ElectricalEngine implements AutoCloseable {
                 );
             }
 
-            MemorySegment worldHandle = result.get(
+            MemorySegment worldHandle = worldResult.get(
                     ValueLayout.ADDRESS,
-                    NativeLayouts.WORLD_CREATION_WORLD_OFFSET
+                    0
             );
 
             if (worldHandle.equals(MemorySegment.NULL)) {
