@@ -5,7 +5,7 @@ do not depend on Criterion.
 
 ## Quick start
 
-Run these commands from `mna/native` (the runner also works when invoked from another directory):
+Run these commands from `..` (the runner also works when invoked from another directory):
 
 ```bash
 ./scripts/bench-linux.sh check
@@ -128,7 +128,8 @@ cargo test -p hynergy-benchmarks --test circuit_fixtures
 The tests verify circuit construction, dirty mutations, topology changes, subscriptions, digital truth tables,
 registered arithmetic, workload sizes, and the complete CPU program.
 
-The complete runner regression test does not execute real benchmarks; it uses mock commands to validate argument routing,
+The complete runner regression test does not execute real benchmarks; it uses mock commands to validate argument
+routing,
 baseline promotion, compatibility aliases, and profiling options:
 
 ```bash
@@ -151,7 +152,7 @@ an overflow-to-zero ADD and a taken conditional branch.
 Solver profiling is feature-gated and is not enabled by the normal Criterion runner. This keeps profiling counters and
 per-iteration trace storage out of ordinary benchmark builds.
 
-Run the CPU convergence diagnostic from `mna/native`:
+Run the CPU convergence diagnostic from `..`:
 
 ```bash
 cargo run --release -p hynergy-benchmarks \
