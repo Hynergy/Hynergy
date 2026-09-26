@@ -4,7 +4,7 @@ import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.ValueLayout;
 
 public final class NativeLayouts {
-    static final int REQUIRED_ABI_VERSION = 4;
+    static final int REQUIRED_ABI_VERSION = 5;
     static final int REQUIRED_ABI_REVISION = 0;
 
     public static final int WORLD_SUCCESS = 0;

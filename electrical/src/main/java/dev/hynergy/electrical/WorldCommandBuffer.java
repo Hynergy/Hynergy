@@ -52,6 +52,7 @@ final class WorldCommandBuffer implements AutoCloseable {
         }
 
         arena = Arena.ofConfined();
+
         try {
             segment = arena.allocate(initialCapacity, BUFFER_ALIGNMENT);
         } catch (Throwable throwable) {
@@ -62,6 +63,7 @@ final class WorldCommandBuffer implements AutoCloseable {
         capacity = initialCapacity;
         position = HEADER_SIZE;
         commandCount = 0;
+
         initializeHeader(segment);
     }
 
