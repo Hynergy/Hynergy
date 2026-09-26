@@ -14,7 +14,7 @@ use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, RwLock};
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 pub const ABI_REVISION: u32 = 0;
 
 #[derive(Clone)]
@@ -844,29 +844,6 @@ pub enum SubscriptionCode {
     InternalPanic = u32::MAX,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubscriptionCreationResult {
-    pub code: u32,
-    pub subscription_id: u32,
-}
-
-impl SubscriptionCreationResult {
-    const fn success(subscription_id: u32) -> Self {
-        Self {
-            code: SubscriptionCode::Success as u32,
-            subscription_id,
-        }
-    }
-
-    const fn failure(code: SubscriptionCode) -> Self {
-        Self {
-            code: code as u32,
-            subscription_id: u32::MAX,
-        }
-    }
-}
-
 fn map_subscription_error(error: SubscriptionError) -> SubscriptionCode {
     match error {
         SubscriptionError::UnknownWorld => SubscriptionCode::InternalPanic,
@@ -917,54 +894,48 @@ pub unsafe extern "C" fn hynergy_world_subscribe_observer(
     world: *mut WorldHandle,
     device_id: u32,
     observer_id: u32,
-    result: *mut SubscriptionCreationResult,
+    subscription_id: *mut u32,
 ) -> u32 {
-    if result.is_null() {
+    if subscription_id.is_null() {
         return SubscriptionCode::NullResult as u32;
     }
 
-    let output = if world.is_null() {
-        SubscriptionCreationResult::failure(SubscriptionCode::NullWorld)
-    } else {
-        let Ok(device) = DeviceId::try_from(device_id) else {
-            let output = SubscriptionCreationResult::failure(SubscriptionCode::InvalidDeviceId);
-
-            let code = output.code;
-
-            unsafe {
-                result.write(output);
-            }
-
-            return code;
-        };
-
-        let observer = DefinitionObserverId::new(observer_id);
-
-        let subscription = catch_unwind(AssertUnwindSafe(|| {
-            let world = unsafe { &mut *world };
-            let definitions = world.definitions.snapshot();
-
-            world
-                .world
-                .subscribe_observer(&definitions, device, observer)
-        }));
-
-        match subscription {
-            Ok(Ok(subscription)) => SubscriptionCreationResult::success(subscription.get()),
-
-            Ok(Err(error)) => SubscriptionCreationResult::failure(map_subscription_error(error)),
-
-            Err(_) => SubscriptionCreationResult::failure(SubscriptionCode::InternalPanic),
-        }
-    };
-
-    let code = output.code;
-
     unsafe {
-        result.write(output);
+        subscription_id.write(0);
     }
 
-    code
+    if world.is_null() {
+        return SubscriptionCode::NullWorld as u32;
+    }
+
+    let Ok(device) = DeviceId::try_from(device_id) else {
+        return SubscriptionCode::InvalidDeviceId as u32;
+    };
+
+    let observer = DefinitionObserverId::new(observer_id);
+
+    let subscription = catch_unwind(AssertUnwindSafe(|| {
+        let world = unsafe { &mut *world };
+        let definitions = world.definitions.snapshot();
+
+        world
+            .world
+            .subscribe_observer(&definitions, device, observer)
+    }));
+
+    match subscription {
+        Ok(Ok(subscription)) => {
+            unsafe {
+                subscription_id.write(subscription.get());
+            }
+
+            SubscriptionCode::Success as u32
+        }
+
+        Ok(Err(error)) => map_subscription_error(error) as u32,
+
+        Err(_) => SubscriptionCode::InternalPanic as u32,
+    }
 }
 
 /// Removes a subscription from a world.
@@ -1040,9 +1011,11 @@ mod tests {
         world: *mut WorldHandle,
         device_id: u32,
         observer_id: u32,
-        result: *mut SubscriptionCreationResult,
+        subscription_id: *mut u32,
     ) -> u32 {
-        unsafe { super::hynergy_world_subscribe_observer(world, device_id, observer_id, result) }
+        unsafe {
+            super::hynergy_world_subscribe_observer(world, device_id, observer_id, subscription_id)
+        }
     }
 
     unsafe fn hynergy_world_unsubscribe(
@@ -1103,11 +1076,8 @@ mod tests {
         bytes
     }
 
-    fn subscription_result_sentinel() -> SubscriptionCreationResult {
-        SubscriptionCreationResult {
-            code: 0xaaaa_aaaa,
-            subscription_id: 0xbbbb_bbbb,
-        }
+    fn subscription_result_sentinel() -> u32 {
+        0xbbbb_bbbb
     }
 
     fn subscribe_observer(
@@ -1116,16 +1086,22 @@ mod tests {
         device: u32,
         observer: u32,
     ) -> u32 {
-        let mut result = subscription_result_sentinel();
+        let mut subscription_id = subscription_result_sentinel();
 
         assert_eq!(
             unsafe {
-                hynergy_world_subscribe_observer(engine, world, device, observer, &mut result)
+                hynergy_world_subscribe_observer(
+                    engine,
+                    world,
+                    device,
+                    observer,
+                    &mut subscription_id,
+                )
             },
             SubscriptionCode::Success as u32,
         );
 
-        result.subscription_id
+        subscription_id
     }
 
     fn assert_close(actual: f64, expected: f64) {
@@ -1812,16 +1788,14 @@ mod tests {
         let mut result = subscription_result_sentinel();
 
         assert_eq!(
-            unsafe { hynergy_world_subscribe_observer(engine, world, device, 0, &mut result,) },
+            unsafe { hynergy_world_subscribe_observer(engine, world, device, 0, &mut result) },
             SubscriptionCode::Success as u32,
         );
 
-        assert_eq!(result.code, SubscriptionCode::Success as u32,);
+        assert_ne!(result, 0);
+        assert_ne!(result, u32::MAX);
 
-        assert_ne!(result.subscription_id, 0);
-        assert_ne!(result.subscription_id, u32::MAX);
-
-        result.subscription_id
+        result
     }
 
     #[test]
@@ -1856,26 +1830,11 @@ mod tests {
             *mut TickResult,
         ) -> u32 = super::hynergy_world_tick;
 
-        let _: unsafe extern "C" fn(
-            *mut WorldHandle,
-            u32,
-            u32,
-            *mut SubscriptionCreationResult,
-        ) -> u32 = super::hynergy_world_subscribe_observer;
+        let _: unsafe extern "C" fn(*mut WorldHandle, u32, u32, *mut u32) -> u32 =
+            super::hynergy_world_subscribe_observer;
 
         let _: unsafe extern "C" fn(*mut WorldHandle, u32) -> u32 =
             super::hynergy_world_unsubscribe;
-    }
-
-    #[test]
-    fn subscription_creation_result_layout_is_stable() {
-        assert_eq!(size_of::<SubscriptionCreationResult>(), 8,);
-
-        assert_eq!(align_of::<SubscriptionCreationResult>(), align_of::<u32>(),);
-
-        assert_eq!(offset_of!(SubscriptionCreationResult, code), 0,);
-
-        assert_eq!(offset_of!(SubscriptionCreationResult, subscription_id), 4,);
     }
 
     #[test]
@@ -2076,7 +2035,7 @@ mod tests {
     #[test]
     fn abi_version_and_revision_are_stable() {
         assert_eq!(hynergy_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 4);
+        assert_eq!(ABI_VERSION, 5);
 
         assert_eq!(hynergy_abi_revision(), ABI_REVISION);
         assert_eq!(ABI_REVISION, 0);
@@ -2174,22 +2133,6 @@ mod tests {
                 device_id: u32::MAX,
                 parameter_id: u32::MAX,
                 iterations: u32::MAX,
-            },
-        );
-
-        assert_eq!(
-            SubscriptionCreationResult::success(9),
-            SubscriptionCreationResult {
-                code: SubscriptionCode::Success as u32,
-                subscription_id: 9,
-            },
-        );
-
-        assert_eq!(
-            SubscriptionCreationResult::failure(SubscriptionCode::UnknownDevice),
-            SubscriptionCreationResult {
-                code: SubscriptionCode::UnknownDevice as u32,
-                subscription_id: u32::MAX,
             },
         );
     }
@@ -2311,13 +2254,7 @@ mod tests {
             SubscriptionCode::NullWorld as u32,
         );
 
-        assert_eq!(
-            subscription,
-            SubscriptionCreationResult {
-                code: SubscriptionCode::NullWorld as u32,
-                subscription_id: u32::MAX,
-            },
-        );
+        assert_eq!(subscription, u32::MAX);
 
         assert_eq!(
             unsafe { super::hynergy_world_unsubscribe(std::ptr::null_mut(), 1) },
@@ -2384,7 +2321,6 @@ mod tests {
     #[test]
     fn observer_subscription_lifecycle_is_exposed_through_ffi() {
         let engine = hynergy_engine_create(1);
-
         let (world, observed, _) = create_observed_voltage_world(engine, 5.0);
 
         let mut first = subscription_result_sentinel();
@@ -2394,26 +2330,24 @@ mod tests {
             SubscriptionCode::Success as u32,
         );
 
-        assert_eq!(first.code, SubscriptionCode::Success as u32,);
-
-        assert_eq!(first.subscription_id, 1);
+        assert_eq!(first, 1);
 
         let mut second = subscription_result_sentinel();
 
         assert_eq!(
-            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 0, &mut second,) },
+            unsafe { hynergy_world_subscribe_observer(engine, world, observed, 0, &mut second) },
             SubscriptionCode::Success as u32,
         );
 
-        assert_eq!(second.subscription_id, 2);
+        assert_eq!(second, 2);
 
         assert_eq!(
-            unsafe { hynergy_world_unsubscribe(engine, world, first.subscription_id,) },
+            unsafe { hynergy_world_unsubscribe(engine, world, first,) },
             SubscriptionCode::Success as u32,
         );
 
         assert_eq!(
-            unsafe { hynergy_world_unsubscribe(engine, world, first.subscription_id,) },
+            unsafe { hynergy_world_unsubscribe(engine, world, first,) },
             SubscriptionCode::UnknownSubscription as u32,
         );
 
@@ -2424,7 +2358,7 @@ mod tests {
             SubscriptionCode::Success as u32,
         );
 
-        assert_eq!(third.subscription_id, 3);
+        assert_eq!(third, 3);
 
         unsafe {
             hynergy_engine_destroy(engine);
@@ -2444,13 +2378,7 @@ mod tests {
             SubscriptionCode::UnknownDevice as u32,
         );
 
-        assert_eq!(
-            result,
-            SubscriptionCreationResult {
-                code: SubscriptionCode::UnknownDevice as u32,
-                subscription_id: u32::MAX,
-            },
-        );
+        assert_eq!(result, u32::MAX,);
 
         result = subscription_result_sentinel();
 
@@ -2459,13 +2387,7 @@ mod tests {
             SubscriptionCode::UnknownObserver as u32,
         );
 
-        assert_eq!(
-            result,
-            SubscriptionCreationResult {
-                code: SubscriptionCode::UnknownObserver as u32,
-                subscription_id: u32::MAX,
-            },
-        );
+        assert_eq!(result, u32::MAX,);
 
         unsafe {
             hynergy_engine_destroy(engine);
@@ -2485,13 +2407,7 @@ mod tests {
             SubscriptionCode::InvalidDeviceId as u32,
         );
 
-        assert_eq!(
-            result,
-            SubscriptionCreationResult {
-                code: SubscriptionCode::InvalidDeviceId as u32,
-                subscription_id: u32::MAX,
-            },
-        );
+        assert_eq!(result, u32::MAX,);
 
         assert_eq!(
             unsafe { hynergy_world_unsubscribe(engine, world, 0,) },
@@ -2523,7 +2439,7 @@ mod tests {
             SubscriptionCode::Success as u32,
         );
 
-        assert_eq!(result.subscription_id, 1);
+        assert_eq!(result, 1);
 
         unsafe {
             hynergy_engine_destroy(engine);

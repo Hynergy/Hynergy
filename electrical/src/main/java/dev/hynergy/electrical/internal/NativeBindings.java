@@ -154,4 +154,62 @@ public final class NativeBindings {
             );
         }
     }
+
+    private static final MethodHandle WORLD_SUBSCRIBE_OBSERVER = downcall(
+            "hynergy_world_subscribe_observer",
+            FunctionDescriptor.of(
+                    ValueLayout.JAVA_INT, // return u32
+                    ValueLayout.ADDRESS,  // WorldHandle*
+                    ValueLayout.JAVA_INT, // device_id
+                    ValueLayout.JAVA_INT, // observer_id
+                    ValueLayout.ADDRESS   // u32* subscription_id
+            )
+    );
+
+    public static int subscribeObserver(
+            MemorySegment world,
+            int deviceId,
+            int observerId,
+            MemorySegment subscriptionId
+    ) {
+        try {
+            return (int) WORLD_SUBSCRIBE_OBSERVER.invokeExact(
+                    world,
+                    deviceId,
+                    observerId,
+                    subscriptionId
+            );
+        } catch (Throwable throwable) {
+            throw new IllegalStateException(
+                    "Failed to create native electrical subscription",
+                    throwable
+            );
+        }
+    }
+
+    private static final MethodHandle WORLD_UNSUBSCRIBE = downcall(
+            "hynergy_world_unsubscribe",
+            FunctionDescriptor.of(
+                    ValueLayout.JAVA_INT, // return u32
+                    ValueLayout.ADDRESS,  // WorldHandle*
+                    ValueLayout.JAVA_INT  // subscription_id
+            )
+    );
+
+    public static int unsubscribe(
+            MemorySegment world,
+            int subscriptionId
+    ) {
+        try {
+            return (int) WORLD_UNSUBSCRIBE.invokeExact(
+                    world,
+                    subscriptionId
+            );
+        } catch (Throwable throwable) {
+            throw new IllegalStateException(
+                    "Failed to remove native electrical subscription",
+                    throwable
+            );
+        }
+    }
 }
