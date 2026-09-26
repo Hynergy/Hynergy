@@ -25,7 +25,7 @@ public final class NativeBindings {
                     ValueLayout.JAVA_INT, // return u32
                     ValueLayout.ADDRESS,  // EngineHandle*
                     ValueLayout.JAVA_INT, // tick_frequency_hz
-                    ValueLayout.ADDRESS   // WorldCreationResult*
+                    ValueLayout.ADDRESS   // WorldHandle*
             )
     );
     private static final MethodHandle WORLD_DESTROY = downcall("hynergy_world_destroy", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
