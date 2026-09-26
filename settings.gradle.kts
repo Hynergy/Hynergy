@@ -14,4 +14,4 @@ plugins {
 }
 
 rootProject.name = "Hynergy"
-include("core", "mna")
+include("core", "electrical")

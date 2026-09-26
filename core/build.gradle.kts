@@ -5,17 +5,14 @@ plugins {
 
 group = property("group").toString()
 
-val mnaProject = rootProject.project(":mna")
+val electricalProject = rootProject.project(":electrical")
 
 tasks.named<Jar>("jar") {
-  archiveBaseName.set(project.property("mod_name").toString())
-  archiveVersion.set(project.property("version").toString())
-  duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    archiveBaseName.set(project.property("mod_name").toString())
+    archiveVersion.set(project.property("version").toString())
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
-  // Bundle MNA into the mod artifact so its FFI classes and platform natives
-  // share the plugin classloader instead of relying on a separately installed
-  // library JAR.
-  from(mnaProject.tasks.named<Jar>("jar").map { zipTree(it.archiveFile) })
+    from(electricalProject.tasks.named<Jar>("jar").map { zipTree(it.archiveFile) })
 }
 
 java {
@@ -47,5 +44,5 @@ repositories {
 }
 
 dependencies {
-    implementation(project(":mna"))
+    implementation(project(":electrical"))
 }
