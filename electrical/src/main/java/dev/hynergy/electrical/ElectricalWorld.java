@@ -135,7 +135,7 @@ public final class ElectricalWorld implements AutoCloseable {
             return;
         }
 
-        MemorySegment input = commandBuffer.segmentForApply();
+        MemorySegment input = commandBuffer.encodedSegment();
         int inputLength = commandBuffer.byteSize();
 
         try {

@@ -180,7 +180,7 @@ final class WorldCommandBuffer implements AutoCloseable {
         finishCommand(16);
     }
 
-    MemorySegment segmentForApply() {
+    MemorySegment encodedSegment() {
         requireOpen();
         segment.set(U32_LE, COMMAND_COUNT_OFFSET, commandCount);
         return segment;

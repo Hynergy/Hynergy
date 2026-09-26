@@ -57,14 +57,14 @@ final class WorldCommandBufferTest {
     @Test
     void growthReplacesAndReleasesTheOldBackingArena() {
         try (WorldCommandBuffer buffer = new WorldCommandBuffer(16)) {
-            MemorySegment oldSegment = buffer.segmentForApply();
+            MemorySegment oldSegment = buffer.encodedSegment();
 
             assertEquals(0, oldSegment.address() % 8);
 
             buffer.setDeviceParameter(1, 0, 1.0);
 
             assertEquals(64, buffer.capacity());
-            assertEquals(0, buffer.segmentForApply().address() % 8);
+            assertEquals(0, buffer.encodedSegment().address() % 8);
             assertThrows(
                     IllegalStateException.class,
                     () -> oldSegment.get(ValueLayout.JAVA_BYTE, 0)
@@ -99,14 +99,14 @@ final class WorldCommandBufferTest {
     @Test
     void commandCountIsWrittenOnlyWhenPreparedForApply() {
         try (WorldCommandBuffer buffer = new WorldCommandBuffer()) {
-            MemorySegment segment = buffer.segmentForApply();
+            MemorySegment segment = buffer.encodedSegment();
             assertEquals(0, segment.get(U32_LE, 12));
 
             buffer.addWire(1);
 
             assertEquals(0, segment.get(U32_LE, 12));
 
-            buffer.segmentForApply();
+            buffer.encodedSegment();
 
             assertEquals(1, segment.get(U32_LE, 12));
         }
@@ -145,7 +145,7 @@ final class WorldCommandBufferTest {
         assertThrows(IllegalStateException.class, buffer::clear);
         assertThrows(IllegalStateException.class, buffer::byteSize);
         assertThrows(IllegalStateException.class, () -> buffer.addWire(1));
-        assertThrows(IllegalStateException.class, buffer::segmentForApply);
+        assertThrows(IllegalStateException.class, buffer::encodedSegment);
     }
 
     @Test
@@ -166,7 +166,7 @@ final class WorldCommandBufferTest {
     }
 
     private static byte[] bytes(WorldCommandBuffer buffer) {
-        MemorySegment segment = buffer.segmentForApply();
+        MemorySegment segment = buffer.encodedSegment();
         int byteSize = buffer.byteSize();
         byte[] bytes = new byte[byteSize];
 
