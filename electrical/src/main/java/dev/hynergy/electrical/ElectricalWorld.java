@@ -26,6 +26,9 @@ public final class ElectricalWorld implements AutoCloseable {
         static final int INTERNAL_PANIC = -1;
     }
 
+    private final WorldIdAllocator wireIds;
+    private final WorldIdAllocator deviceIds;
+
     private final WorldCommandBuffer commandBuffer;
     private final Arena scratchArena;
     private final MemorySegment commandResult;
@@ -43,10 +46,14 @@ public final class ElectricalWorld implements AutoCloseable {
         Arena scratchArena = null;
 
         try {
+            this.wireIds = new WorldIdAllocator();
+            this.deviceIds = new WorldIdAllocator();
+
             commandBuffer = new WorldCommandBuffer();
             scratchArena = Arena.ofConfined();
 
             this.commandResult = scratchArena.allocate(NativeLayouts.COMMAND_RESULT);
+
             this.subscriptionIdResult = scratchArena.allocate(ValueLayout.JAVA_INT);
         } catch (RuntimeException | Error failure) {
             if (scratchArena != null) {
@@ -73,59 +80,160 @@ public final class ElectricalWorld implements AutoCloseable {
         this.scratchArena = scratchArena;
     }
 
-    public void addWire(int wireId) {
+    int addWire() {
         requireUsable();
-        commandBuffer.addWire(wireId);
+
+        int id = wireIds.reserve();
+        int generation = wireIds.generation(id);
+
+        try {
+            commandBuffer.addWire(id);
+        } catch (RuntimeException | Error failure) {
+            cancelPendingAdd(wireIds, id, generation, failure);
+
+            throw failure;
+        }
+
+        return id;
     }
 
-    public void removeWire(int wireId) {
+    int addDevice(int definitionId) {
         requireUsable();
-        commandBuffer.removeWire(wireId);
+
+        if (definitionId == 0) {
+            throw new IllegalArgumentException("Definition ID must not be zero");
+        }
+
+        int id = deviceIds.reserve();
+        int generation = deviceIds.generation(id);
+
+        try {
+            commandBuffer.addDevice(id, definitionId);
+        } catch (RuntimeException | Error failure) {
+            cancelPendingAdd(deviceIds, id, generation, failure);
+
+            throw failure;
+        }
+
+        return id;
     }
 
-    public void connectWires(int wireAId, int wireBId) {
+    int wireGeneration(int wireId) {
         requireUsable();
+        return wireIds.generation(wireId);
+    }
+
+    int deviceGeneration(int deviceId) {
+        requireUsable();
+        return deviceIds.generation(deviceId);
+    }
+
+    void removeWire(int wireId, int generation) {
+        requireUsable();
+
+        wireIds.remove(wireId, generation);
+
+        try {
+            commandBuffer.removeWire(wireId);
+        } catch (RuntimeException | Error failure) {
+            cancelPendingRemove(wireIds, wireId, generation, failure);
+
+            throw failure;
+        }
+    }
+
+    void removeDevice(int deviceId, int generation) {
+        requireUsable();
+
+        deviceIds.remove(deviceId, generation);
+
+        try {
+            commandBuffer.removeDevice(deviceId);
+        } catch (RuntimeException | Error failure) {
+            cancelPendingRemove(deviceIds, deviceId, generation, failure);
+
+            throw failure;
+        }
+    }
+
+    void connectWires(int wireAId, int wireAGeneration, int wireBId, int wireBGeneration) {
+        requireUsable();
+
+        wireIds.requireUsable(wireAId, wireAGeneration);
+
+        wireIds.requireUsable(wireBId, wireBGeneration);
+
+        if (wireAId == wireBId) {
+            throw new IllegalArgumentException("A wire cannot be connected to itself");
+        }
+
         commandBuffer.connectWires(wireAId, wireBId);
     }
 
-    public void disconnectWires(int wireAId, int wireBId) {
+    void disconnectWires(int wireAId, int wireAGeneration, int wireBId, int wireBGeneration) {
         requireUsable();
+
+        wireIds.requireUsable(wireAId, wireAGeneration);
+
+        wireIds.requireUsable(wireBId, wireBGeneration);
+
+        if (wireAId == wireBId) {
+            throw new IllegalArgumentException("A wire cannot be disconnected from itself");
+        }
+
         commandBuffer.disconnectWires(wireAId, wireBId);
     }
 
-    public void addDevice(int deviceId, int definitionId) {
+    void attachTerminal(int wireId,
+        int wireGeneration,
+        int deviceId,
+        int deviceGeneration,
+        int terminalId
+    ) {
         requireUsable();
-        commandBuffer.addDevice(deviceId, definitionId);
-    }
 
-    public void removeDevice(int deviceId) {
-        requireUsable();
-        commandBuffer.removeDevice(deviceId);
-    }
+        wireIds.requireUsable(wireId, wireGeneration);
 
-    public void attachTerminal(int wireId, int deviceId, int terminalId) {
-        requireUsable();
+        deviceIds.requireUsable(deviceId, deviceGeneration);
+
         commandBuffer.attachTerminal(wireId, deviceId, terminalId);
     }
 
-    public void detachTerminal(int wireId, int deviceId, int terminalId) {
+    void detachTerminal(int wireId,
+        int wireGeneration,
+        int deviceId,
+        int deviceGeneration,
+        int terminalId
+    ) {
         requireUsable();
+
+        wireIds.requireUsable(wireId, wireGeneration);
+
+        deviceIds.requireUsable(deviceId, deviceGeneration);
+
         commandBuffer.detachTerminal(wireId, deviceId, terminalId);
     }
 
-    public void setDeviceParameter(int deviceId, int parameterId, double value) {
+    void setDeviceParameter(int deviceId, int deviceGeneration, int parameterId, double value) {
         requireUsable();
+
+        deviceIds.requireUsable(deviceId, deviceGeneration);
+
         commandBuffer.setDeviceParameter(deviceId, parameterId, value);
     }
 
-    public void applyCommands() {
+    void applyCommands() {
         MemorySegment world = requireUsable();
 
         if (commandBuffer.isEmpty()) {
             return;
         }
 
+        wireIds.prepareCommitBatch();
+        deviceIds.prepareCommitBatch();
+
         MemorySegment input = commandBuffer.encodedSegment();
+
         int inputLength = commandBuffer.byteSize();
 
         try {
@@ -154,17 +262,27 @@ public final class ElectricalWorld implements AutoCloseable {
                         + ", commandIndex=" + Integer.toUnsignedLong(commandIndex) + ", byteOffset="
                         + Integer.toUnsignedLong(byteOffset));
             }
+
+            try {
+                wireIds.commitBatch();
+                deviceIds.commitBatch();
+            } catch (RuntimeException | Error failure) {
+                poisoned = true;
+
+                throw new IllegalStateException(
+                    "Native commands were applied, but Java ID state could " + "not be committed",
+                    failure
+                );
+            }
         } finally {
             commandBuffer.clear();
         }
     }
 
-    public int subscribeObserver(int deviceId, int observerId) {
+    int subscribeObserver(int deviceId, int deviceGeneration, int observerId) {
         requireUsable();
 
-        if (deviceId <= 0) {
-            throw new IllegalArgumentException("Device ID must be greater than zero");
-        }
+        deviceIds.requireUsable(deviceId, deviceGeneration);
 
         if (observerId < 0) {
             throw new IllegalArgumentException("Observer ID must be non-negative");
@@ -172,11 +290,18 @@ public final class ElectricalWorld implements AutoCloseable {
 
         applyCommands();
 
-        int code = NativeBindings.subscribeObserver(requireUsable(),
-            deviceId,
-            observerId,
-            subscriptionIdResult
-        );
+        final int code;
+
+        try {
+            code = NativeBindings.subscribeObserver(requireUsable(),
+                deviceId,
+                observerId,
+                subscriptionIdResult
+            );
+        } catch (RuntimeException | Error failure) {
+            poisoned = true;
+            throw failure;
+        }
 
         if (code != SubscriptionCode.SUCCESS) {
             handleSubscriptionFailure("create subscription", code);
@@ -194,7 +319,7 @@ public final class ElectricalWorld implements AutoCloseable {
         return subscriptionId;
     }
 
-    public void unsubscribe(int subscriptionId) {
+    void unsubscribe(int subscriptionId) {
         requireUsable();
 
         if (subscriptionId == 0) {
@@ -203,10 +328,43 @@ public final class ElectricalWorld implements AutoCloseable {
 
         applyCommands();
 
-        int code = NativeBindings.unsubscribe(requireUsable(), subscriptionId);
+        final int code;
+
+        try {
+            code = NativeBindings.unsubscribe(requireUsable(), subscriptionId);
+        } catch (RuntimeException | Error failure) {
+            poisoned = true;
+            throw failure;
+        }
 
         if (code != SubscriptionCode.SUCCESS) {
             handleSubscriptionFailure("remove subscription", code);
+        }
+    }
+
+    private void cancelPendingAdd(WorldIdAllocator allocator,
+        int id,
+        int generation,
+        Throwable failure
+    ) {
+        try {
+            allocator.cancelPendingAdd(id, generation);
+        } catch (RuntimeException | Error rollbackFailure) {
+            poisoned = true;
+            failure.addSuppressed(rollbackFailure);
+        }
+    }
+
+    private void cancelPendingRemove(WorldIdAllocator allocator,
+        int id,
+        int generation,
+        Throwable failure
+    ) {
+        try {
+            allocator.cancelPendingRemove(id, generation);
+        } catch (RuntimeException | Error rollbackFailure) {
+            poisoned = true;
+            failure.addSuppressed(rollbackFailure);
         }
     }
 
@@ -256,7 +414,7 @@ public final class ElectricalWorld implements AutoCloseable {
 
         if (poisoned) {
             throw new IllegalStateException(
-                "Electrical world is unusable after a command application failure");
+                "Electrical world is unusable after an unrecoverable failure");
         }
 
         return world;

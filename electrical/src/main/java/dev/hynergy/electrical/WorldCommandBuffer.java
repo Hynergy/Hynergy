@@ -5,7 +5,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 
-
 final class WorldCommandBuffer implements AutoCloseable {
     private static final int DEFAULT_CAPACITY = 256;
     private static final int HEADER_SIZE = 16;
@@ -28,11 +27,11 @@ final class WorldCommandBuffer implements AutoCloseable {
     private static final short SET_DEVICE_PARAMETER = 9;
 
     private static final ValueLayout.OfShort U16_LE =
-            ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+        ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfInt U32_LE =
-            ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+        ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfDouble F64_LE =
-            ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+        ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     private Arena arena;
     private MemorySegment segment;
@@ -47,8 +46,7 @@ final class WorldCommandBuffer implements AutoCloseable {
     WorldCommandBuffer(int initialCapacity) {
         if (initialCapacity < HEADER_SIZE) {
             throw new IllegalArgumentException(
-                    "Initial capacity must be at least " + HEADER_SIZE + " bytes"
-            );
+                "Initial capacity must be at least " + HEADER_SIZE + " bytes");
         }
 
         arena = Arena.ofConfined();
@@ -114,8 +112,10 @@ final class WorldCommandBuffer implements AutoCloseable {
         requirePositiveId(wireBId, "wireBId");
 
         int payload = beginCommand(CONNECT_WIRES, 8);
+
         writeU32(payload, wireAId);
         writeU32(payload + 4, wireBId);
+
         finishCommand(8);
     }
 
@@ -124,18 +124,23 @@ final class WorldCommandBuffer implements AutoCloseable {
         requirePositiveId(wireBId, "wireBId");
 
         int payload = beginCommand(DISCONNECT_WIRES, 8);
+
         writeU32(payload, wireAId);
         writeU32(payload + 4, wireBId);
+
         finishCommand(8);
     }
 
     void addDevice(int deviceId, int definitionId) {
         requirePositiveId(deviceId, "deviceId");
-        requirePositiveId(definitionId, "definitionId");
+
+        requireNonZeroId(definitionId, "definitionId");
 
         int payload = beginCommand(ADD_DEVICE, 8);
+
         writeU32(payload, deviceId);
         writeU32(payload + 4, definitionId);
+
         finishCommand(8);
     }
 
@@ -143,7 +148,9 @@ final class WorldCommandBuffer implements AutoCloseable {
         requirePositiveId(deviceId, "deviceId");
 
         int payload = beginCommand(REMOVE_DEVICE, 4);
+
         writeU32(payload, deviceId);
+
         finishCommand(4);
     }
 
@@ -153,9 +160,11 @@ final class WorldCommandBuffer implements AutoCloseable {
         requireIndex(terminalId, "terminalId");
 
         int payload = beginCommand(ATTACH_TERMINAL, 12);
+
         writeU32(payload, wireId);
         writeU32(payload + 4, deviceId);
         writeU32(payload + 8, terminalId);
+
         finishCommand(12);
     }
 
@@ -165,9 +174,11 @@ final class WorldCommandBuffer implements AutoCloseable {
         requireIndex(terminalId, "terminalId");
 
         int payload = beginCommand(DETACH_TERMINAL, 12);
+
         writeU32(payload, wireId);
         writeU32(payload + 4, deviceId);
         writeU32(payload + 8, terminalId);
+
         finishCommand(12);
     }
 
@@ -175,10 +186,17 @@ final class WorldCommandBuffer implements AutoCloseable {
         requirePositiveId(deviceId, "deviceId");
         requireIndex(parameterId, "parameterId");
 
+        if (!Double.isFinite(value)) {
+            throw new IllegalArgumentException("Device parameter value must be finite");
+        }
+
         int payload = beginCommand(SET_DEVICE_PARAMETER, 16);
+
         writeU32(payload, deviceId);
         writeU32(payload + 4, parameterId);
+
         segment.set(F64_LE, payload + 8L, value);
+
         finishCommand(16);
     }
 
@@ -227,8 +245,7 @@ final class WorldCommandBuffer implements AutoCloseable {
         }
         if (required > MAX_CAPACITY) {
             throw new IllegalStateException(
-                    "World command buffer exceeds maximum capacity of " + MAX_CAPACITY + " bytes"
-            );
+                "World command buffer exceeds maximum capacity of " + MAX_CAPACITY + " bytes");
         }
 
         int newCapacity = capacity;
@@ -280,6 +297,12 @@ final class WorldCommandBuffer implements AutoCloseable {
 
     private void writeU32(long offset, int value) {
         segment.set(U32_LE, offset, value);
+    }
+
+    private static void requireNonZeroId(int value, String name) {
+        if (value == 0) {
+            throw new IllegalArgumentException(name + " must not be zero");
+        }
     }
 
     private static void requirePositiveId(int value, String name) {
