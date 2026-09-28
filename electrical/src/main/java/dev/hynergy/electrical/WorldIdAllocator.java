@@ -166,11 +166,13 @@ final class WorldIdAllocator {
         }
     }
 
-    void commitBatch() {
+    void prepareCommitBatch() {
         int reusableReleaseCount = validatePendingAndCountReusableReleases();
 
         ensureFreeCapacity(reusableReleaseCount);
+    }
 
+    void commitBatch() {
         for (int i = 0; i < pendingCount; i++) {
             int id = pendingIds[i];
             int index = id - 1;
@@ -180,7 +182,8 @@ final class WorldIdAllocator {
 
                 case PENDING_REMOVE, PENDING_ADD_REMOVE -> releaseCommitted(id, index);
 
-                default -> throw new AssertionError("Pending ID state changed during commit");
+                default ->
+                    throw new AssertionError("Pending ID state changed after commit preparation");
             }
         }
 

@@ -6,6 +6,29 @@ import static org.junit.jupiter.api.Assertions.*;
 
 final class WorldIdAllocatorTest {
 
+    private static void commit(WorldIdAllocator ids) {
+        ids.prepareCommitBatch();
+        ids.commitBatch();
+    }
+
+    @Test
+    void preparingCommitDoesNotCommitPendingState() {
+        WorldIdAllocator ids = new WorldIdAllocator();
+
+        int id = ids.reserve();
+        int generation = ids.generation(id);
+
+        ids.prepareCommitBatch();
+
+        assertEquals(0, ids.committedHighWaterMark());
+
+        assertDoesNotThrow(() -> ids.requireUsable(id, generation));
+
+        ids.commitBatch();
+
+        assertEquals(1, ids.committedHighWaterMark());
+    }
+
     @Test
     void freshIdsAreSequentialAndCommitHighWaterMark() {
         WorldIdAllocator ids = new WorldIdAllocator();
@@ -19,7 +42,7 @@ final class WorldIdAllocatorTest {
         assertEquals(2, ids.highWaterMark());
         assertEquals(0, ids.committedHighWaterMark());
 
-        ids.commitBatch();
+        commit(ids);
 
         assertEquals(2, ids.highWaterMark());
         assertEquals(2, ids.committedHighWaterMark());
@@ -45,12 +68,12 @@ final class WorldIdAllocatorTest {
         int first = ids.reserve();
         int second = ids.reserve();
 
-        ids.commitBatch();
+        commit(ids);
         ids.remove(first, ids.generation(first));
 
         assertEquals(3, ids.reserve());
 
-        ids.commitBatch();
+        commit(ids);
 
         assertEquals(first, ids.reserve());
         assertDoesNotThrow(() -> ids.requireUsable(second, ids.generation(second)));
@@ -70,7 +93,7 @@ final class WorldIdAllocatorTest {
 
         assertEquals(2, ids.reserve());
 
-        ids.commitBatch();
+        commit(ids);
 
         assertEquals(2, ids.committedHighWaterMark());
         assertEquals(first, ids.reserve());
@@ -83,10 +106,10 @@ final class WorldIdAllocatorTest {
         int id = ids.reserve();
         int oldGeneration = ids.generation(id);
 
-        ids.commitBatch();
+        commit(ids);
 
         ids.remove(id, oldGeneration);
-        ids.commitBatch();
+        commit(ids);
 
         assertEquals(id, ids.reserve());
         assertEquals(oldGeneration + 1, ids.generation(id));
@@ -99,10 +122,10 @@ final class WorldIdAllocatorTest {
         int id = ids.reserve();
         int oldGeneration = ids.generation(id);
 
-        ids.commitBatch();
+        commit(ids);
 
         ids.remove(id, oldGeneration);
-        ids.commitBatch();
+        commit(ids);
 
         assertEquals(id, ids.reserve());
 
@@ -121,7 +144,7 @@ final class WorldIdAllocatorTest {
         int id = ids.reserve();
         int generation = ids.generation(id);
 
-        ids.commitBatch();
+        commit(ids);
         ids.remove(id, generation);
 
         assertThrows(IllegalStateException.class, () -> ids.requireUsable(id, generation));
@@ -134,7 +157,7 @@ final class WorldIdAllocatorTest {
         int id = ids.reserve();
         int generation = ids.generation(id);
 
-        ids.commitBatch();
+        commit(ids);
 
         ids.remove(id, generation);
 
@@ -163,11 +186,11 @@ final class WorldIdAllocatorTest {
 
         int id = ids.reserve();
 
-        ids.commitBatch();
+        commit(ids);
 
         ids.remove(id, ids.generation(id));
 
-        ids.commitBatch();
+        commit(ids);
 
         int reused = ids.reserve();
         int generation = ids.generation(reused);
@@ -186,7 +209,7 @@ final class WorldIdAllocatorTest {
         int id = ids.reserve();
         int generation = ids.generation(id);
 
-        ids.commitBatch();
+        commit(ids);
         ids.remove(id, generation);
 
         assertThrows(IllegalStateException.class, () -> ids.requireUsable(id, generation));
@@ -195,7 +218,7 @@ final class WorldIdAllocatorTest {
 
         assertDoesNotThrow(() -> ids.requireUsable(id, generation));
 
-        ids.commitBatch();
+        commit(ids);
 
         assertDoesNotThrow(() -> ids.requireUsable(id, generation));
     }
@@ -215,7 +238,7 @@ final class WorldIdAllocatorTest {
 
         assertDoesNotThrow(() -> ids.requireUsable(id, generation));
 
-        ids.commitBatch();
+        commit(ids);
 
         assertDoesNotThrow(() -> ids.requireUsable(id, generation));
     }
