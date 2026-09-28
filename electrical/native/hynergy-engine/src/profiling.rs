@@ -32,6 +32,8 @@ pub struct SolverDiscreteProfile {
     closure_rounds: usize,
     driver_scans: usize,
     output_updates: usize,
+    closure_actual_iteration_ops: usize,
+    closure_full_iteration_ops: usize,
     zero_update_attempts: usize,
     barrier_exits: usize,
     verification_solves: usize,
@@ -78,6 +80,18 @@ impl SolverDiscreteProfile {
     #[inline]
     pub const fn output_updates(self) -> usize {
         self.output_updates
+    }
+
+    /// Operations evaluated during changed discrete closure rounds.
+    #[inline]
+    pub const fn closure_actual_iteration_ops(self) -> usize {
+        self.closure_actual_iteration_ops
+    }
+
+    /// Operations that full evaluation would execute in those same rounds.
+    #[inline]
+    pub const fn closure_full_iteration_ops(self) -> usize {
+        self.closure_full_iteration_ops
     }
 
     #[inline]
@@ -132,11 +146,15 @@ impl SolverDiscreteProfile {
         rounds: usize,
         driver_scans: usize,
         output_updates: usize,
+        actual_iteration_ops: usize,
+        full_iteration_ops: usize,
     ) {
         self.closure_attempts += 1;
         self.closure_rounds += rounds;
         self.driver_scans += driver_scans;
         self.output_updates += output_updates;
+        self.closure_actual_iteration_ops += actual_iteration_ops;
+        self.closure_full_iteration_ops += full_iteration_ops;
 
         if output_updates == 0 {
             self.zero_update_attempts += 1;
@@ -401,6 +419,20 @@ impl SolverTickProfile {
             .sum()
     }
 
+    pub fn total_discrete_closure_actual_iteration_ops(&self) -> usize {
+        self.islands
+            .iter()
+            .map(|island| island.discrete.closure_actual_iteration_ops())
+            .sum()
+    }
+
+    pub fn total_discrete_closure_full_iteration_ops(&self) -> usize {
+        self.islands
+            .iter()
+            .map(|island| island.discrete.closure_full_iteration_ops())
+            .sum()
+    }
+
     #[inline]
     pub fn total_discrete_zero_update_attempts(&self) -> usize {
         self.islands
@@ -459,8 +491,8 @@ mod tests {
 
         let discrete = profile.discrete_mut();
 
-        discrete.record_closure(4, 12, 2);
-        discrete.record_closure(1, 0, 0);
+        discrete.record_closure(4, 12, 2, 12, 40);
+        discrete.record_closure(1, 0, 0, 0, 0);
         discrete.record_barrier_exit();
         discrete.record_verification_solve();
         discrete.record_budget_fallback();
@@ -476,6 +508,8 @@ mod tests {
         assert_eq!(discrete.closure_rounds(), 5);
         assert_eq!(discrete.driver_scans(), 12);
         assert_eq!(discrete.output_updates(), 2);
+        assert_eq!(discrete.closure_actual_iteration_ops(), 12);
+        assert_eq!(discrete.closure_full_iteration_ops(), 40);
         assert_eq!(discrete.zero_update_attempts(), 1);
         assert_eq!(discrete.barrier_exits(), 1);
         assert_eq!(discrete.verification_solves(), 1);
@@ -492,12 +526,12 @@ mod tests {
     fn tick_profile_aggregates_discrete_work() {
         let mut first = SolverIslandProfile::default();
         first.begin_tick(true, 4, 1, 0);
-        first.discrete_mut().record_closure(3, 12, 4);
+        first.discrete_mut().record_closure(3, 12, 4, 8, 30);
         first.discrete_mut().record_verification_solve();
 
         let mut second = SolverIslandProfile::default();
         second.begin_tick(true, 2, 0, 1);
-        second.discrete_mut().record_closure(1, 2, 0);
+        second.discrete_mut().record_closure(1, 2, 0, 4, 10);
         second.discrete_mut().record_barrier_exit();
         second.discrete_mut().record_verification_solve();
         second.discrete_mut().record_invalid_fallback();
@@ -510,6 +544,8 @@ mod tests {
         assert_eq!(tick.total_discrete_closure_rounds(), 4);
         assert_eq!(tick.total_discrete_driver_scans(), 14);
         assert_eq!(tick.total_discrete_output_updates(), 4);
+        assert_eq!(tick.total_discrete_closure_actual_iteration_ops(), 12);
+        assert_eq!(tick.total_discrete_closure_full_iteration_ops(), 40);
         assert_eq!(tick.total_discrete_zero_update_attempts(), 1);
         assert_eq!(tick.total_discrete_barrier_exits(), 1);
         assert_eq!(tick.total_discrete_verification_solves(), 2);

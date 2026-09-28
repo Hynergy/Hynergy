@@ -719,6 +719,8 @@ impl IslandRuntime {
                         closure_profile.rounds(),
                         closure_profile.driver_scans(),
                         closure_profile.output_updates(),
+                        closure_profile.actual_iteration_ops(),
+                        closure_profile.full_iteration_ops(),
                     );
                 }
 

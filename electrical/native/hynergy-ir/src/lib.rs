@@ -9,6 +9,6 @@ pub use rhs::{RhsAdd, RhsProgram};
 pub use state::{StateProgramError, StateSlot, StateTransitionProgram, StateWrite};
 
 pub use value::{
-    EvaluationRate, InputSlot, ValueBuildError, ValueProgram, ValueProgramBuilder, ValueSlot,
-    ValueWorkspace,
+    EvaluationRate, InputSlot, IterationDependencyPlan, IterationScratch, ValueBuildError,
+    ValueProgram, ValueProgramBuilder, ValueSlot, ValueWorkspace,
 };

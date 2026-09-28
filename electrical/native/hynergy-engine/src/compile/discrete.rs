@@ -1,5 +1,5 @@
 use crate::compile::island_ir::CompiledIslandIr;
-use hynergy_ir::{MatrixProgram, RhsProgram, ValueSlot};
+use hynergy_ir::{InputSlot, IterationDependencyPlan, MatrixProgram, RhsProgram, ValueSlot};
 use hynergy_mna::pattern::{MnaPattern, UnknownIndex};
 use smallvec::SmallVec;
 
@@ -175,6 +175,8 @@ impl MatrixBarrierSource {
 #[derive(Debug)]
 pub(crate) struct CompiledDiscretePlan {
     drivers: Box<[QualifiedComplementaryDriver]>,
+    driver_output_inputs: Box<[Option<InputSlot>]>,
+    iteration_dependencies: IterationDependencyPlan,
     dependent_offsets: Box<[u32]>,
     dependents: Box<[u32]>,
     stability_dependent_offsets: Box<[u32]>,
@@ -185,6 +187,16 @@ pub(crate) struct CompiledDiscretePlan {
 }
 
 impl CompiledDiscretePlan {
+    #[inline]
+    pub(crate) fn driver_output_input(&self, driver: usize) -> Option<InputSlot> {
+        self.driver_output_inputs[driver]
+    }
+
+    #[inline]
+    pub(crate) fn iteration_dependencies(&self) -> &IterationDependencyPlan {
+        &self.iteration_dependencies
+    }
+
     #[inline]
     pub(crate) fn drivers(&self) -> &[QualifiedComplementaryDriver] {
         &self.drivers
@@ -394,7 +406,23 @@ pub(crate) fn compile_discrete_plan(
         ir.iteration_stability_values().len() + 1,
     );
 
+    // The IR builder collects solution inputs in ascending unknown-index order.
+    // An output with no IR readers need not have an input slot.
+    let solution_inputs = ir.solution_inputs();
+    let driver_output_inputs = qualified
+        .iter()
+        .map(|driver| {
+            solution_inputs
+                .binary_search_by_key(&driver.output(), |&(unknown, _)| unknown)
+                .ok()
+                .map(|index| solution_inputs[index].1)
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+
     Some(Box::new(CompiledDiscretePlan {
+        driver_output_inputs,
+        iteration_dependencies: ir.value_program().compile_iteration_dependencies(),
         drivers: qualified.into_boxed_slice(),
         dependent_offsets,
         dependents,

@@ -101,6 +101,18 @@ enum ValueOp {
 
 impl ValueOp {
     #[inline]
+    fn destination(self) -> ValueSlot {
+        match self {
+            Self::Add { destination, .. }
+            | Self::Sub { destination, .. }
+            | Self::Mul { destination, .. }
+            | Self::Div { destination, .. }
+            | Self::LessEqual { destination, .. }
+            | Self::Neg { destination, .. } => destination,
+        }
+    }
+
+    #[inline]
     fn execute(self, values: &mut [f64]) {
         match self {
             Self::Add {
@@ -468,7 +480,157 @@ pub struct ValueProgram {
     iteration_ops: Box<[ValueOp]>,
 }
 
+/// Direct iteration-operation users of each value, compiled for one program.
+/// This metadata is optional; ordinary full evaluation does not allocate it.
+#[derive(Debug)]
+pub struct IterationDependencyPlan {
+    offsets: Box<[u32]>,
+    dependent_ops: Box<[u32]>,
+    operation_count: usize,
+}
+
+/// Reusable dirty-operation bits for an iteration dependency plan.
+#[derive(Debug)]
+pub struct IterationScratch {
+    dirty_words: Box<[u64]>,
+    pending_count: usize,
+    operation_count: usize,
+}
+
+impl IterationDependencyPlan {
+    pub fn new_scratch(&self) -> IterationScratch {
+        IterationScratch {
+            dirty_words: vec![0; self.operation_count.div_ceil(64)].into_boxed_slice(),
+            pending_count: 0,
+            operation_count: self.operation_count,
+        }
+    }
+
+    /// Mark direct users after changing an iteration input in the workspace.
+    /// Use scratch made by this plan and mark every changed iteration input.
+    pub fn mark_input(&self, input: InputSlot, scratch: &mut IterationScratch) {
+        self.assert_scratch(scratch);
+        self.mark_users(input.value(), scratch);
+    }
+
+    #[inline]
+    fn mark_users(&self, value: ValueSlot, scratch: &mut IterationScratch) {
+        let start = self.offsets[value.index()] as usize;
+        let end = self.offsets[value.index() + 1] as usize;
+        for &operation in &self.dependent_ops[start..end] {
+            let operation = operation as usize;
+            let mask = 1_u64 << (operation % 64);
+            let word = &mut scratch.dirty_words[operation / 64];
+            if *word & mask == 0 {
+                *word |= mask;
+                scratch.pending_count += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn assert_scratch(&self, scratch: &IterationScratch) {
+        assert_eq!(
+            self.operation_count, scratch.operation_count,
+            "IterationScratch must match the iteration dependency plan"
+        );
+    }
+}
+
 impl ValueProgram {
+    /// Compile a compact reverse graph without copying operations or values.
+    pub fn compile_iteration_dependencies(&self) -> IterationDependencyPlan {
+        let mut offsets = vec![
+            0_u32;
+            self.value_count()
+                .checked_add(1)
+                .expect("value count overflow")
+        ];
+        for &op in &self.iteration_ops {
+            op.visit_dependencies(&mut |_, source| {
+                let count = &mut offsets[source.index() + 1];
+                *count = count
+                    .checked_add(1)
+                    .expect("iteration dependency count exceeds u32");
+            });
+        }
+        for index in 1..offsets.len() {
+            offsets[index] = offsets[index]
+                .checked_add(offsets[index - 1])
+                .expect("iteration dependency offsets exceed u32");
+        }
+        let mut dependent_ops = vec![0; offsets[self.value_count()] as usize];
+        let mut cursors = offsets[..self.value_count()].to_vec();
+        for (index, &op) in self.iteration_ops.iter().enumerate() {
+            let index = u32::try_from(index).expect("iteration operation count exceeds u32");
+            op.visit_dependencies(&mut |_, source| {
+                let cursor = &mut cursors[source.index()];
+                dependent_ops[*cursor as usize] = index;
+                *cursor += 1;
+            });
+        }
+        IterationDependencyPlan {
+            offsets: offsets.into_boxed_slice(),
+            dependent_ops: dependent_ops.into_boxed_slice(),
+            operation_count: self.iteration_ops.len(),
+        }
+    }
+
+    /// Refresh marked iteration inputs and their transitive users.
+    ///
+    /// The plan must be compiled from this program. First fully evaluate the
+    /// workspace, then set and mark every changed iteration input. Changes to
+    /// static or tick inputs require a fresh full evaluation before reuse.
+    /// Returns the number of operations executed and leaves scratch empty.
+    pub fn execute_iteration_incremental(
+        &self,
+        plan: &IterationDependencyPlan,
+        workspace: &mut ValueWorkspace,
+        scratch: &mut IterationScratch,
+    ) -> usize {
+        self.assert_workspace(workspace);
+        assert_eq!(
+            self.value_count(),
+            plan.offsets.len() - 1,
+            "iteration plan value count mismatch"
+        );
+        assert_eq!(
+            self.iteration_ops.len(),
+            plan.operation_count,
+            "iteration plan operation count mismatch"
+        );
+        plan.assert_scratch(scratch);
+        if scratch.pending_count == 0 {
+            return 0;
+        }
+        if scratch.pending_count >= self.iteration_ops.len().div_ceil(4) {
+            execute_ops(&self.iteration_ops, &mut workspace.values);
+            scratch.dirty_words.fill(0);
+            scratch.pending_count = 0;
+            return self.iteration_ops.len();
+        }
+
+        let mut executed = 0;
+        // Builder order is topological. Re-read each word because an operation
+        // can mark a successor in the same word while it is being drained.
+        for word_index in 0..scratch.dirty_words.len() {
+            while scratch.dirty_words[word_index] != 0 {
+                let bit = scratch.dirty_words[word_index].trailing_zeros() as usize;
+                let index = word_index * 64 + bit;
+                scratch.dirty_words[word_index] &= !(1_u64 << bit);
+                scratch.pending_count -= 1;
+                let op = self.iteration_ops[index];
+                op.execute(&mut workspace.values);
+                executed += 1;
+                // Do not stop at numerically equal results: signed zero and
+                // NaN payloads must retain the full evaluator's arithmetic.
+                plan.mark_users(op.destination(), scratch);
+            }
+        }
+        debug_assert_eq!(scratch.pending_count, 0);
+        executed
+    }
+
     #[inline]
     pub fn value_count(&self) -> usize {
         self.initial_values.len()
@@ -847,5 +1009,341 @@ mod tests {
     #[test]
     fn value_op_remains_compact() {
         assert_eq!(size_of::<ValueOp>(), 16);
+    }
+
+    #[test]
+    fn incremental_execution_prunes_unrelated_ops() {
+        let mut builder = ValueProgramBuilder::new();
+        let source = builder.iteration_input().unwrap();
+        let one = builder.constant(1.0).unwrap();
+        let two = builder.constant(2.0).unwrap();
+        let first = builder.add(source.value(), one).unwrap();
+        let second = builder.mul(first, two).unwrap();
+        let result = builder.neg(second).unwrap();
+
+        let unrelated = (0..5)
+            .map(|_| {
+                let input = builder.iteration_input().unwrap();
+                let output = builder.add(input.value(), one).unwrap();
+                (input, output)
+            })
+            .collect::<Vec<_>>();
+        let program = builder.finish();
+        assert_eq!(program.iteration_op_count(), 8);
+
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut workspace = program.new_workspace();
+        workspace.set_input(source, 1.0);
+        for (input, _) in &unrelated {
+            workspace.set_input(*input, 10.0);
+        }
+        program.execute_iteration(&mut workspace);
+
+        workspace.set_input(source, 3.0);
+        plan.mark_input(source, &mut scratch);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            3
+        );
+        assert_eq!(workspace.value(result), -8.0);
+        for (_, output) in unrelated {
+            assert_eq!(workspace.value(output), 11.0);
+        }
+        assert_eq!(scratch.pending_count, 0);
+    }
+
+    #[test]
+    fn incremental_execution_rereads_dirty_words_across_word_boundary() {
+        let mut builder = ValueProgramBuilder::new();
+        let one = builder.constant(1.0).unwrap();
+        let fillers = (0..62)
+            .map(|_| {
+                let input = builder.iteration_input().unwrap();
+                builder.add(input.value(), one).unwrap();
+                input
+            })
+            .collect::<Vec<_>>();
+        let source = builder.iteration_input().unwrap();
+        let first = builder.add(source.value(), one).unwrap();
+        let second = builder.mul(first, one).unwrap();
+        let result = builder.neg(second).unwrap();
+        let program = builder.finish();
+        assert_eq!(program.iteration_op_count(), 65);
+
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut workspace = program.new_workspace();
+        for input in fillers {
+            workspace.set_input(input, 0.0);
+        }
+        workspace.set_input(source, 1.0);
+        program.execute_iteration(&mut workspace);
+
+        workspace.set_input(source, 2.0);
+        plan.mark_input(source, &mut scratch);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            3
+        );
+        assert_eq!(workspace.value(result), -3.0);
+    }
+
+    #[test]
+    fn incremental_execution_deduplicates_reconverging_roots() {
+        let mut builder = ValueProgramBuilder::new();
+        let one = builder.constant(1.0).unwrap();
+        let two = builder.constant(2.0).unwrap();
+        let left_root = builder.iteration_input().unwrap();
+        let right_root = builder.iteration_input().unwrap();
+        let left_first = builder.add(left_root.value(), one).unwrap();
+        let left = builder.mul(left_first, two).unwrap();
+        let right = builder.sub(right_root.value(), one).unwrap();
+        let joined = builder.add(left, right).unwrap();
+        let fillers = (0..8)
+            .map(|_| {
+                let input = builder.iteration_input().unwrap();
+                builder.add(input.value(), one).unwrap();
+                input
+            })
+            .collect::<Vec<_>>();
+        let program = builder.finish();
+
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut workspace = program.new_workspace();
+        workspace.set_input(left_root, 1.0);
+        workspace.set_input(right_root, 5.0);
+        for input in fillers {
+            workspace.set_input(input, 10.0);
+        }
+        program.execute_iteration(&mut workspace);
+
+        workspace.set_input(left_root, 3.0);
+        workspace.set_input(right_root, 8.0);
+        plan.mark_input(left_root, &mut scratch);
+        plan.mark_input(right_root, &mut scratch);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            4
+        );
+        assert_eq!(workspace.value(joined), 15.0);
+    }
+
+    #[test]
+    fn incremental_execution_drains_repeated_rounds_and_handles_empty_program() {
+        let mut builder = ValueProgramBuilder::new();
+        let source = builder.iteration_input().unwrap();
+        let one = builder.constant(1.0).unwrap();
+        let first = builder.add(source.value(), one).unwrap();
+        let result = builder.neg(first).unwrap();
+        let program = builder.finish();
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut workspace = program.new_workspace();
+
+        workspace.set_input(source, 2.0);
+        program.execute_iteration(&mut workspace);
+        workspace.set_input(source, 3.0);
+        plan.mark_input(source, &mut scratch);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            2
+        );
+        assert_eq!(workspace.value(result), -4.0);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            0
+        );
+
+        workspace.set_input(source, 4.0);
+        plan.mark_input(source, &mut scratch);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            2
+        );
+        assert_eq!(workspace.value(result), -5.0);
+
+        let empty_program = ValueProgramBuilder::new().finish();
+        let empty_plan = empty_program.compile_iteration_dependencies();
+        let mut empty_scratch = empty_plan.new_scratch();
+        let mut empty_workspace = empty_program.new_workspace();
+        assert_eq!(
+            empty_program.execute_iteration_incremental(
+                &empty_plan,
+                &mut empty_workspace,
+                &mut empty_scratch,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn incremental_execution_uses_full_loop_for_dense_initial_frontier() {
+        let mut builder = ValueProgramBuilder::new();
+        let one = builder.constant(1.0).unwrap();
+        let inputs = (0..8)
+            .map(|_| {
+                let input = builder.iteration_input().unwrap();
+                builder.add(input.value(), one).unwrap();
+                input
+            })
+            .collect::<Vec<_>>();
+        let program = builder.finish();
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut workspace = program.new_workspace();
+        program.execute_iteration(&mut workspace);
+
+        for (index, input) in inputs.iter().copied().take(2).enumerate() {
+            workspace.set_input(input, (index + 1) as f64);
+            plan.mark_input(input, &mut scratch);
+        }
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            program.iteration_op_count()
+        );
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            0
+        );
+    }
+
+    #[test]
+    fn incremental_execution_matches_full_bits_for_ieee_values_and_all_ops() {
+        let mut builder = ValueProgramBuilder::new();
+        let numerator = builder.static_input().unwrap();
+        let denominator = builder.static_input().unwrap();
+        let tick = builder.tick_input().unwrap();
+        let x = builder.iteration_input().unwrap();
+        let y = builder.iteration_input().unwrap();
+        let z = builder.iteration_input().unwrap();
+
+        let static_value = builder.div(numerator.value(), denominator.value()).unwrap();
+        let tick_value = builder.add(tick.value(), static_value).unwrap();
+        let added = builder.add(x.value(), tick_value).unwrap();
+        let subtracted = builder.sub(y.value(), tick_value).unwrap();
+        let multiplied = builder.mul(added, subtracted).unwrap();
+        let divided = builder.div(multiplied, z.value()).unwrap();
+        let negated = builder.neg(divided).unwrap();
+        let compared = builder.less_equal(negated, x.value()).unwrap();
+        let one = builder.constant(1.0).unwrap();
+        let fillers = (0..24)
+            .map(|_| {
+                let input = builder.iteration_input().unwrap();
+                builder.add(input.value(), one).unwrap();
+                input
+            })
+            .collect::<Vec<_>>();
+        let program = builder.finish();
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut full_workspace = program.new_workspace();
+        let mut incremental_workspace = program.new_workspace();
+
+        for workspace in [&mut full_workspace, &mut incremental_workspace] {
+            workspace.set_input(numerator, 1.0);
+            workspace.set_input(denominator, 1.0);
+            workspace.set_input(tick, 0.0);
+            for input in &fillers {
+                workspace.set_input(*input, 0.0);
+            }
+            program.execute_static(workspace);
+            program.execute_tick(workspace);
+            program.execute_iteration(workspace);
+        }
+
+        let cases = [
+            (0.0, -0.0, -0.0),
+            (-0.0, 0.0, 0.0),
+            (f64::from_bits(0x7ff8_0000_0000_0042), -1.0, 0.0),
+            (f64::INFINITY, f64::NEG_INFINITY, 1.0),
+            (f64::NEG_INFINITY, f64::INFINITY, -1.0),
+        ];
+
+        for (x_value, y_value, z_value) in cases {
+            for workspace in [&mut full_workspace, &mut incremental_workspace] {
+                workspace.set_input(x, x_value);
+                workspace.set_input(y, y_value);
+                workspace.set_input(z, z_value);
+            }
+            plan.mark_input(x, &mut scratch);
+            plan.mark_input(y, &mut scratch);
+            plan.mark_input(z, &mut scratch);
+
+            program.execute_iteration(&mut full_workspace);
+            assert_eq!(
+                program.execute_iteration_incremental(
+                    &plan,
+                    &mut incremental_workspace,
+                    &mut scratch,
+                ),
+                6
+            );
+            assert_eq!(
+                incremental_workspace
+                    .values()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                full_workspace
+                    .values()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "workspace values differ for x={x_value:?}, y={y_value:?}, z={z_value:?}"
+            );
+            assert_eq!(
+                incremental_workspace.value(negated).to_bits(),
+                full_workspace.value(negated).to_bits()
+            );
+            assert_eq!(
+                incremental_workspace.value(compared).to_bits(),
+                full_workspace.value(compared).to_bits()
+            );
+        }
+
+        for workspace in [&mut full_workspace, &mut incremental_workspace] {
+            workspace.set_input(numerator, 3.0);
+            workspace.set_input(denominator, 2.0);
+            workspace.set_input(tick, 0.5);
+            workspace.set_input(x, 3.0);
+            workspace.set_input(y, 4.0);
+            workspace.set_input(z, 2.0);
+            program.execute_static(workspace);
+            program.execute_tick(workspace);
+            program.execute_iteration(workspace);
+            assert_eq!(workspace.value(negated), -5.0);
+            workspace.set_input(x, 4.0);
+        }
+        plan.mark_input(x, &mut scratch);
+        program.execute_iteration(&mut full_workspace);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut incremental_workspace, &mut scratch),
+            5
+        );
+        assert_eq!(incremental_workspace.value(negated), -6.0);
+        assert_eq!(incremental_workspace.values, full_workspace.values);
+    }
+
+    #[test]
+    fn incremental_input_without_users_does_no_work() {
+        let mut builder = ValueProgramBuilder::new();
+        let unused = builder.iteration_input().unwrap();
+        let used = builder.iteration_input().unwrap();
+        let result = builder.neg(used.value()).unwrap();
+        let program = builder.finish();
+        let plan = program.compile_iteration_dependencies();
+        let mut scratch = plan.new_scratch();
+        let mut workspace = program.new_workspace();
+        workspace.set_input(used, 2.0);
+        program.execute_iteration(&mut workspace);
+        workspace.set_input(unused, 3.0);
+        plan.mark_input(unused, &mut scratch);
+        assert_eq!(
+            program.execute_iteration_incremental(&plan, &mut workspace, &mut scratch),
+            0
+        );
+        assert_eq!(workspace.value(result), -2.0);
     }
 }
