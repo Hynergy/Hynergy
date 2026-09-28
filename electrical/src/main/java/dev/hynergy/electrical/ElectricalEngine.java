@@ -5,6 +5,7 @@ import dev.hynergy.electrical.internal.NativeBindings;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ElectricalEngine implements AutoCloseable {
     private static final class WorldCode {
@@ -17,14 +18,29 @@ public final class ElectricalEngine implements AutoCloseable {
 
     private MemorySegment handle;
 
+    private static final AtomicBoolean engineAlreadyInstantiated = new AtomicBoolean(false);
+
     private ElectricalEngine(MemorySegment handle) {
         this.handle = handle;
     }
 
     public static ElectricalEngine create() {
-        MemorySegment handle = NativeBindings.createEngine(1);
+        if (!engineAlreadyInstantiated.compareAndSet(false, true)) {
+            throw new IllegalStateException("Engine already instantiated");
+        }
 
-        if (handle.equals(MemorySegment.NULL)) {
+        MemorySegment handle;
+
+        try {
+            handle = NativeBindings.createEngine(1);
+        } catch (RuntimeException | Error failure) {
+            engineAlreadyInstantiated.set(false);
+            throw failure;
+        }
+
+        if (MemorySegment.NULL.equals(handle)) {
+            engineAlreadyInstantiated.set(false);
+
             throw new IllegalStateException("Native electrical engine creation returned a null handle");
         }
 
@@ -92,9 +108,13 @@ public final class ElectricalEngine implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!MemorySegment.NULL.equals(handle)) {
-            NativeBindings.destroyEngine(handle);
-            handle = MemorySegment.NULL;
+        if (MemorySegment.NULL.equals(handle)) {
+            return;
         }
+
+        NativeBindings.destroyEngine(handle);
+
+        handle = MemorySegment.NULL;
+        engineAlreadyInstantiated.set(false);
     }
 }
