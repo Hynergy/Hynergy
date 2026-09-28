@@ -33,6 +33,12 @@ fn profile_cpu(width: FullCpuWidth, ticks: usize) {
         let profile = cpu.solver_tick_profile();
 
         println!(
+            "closure_ir_ops={} closure_ir_full_ops={}",
+            profile.total_discrete_closure_actual_iteration_ops(),
+            profile.total_discrete_closure_full_iteration_ops(),
+        );
+
+        println!(
             "tick={tick:02} islands={} nonlinear_iterations={} solves={} factorizations={} matrix_source_changes={} stability_changes={} discrete_islands={} drivers={} closures={} closure_rounds={} driver_scans={} output_updates={} zero_update_attempts={} barrier_exits={} verification_solves={} fast_fallbacks={} max_delta={:.6e}",
             profile.islands().len(),
             profile.total_nonlinear_iterations(),

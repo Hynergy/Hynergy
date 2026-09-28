@@ -1,6 +1,6 @@
 use crate::compile::discrete::CompiledDiscretePlan;
 use crate::compile::island_ir::CompiledIslandIr;
-use hynergy_ir::ValueWorkspace;
+use hynergy_ir::{IterationScratch, ValueWorkspace};
 use hynergy_mna::pattern::UnknownIndex;
 
 pub(crate) const DISCRETE_CLOSURE_MAX_ROUNDS: usize = 128;
@@ -19,6 +19,8 @@ pub(crate) struct DiscreteClosureProfile {
     rounds: usize,
     driver_scans: usize,
     output_updates: usize,
+    actual_iteration_ops: usize,
+    full_iteration_ops: usize,
 }
 
 #[cfg(feature = "solver-profiling")]
@@ -37,10 +39,19 @@ impl DiscreteClosureProfile {
     pub(crate) const fn output_updates(self) -> usize {
         self.output_updates
     }
+
+    pub(crate) const fn actual_iteration_ops(self) -> usize {
+        self.actual_iteration_ops
+    }
+
+    pub(crate) const fn full_iteration_ops(self) -> usize {
+        self.full_iteration_ops
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct DiscreteScratch {
+    iteration: IterationScratch,
     driver_outputs: Box<[f64]>,
     current_frontier: Vec<u32>,
     next_frontier: Vec<u32>,
@@ -56,6 +67,7 @@ impl DiscreteScratch {
         let driver_count = plan.drivers().len();
 
         Self {
+            iteration: plan.iteration_dependencies().new_scratch(),
             driver_outputs: vec![0.0; driver_count].into_boxed_slice(),
             current_frontier: Vec::with_capacity(driver_count),
             next_frontier: Vec::with_capacity(driver_count),
@@ -384,7 +396,15 @@ impl DiscreteClosureContext<'_> {
                 return ClosureOutcome::Settled;
             }
 
-            evaluate_iteration(self.ir, workspace, predicted);
+            let _actual_ops =
+                evaluate_changed_iteration(self.plan, self.ir, workspace, predicted, scratch);
+
+            #[cfg(feature = "solver-profiling")]
+            {
+                let count = self.ir.value_program().iteration_op_count();
+                scratch.profile.actual_iteration_ops += _actual_ops;
+                scratch.profile.full_iteration_ops += count;
+            }
 
             if scratch.next_frontier.is_empty() {
                 if barriers_changed(
@@ -435,6 +455,7 @@ fn unknown_voltage(solution: &[f64], unknown: Option<UnknownIndex>) -> f64 {
     unknown.map_or(0.0, |unknown| solution[unknown.index()])
 }
 
+#[cfg(test)]
 #[inline]
 fn evaluate_iteration(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace, solution: &[f64]) {
     for &(unknown, input) in ir.solution_inputs() {
@@ -442,6 +463,34 @@ fn evaluate_iteration(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace, sol
     }
 
     ir.value_program().execute_iteration(workspace);
+}
+
+fn evaluate_changed_iteration(
+    plan: &CompiledDiscretePlan,
+    ir: &CompiledIslandIr,
+    workspace: &mut ValueWorkspace,
+    predicted: &[f64],
+    scratch: &mut DiscreteScratch,
+) -> usize {
+    for &driver_index in &scratch.current_frontier {
+        let driver_index = driver_index as usize;
+        let Some(input) = plan.driver_output_input(driver_index) else {
+            continue;
+        };
+        let value = predicted[plan.drivers()[driver_index].output().index()];
+        // A numerically equal signed zero still changes downstream arithmetic.
+        // This refresh runs only after the round's existing numeric change gate.
+        if workspace.value(input.value()).to_bits() != value.to_bits() {
+            workspace.set_input(input, value);
+            plan.iteration_dependencies()
+                .mark_input(input, &mut scratch.iteration);
+        }
+    }
+    ir.value_program().execute_iteration_incremental(
+        plan.iteration_dependencies(),
+        workspace,
+        &mut scratch.iteration,
+    )
 }
 
 #[cfg(test)]
@@ -585,6 +634,34 @@ mod tests {
     }
 
     #[test]
+    fn changed_round_refreshes_signed_zero_inputs() {
+        let (_pattern, ir, plan, [output_a, output_b, high, input]) = two_level_chain();
+        let mut workspace = ir.value_program().new_workspace();
+        let mut predicted = [0.0; 4];
+        predicted[high.index()] = 5.0;
+        predicted[input.index()] = 5.0;
+        evaluate_iteration(&ir, &mut workspace, &predicted);
+        let mut scratch = DiscreteScratch::new(&plan);
+        scratch.seed_all(plan.drivers().len());
+
+        predicted[output_a.index()] = -0.0;
+        predicted[output_b.index()] = 5.0;
+        evaluate_changed_iteration(&plan, &ir, &mut workspace, &predicted, &mut scratch);
+
+        let output_input = ir
+            .solution_inputs()
+            .iter()
+            .find(|(unknown, _)| *unknown == output_a)
+            .unwrap()
+            .1;
+        assert_eq!(
+            workspace.value(output_input.value()).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert!(plan.driver_output_input(1).is_none());
+    }
+
+    #[test]
     fn evaluated_closure_entry_point_uses_existing_workspace_evaluation() {
         let (_pattern, ir, plan, [output_a, output_b, high, input]) = two_level_chain();
 
@@ -678,6 +755,12 @@ mod tests {
         assert_eq!(profile.rounds(), 2);
         assert_eq!(profile.driver_scans(), 6);
         assert_eq!(profile.output_updates(), 2);
+        assert_eq!(
+            profile.full_iteration_ops(),
+            ir.value_program().iteration_op_count() * 2
+        );
+        assert!(profile.actual_iteration_ops() > 0);
+        assert!(profile.actual_iteration_ops() < profile.full_iteration_ops());
     }
 
     #[test]
@@ -1034,79 +1117,87 @@ mod tests {
 
     #[test]
     fn empty_next_frontier_still_detects_rhs_barrier() {
-        let output = UnknownIndex::new(0);
-        let high = UnknownIndex::new(1);
-        let input = UnknownIndex::new(2);
-        let rhs_row = UnknownIndex::new(3);
+        for derived in [false, true] {
+            let output = UnknownIndex::new(0);
+            let high = UnknownIndex::new(1);
+            let input = UnknownIndex::new(2);
+            let rhs_row = UnknownIndex::new(3);
 
-        let mut pattern_builder = PatternBuilder::new(4).unwrap();
+            let mut pattern_builder = PatternBuilder::new(4).unwrap();
 
-        request_conductance(&mut pattern_builder, Some(high), Some(output));
-        request_conductance(&mut pattern_builder, Some(output), None);
+            request_conductance(&mut pattern_builder, Some(high), Some(output));
+            request_conductance(&mut pattern_builder, Some(output), None);
 
-        let pattern = pattern_builder.finish().unwrap();
-        let mut ir = IslandIrBuilder::new(&pattern);
+            let pattern = pattern_builder.finish().unwrap();
+            let mut ir = IslandIrBuilder::new(&pattern);
 
-        let one = ir.constant_value(1.0).unwrap();
-        let input_value = ir.unknown_value(Some(input)).unwrap();
-        let output_value = ir.unknown_value(Some(output)).unwrap();
-        let mode = ir.less_equal_value(one, input_value).unwrap();
-        let (pull_up, pull_down) = binary_pulls(&mut ir, mode, one);
+            let one = ir.constant_value(1.0).unwrap();
+            let input_value = ir.unknown_value(Some(input)).unwrap();
+            let output_value = ir.unknown_value(Some(output)).unwrap();
+            let mode = ir.less_equal_value(one, input_value).unwrap();
+            let (pull_up, pull_down) = binary_pulls(&mut ir, mode, one);
 
-        add_conductance(&mut ir, Some(high), Some(output), pull_up);
-        add_conductance(&mut ir, Some(output), None, pull_down);
-        ir.add_rhs(rhs_row, output_value, 1.0);
+            add_conductance(&mut ir, Some(high), Some(output), pull_up);
+            add_conductance(&mut ir, Some(output), None, pull_down);
+            let rhs_source = if derived {
+                ir.add_value(output_value, one).unwrap()
+            } else {
+                output_value
+            };
+            ir.add_rhs(rhs_row, rhs_source, 1.0);
 
-        let metadata = BoundDiscreteMetadata::new(
-            smallvec![mode],
-            smallvec![BoundComplementaryDriver::new(
-                mode,
-                Some(output),
-                Some(high),
-                None,
-                pull_up,
-                pull_down,
-            )],
-        );
+            let metadata = BoundDiscreteMetadata::new(
+                smallvec![mode],
+                smallvec![BoundComplementaryDriver::new(
+                    mode,
+                    Some(output),
+                    Some(high),
+                    None,
+                    pull_up,
+                    pull_down,
+                )],
+            );
 
-        let ir = ir.finish().unwrap();
-        let plan = compile_discrete_plan(&pattern, &ir, metadata).unwrap();
+            let ir = ir.finish().unwrap();
+            let plan = compile_discrete_plan(&pattern, &ir, metadata).unwrap();
 
-        assert!(plan.dependents_for(0).is_empty());
-        assert_eq!(plan.rhs_barriers(), &[output_value]);
+            assert!(plan.dependents_for(0).is_empty());
+            assert_eq!(plan.rhs_barriers(), &[rhs_source]);
 
-        let mut workspace = ir.value_program().new_workspace();
-        let mut predicted = [0.0; 4];
+            let mut workspace = ir.value_program().new_workspace();
+            let mut predicted = [0.0; 4];
 
-        predicted[high.index()] = 5.0;
-        predicted[input.index()] = 5.0;
+            predicted[high.index()] = 5.0;
+            predicted[input.index()] = 5.0;
 
-        evaluate_iteration(&ir, &mut workspace, &predicted);
+            evaluate_iteration(&ir, &mut workspace, &predicted);
 
-        let factorized = ir
-            .iteration_matrix_sources()
-            .iter()
-            .map(|&source| workspace.value(source))
-            .collect::<Vec<_>>();
-        let rhs_reference = plan
-            .rhs_barriers()
-            .iter()
-            .map(|&source| workspace.value(source))
-            .collect::<Vec<_>>();
-        let mut scratch = DiscreteScratch::new(&plan);
+            let factorized = ir
+                .iteration_matrix_sources()
+                .iter()
+                .map(|&source| workspace.value(source))
+                .collect::<Vec<_>>();
+            let rhs_reference = plan
+                .rhs_barriers()
+                .iter()
+                .map(|&source| workspace.value(source))
+                .collect::<Vec<_>>();
+            let mut scratch = DiscreteScratch::new(&plan);
 
-        let outcome = run_discrete_closure(
-            &plan,
-            &ir,
-            &mut workspace,
-            &mut predicted,
-            &factorized,
-            &rhs_reference,
-            &mut scratch,
-        );
+            let outcome = run_discrete_closure(
+                &plan,
+                &ir,
+                &mut workspace,
+                &mut predicted,
+                &factorized,
+                &rhs_reference,
+                &mut scratch,
+            );
 
-        assert_eq!(outcome, ClosureOutcome::Barrier);
-        assert_eq!(predicted[output.index()], 5.0);
+            assert_eq!(outcome, ClosureOutcome::Barrier);
+            assert_eq!(predicted[output.index()], 5.0);
+            assert_eq!(workspace.value(rhs_source), if derived { 6.0 } else { 5.0 });
+        }
     }
 
     #[test]
