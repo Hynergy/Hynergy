@@ -1,7 +1,13 @@
 package dev.hynergy.electrical;
 
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Value;
+
+@Value
 public class DeviceDefinition {
-    private final int id;
+    @Getter(AccessLevel.PACKAGE)
+    int id;
 
     DeviceDefinition(int id) {
         if (id == 0) {
@@ -9,9 +15,5 @@ public class DeviceDefinition {
         }
 
         this.id = id;
-    }
-
-    int id() {
-        return id;
     }
 }
