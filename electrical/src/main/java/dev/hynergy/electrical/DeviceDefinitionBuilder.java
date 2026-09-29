@@ -7,6 +7,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.util.Objects;
+import java.util.function.Function;
 
 /**
  * Encodes a device definition in the HYDF format.
@@ -94,6 +95,8 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     private static final ValueLayout.OfDouble F64 =
         ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
+    private final @Nullable Function<DeviceType<?>, DeviceDefinition> definitionResolver;
+
     private @Nullable Arena arena;
     private MemorySegment buffer;
 
@@ -119,7 +122,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      * Creates a builder with the default initial buffer capacity.
      */
     public DeviceDefinitionBuilder() {
-        this(DEFAULT_INITIAL_CAPACITY);
+        this(DEFAULT_INITIAL_CAPACITY, null);
     }
 
     /**
@@ -134,6 +137,24 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *     HYDF header
      */
     DeviceDefinitionBuilder(int initialCapacity) {
+        this(initialCapacity, null);
+    }
+
+    DeviceDefinitionBuilder(
+        Function<DeviceType<?>, DeviceDefinition> definitionResolver
+    ) {
+        this(
+            DEFAULT_INITIAL_CAPACITY,
+            Objects.requireNonNull(definitionResolver, "definitionResolver")
+        );
+    }
+
+    private DeviceDefinitionBuilder(
+        int initialCapacity,
+        @Nullable Function<DeviceType<?>, DeviceDefinition> definitionResolver
+    ) {
+        this.definitionResolver = definitionResolver;
+
         if (initialCapacity < HEADER_SIZE) {
             throw new IllegalArgumentException("Initial capacity must be at least " + HEADER_SIZE + " bytes");
         }
@@ -282,6 +303,47 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
+     * Starts an element that uses a device type.
+     *
+     * <p>If this builder has a definition resolver, the resolver registers an
+     * unresolved child type before this method writes its definition ID.</p>
+     *
+     * @param type the child device type
+     *
+     * @return this builder
+     *
+     * @throws IllegalStateException if the type is not registered and this
+     *     builder cannot resolve device types
+     */
+    public DeviceDefinitionBuilder beginElement(
+        DeviceType<?> type
+    ) {
+        requireTopLevel();
+        Objects.requireNonNull(type, "type");
+
+        Function<DeviceType<?>, DeviceDefinition> definitionResolver = this.definitionResolver;
+
+        DeviceDefinition definition;
+
+        if (definitionResolver != null) {
+            definition = Objects.requireNonNull(
+                definitionResolver.apply(type),
+                "Device type resolver returned null"
+            );
+        } else {
+            definition = type.currentDefinition();
+
+            if (definition == null) {
+                throw new IllegalStateException(
+                    "Device type is not registered and this builder cannot resolve device types"
+                );
+            }
+        }
+
+        return beginElement(definition);
+    }
+
+    /**
      * Starts an element.
      *
      * <p>Add all element terminals before the first element parameter. Call
@@ -291,7 +353,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @return this builder
      */
-    public DeviceDefinitionBuilder beginElement(
+    DeviceDefinitionBuilder beginElement(
         DeviceDefinition definition
     ) {
         requireTopLevel();

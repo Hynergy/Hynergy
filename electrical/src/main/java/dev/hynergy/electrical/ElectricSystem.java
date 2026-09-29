@@ -1,18 +1,17 @@
 package dev.hynergy.electrical;
 
+import java.util.Objects;
+
 public final class ElectricSystem implements AutoCloseable {
     private final ElectricalRuntime runtime;
     private final ElectricalWorld world;
 
     private boolean closed;
 
-
     ElectricSystem(ElectricalRuntime runtime, ElectricalWorld world) {
         this.runtime = runtime;
         this.world = world;
     }
-
-
 
     public Wire createWire() {
         requireOpen();
@@ -43,14 +42,15 @@ public final class ElectricSystem implements AutoCloseable {
         world.removeWire(wire.id(), wire.generation());
     }
 
-
-
     public <T extends Device> T create(DeviceType<T> type) {
         requireOpen();
 
-        DeviceDefinition definition = runtime.requireDefinition(type);
+        Objects.requireNonNull(type, "type");
 
+        DeviceDefinition definition = runtime.requireDefinition(type);
         T device = type.construct();
+
+        device.requireUnbound();
 
         int id = world.addDevice(definition);
         int generation = world.deviceGeneration(id);
@@ -85,8 +85,6 @@ public final class ElectricSystem implements AutoCloseable {
 
         world.removeDevice(device.id(), device.generation());
     }
-
-
 
     private void requireOwned(Wire wire) {
         requireOpen();

@@ -4,7 +4,6 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.Objects;
 
-
 @SuppressWarnings("resource")
 public abstract class Device {
     private @Nullable ElectricSystem system;
@@ -15,10 +14,14 @@ public abstract class Device {
     protected Device() {
     }
 
-    final void bind(ElectricSystem system, int id, int generation) {
-        if (this.system != null) {
+    final void requireUnbound() {
+        if (system != null) {
             throw new IllegalStateException("Electrical device is already bound");
         }
+    }
+
+    final void bind(ElectricSystem system, int id, int generation) {
+        requireUnbound();
 
         this.system = Objects.requireNonNull(system, "system");
         this.id = id;
@@ -28,7 +31,6 @@ public abstract class Device {
     final boolean belongsTo(ElectricSystem system) {
         return this.system == system;
     }
-
 
     final int id() {
         requireBound();
