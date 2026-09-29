@@ -28,8 +28,7 @@ final class WorldCommandBuffer implements AutoCloseable {
 
     private static final ValueLayout.OfShort U16_LE =
         ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfInt U32_LE =
-        ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfInt U32_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfDouble F64_LE =
         ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
@@ -45,8 +44,7 @@ final class WorldCommandBuffer implements AutoCloseable {
 
     WorldCommandBuffer(int initialCapacity) {
         if (initialCapacity < HEADER_SIZE) {
-            throw new IllegalArgumentException(
-                "Initial capacity must be at least " + HEADER_SIZE + " bytes");
+            throw new IllegalArgumentException("Initial capacity must be at least " + HEADER_SIZE + " bytes");
         }
 
         arena = Arena.ofConfined();
@@ -206,21 +204,6 @@ final class WorldCommandBuffer implements AutoCloseable {
         return segment;
     }
 
-    @Override
-    public void close() {
-        Arena currentArena = arena;
-        if (currentArena == null) {
-            return;
-        }
-
-        currentArena.close();
-        arena = null;
-        segment = MemorySegment.NULL;
-        capacity = 0;
-        position = 0;
-        commandCount = 0;
-    }
-
     private int beginCommand(short tag, int payloadSize) {
         requireOpen();
 
@@ -321,5 +304,20 @@ final class WorldCommandBuffer implements AutoCloseable {
         if (arena == null) {
             throw new IllegalStateException("World command buffer is closed");
         }
+    }
+
+    @Override
+    public void close() {
+        Arena currentArena = arena;
+        if (currentArena == null) {
+            return;
+        }
+
+        currentArena.close();
+        arena = null;
+        segment = MemorySegment.NULL;
+        capacity = 0;
+        position = 0;
+        commandCount = 0;
     }
 }
