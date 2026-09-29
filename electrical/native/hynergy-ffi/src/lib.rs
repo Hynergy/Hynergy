@@ -112,7 +112,7 @@ pub enum DefinitionRegistrationCode {
     NullEngine = 1,
     NullInput = 2,
     NullResult = 3,
-    // 4 is reserved; ABI 5 exposed an unused InputTooLarge code.
+    // 4 is unused;
     InvalidMagic = 5,
     UnsupportedVersion = 6,
     InvalidFlags = 7,
@@ -137,7 +137,7 @@ pub enum DefinitionRegistrationCode {
     InvalidDefinition = 29,
     InvalidPrimitiveParameters = 30,
     UnusedInternalNode = 31,
-    // 32 is reserved; ABI 5 exposed the obsolete DisconnectedInternalComponent code.
+    // 32 is unused;
     IncompatibleParameterConstraints = 33,
     UnusedParameter = 34,
     DevicePartitionIdExhausted = 35,
@@ -363,7 +363,7 @@ pub enum WorldCode {
     Success = 0,
     NullEngine = 1,
     NullResult = 2,
-    // 3-4 are reserved; ABI 2 used them for engine-owned world IDs.
+    // 3-4 are reserved;
     InvalidTickFrequency = 5,
     InternalPanic = u32::MAX,
 }
@@ -448,7 +448,7 @@ pub enum CommandCode {
     NullWorld = 1,
     NullInput = 2,
     NullResult = 3,
-    // 4 is reserved; ABI 5 exposed an unused InputTooLarge code.
+    // 4 is unused;
     InvalidMagic = 5,
     UnsupportedVersion = 6,
     InvalidFlags = 7,
@@ -458,7 +458,7 @@ pub enum CommandCode {
     InvalidCommandLength = 11,
     InvalidId = 12,
     TrailingBytes = 13,
-    // 14 is reserved; ABI 2 used it for an unknown engine-owned world.
+    // 14 is unused;
     IdOutOfBound = 20,
     IdExceeds31Bit = 21,
     IdAlreadyAssigned = 22,
@@ -613,7 +613,7 @@ pub enum TickCode {
     NullWorld = 1,
     NullResult = 2,
     NullOutput = 3,
-    // 4 is reserved; ABI 2 used it for an unknown engine-owned world.
+    // 4 is unused;
     BufferTooSmall = 5,
 
     MissingParameter = 20,
@@ -841,7 +841,7 @@ pub enum SubscriptionCode {
 
     NullWorld = 1,
     NullResult = 2,
-    // 3 is reserved; ABI 2 used it for an unknown engine-owned world.
+    // 3 is unused;
     InvalidDeviceId = 4,
     InvalidSubscriptionId = 5,
 

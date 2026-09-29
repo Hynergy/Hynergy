@@ -97,10 +97,10 @@ public final class ElectricalWorld implements AutoCloseable {
         return id;
     }
 
-    int addDevice(int definitionId) {
+    int addDevice(DeviceDefinition definition) {
         requireUsable();
 
-        if (definitionId == 0) {
+        if (definition.getId() == 0) {
             throw new IllegalArgumentException("Definition ID must not be zero");
         }
 
@@ -108,7 +108,7 @@ public final class ElectricalWorld implements AutoCloseable {
         int generation = deviceIds.generation(id);
 
         try {
-            commandBuffer.addDevice(id, definitionId);
+            commandBuffer.addDevice(id, definition.getId());
         } catch (RuntimeException | Error failure) {
             cancelPendingAdd(deviceIds, id, generation, failure);
 
@@ -184,12 +184,7 @@ public final class ElectricalWorld implements AutoCloseable {
         commandBuffer.disconnectWires(wireAId, wireBId);
     }
 
-    void attachTerminal(int wireId,
-        int wireGeneration,
-        int deviceId,
-        int deviceGeneration,
-        int terminalId
-    ) {
+    void attachTerminal(int wireId, int wireGeneration, int deviceId, int deviceGeneration, int terminalId) {
         requireUsable();
 
         wireIds.requireUsable(wireId, wireGeneration);
@@ -199,12 +194,7 @@ public final class ElectricalWorld implements AutoCloseable {
         commandBuffer.attachTerminal(wireId, deviceId, terminalId);
     }
 
-    void detachTerminal(int wireId,
-        int wireGeneration,
-        int deviceId,
-        int deviceGeneration,
-        int terminalId
-    ) {
+    void detachTerminal(int wireId, int wireGeneration, int deviceId, int deviceGeneration, int terminalId) {
         requireUsable();
 
         wireIds.requireUsable(wireId, wireGeneration);
@@ -249,18 +239,14 @@ public final class ElectricalWorld implements AutoCloseable {
             if (code != 0) {
                 poisoned = true;
 
-                int commandIndex = commandResult.get(ValueLayout.JAVA_INT,
-                    NativeLayouts.COMMAND_RESULT_COMMAND_INDEX_OFFSET
-                );
+                int commandIndex =
+                    commandResult.get(ValueLayout.JAVA_INT, NativeLayouts.COMMAND_RESULT_COMMAND_INDEX_OFFSET);
 
-                int byteOffset = commandResult.get(ValueLayout.JAVA_INT,
-                    NativeLayouts.COMMAND_RESULT_BYTE_OFFSET
-                );
+                int byteOffset = commandResult.get(ValueLayout.JAVA_INT, NativeLayouts.COMMAND_RESULT_BYTE_OFFSET);
 
                 throw new IllegalStateException(
-                    "Native world command application failed: code=" + Integer.toUnsignedLong(code)
-                        + ", commandIndex=" + Integer.toUnsignedLong(commandIndex) + ", byteOffset="
-                        + Integer.toUnsignedLong(byteOffset));
+                    "Native world command application failed: code=" + Integer.toUnsignedLong(code) + ", commandIndex="
+                        + Integer.toUnsignedLong(commandIndex) + ", byteOffset=" + Integer.toUnsignedLong(byteOffset));
             }
 
             try {
@@ -271,7 +257,7 @@ public final class ElectricalWorld implements AutoCloseable {
 
                 throw new IllegalStateException(
                     "Native commands were applied, but Java ID state could " + "not be committed",
-                    failure
+                                                failure
                 );
             }
         } finally {
@@ -293,11 +279,7 @@ public final class ElectricalWorld implements AutoCloseable {
         final int code;
 
         try {
-            code = NativeBindings.subscribeObserver(requireUsable(),
-                deviceId,
-                observerId,
-                subscriptionIdResult
-            );
+            code = NativeBindings.subscribeObserver(requireUsable(), deviceId, observerId, subscriptionIdResult);
         } catch (RuntimeException | Error failure) {
             poisoned = true;
             throw failure;
@@ -312,8 +294,7 @@ public final class ElectricalWorld implements AutoCloseable {
         if (subscriptionId == 0) {
             poisoned = true;
 
-            throw new IllegalStateException(
-                "Native subscription creation succeeded with an invalid ID");
+            throw new IllegalStateException("Native subscription creation succeeded with an invalid ID");
         }
 
         return subscriptionId;
@@ -342,11 +323,7 @@ public final class ElectricalWorld implements AutoCloseable {
         }
     }
 
-    private void cancelPendingAdd(WorldIdAllocator allocator,
-        int id,
-        int generation,
-        Throwable failure
-    ) {
+    private void cancelPendingAdd(WorldIdAllocator allocator, int id, int generation, Throwable failure) {
         try {
             allocator.cancelPendingAdd(id, generation);
         } catch (RuntimeException | Error rollbackFailure) {
@@ -355,11 +332,7 @@ public final class ElectricalWorld implements AutoCloseable {
         }
     }
 
-    private void cancelPendingRemove(WorldIdAllocator allocator,
-        int id,
-        int generation,
-        Throwable failure
-    ) {
+    private void cancelPendingRemove(WorldIdAllocator allocator, int id, int generation, Throwable failure) {
         try {
             allocator.cancelPendingRemove(id, generation);
         } catch (RuntimeException | Error rollbackFailure) {
@@ -374,11 +347,9 @@ public final class ElectricalWorld implements AutoCloseable {
 
             case SubscriptionCode.NULL_RESULT -> "native subscription result pointer is null";
 
-            case SubscriptionCode.INVALID_DEVICE_ID ->
-                "native code rejected the validated device ID";
+            case SubscriptionCode.INVALID_DEVICE_ID -> "native code rejected the validated device ID";
 
-            case SubscriptionCode.INVALID_SUBSCRIPTION_ID ->
-                "native code rejected the validated subscription ID";
+            case SubscriptionCode.INVALID_SUBSCRIPTION_ID -> "native code rejected the validated subscription ID";
 
             case SubscriptionCode.UNKNOWN_DEVICE -> "device does not exist";
 
@@ -397,8 +368,7 @@ public final class ElectricalWorld implements AutoCloseable {
         };
 
         throw new IllegalStateException(
-            "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code)
-                + ")");
+            "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code) + ")");
     }
 
     @NonNull MemorySegment requireOpen() {
@@ -413,8 +383,7 @@ public final class ElectricalWorld implements AutoCloseable {
         MemorySegment world = requireOpen();
 
         if (poisoned) {
-            throw new IllegalStateException(
-                "Electrical world is unusable after an unrecoverable failure");
+            throw new IllegalStateException("Electrical world is unusable after an unrecoverable failure");
         }
 
         return world;
