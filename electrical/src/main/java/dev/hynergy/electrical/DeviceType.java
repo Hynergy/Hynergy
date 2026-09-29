@@ -27,29 +27,15 @@ public final class DeviceType<T extends Device> {
         Supplier<T> constructor,
         Consumer<DeviceDefinitionBuilder> definitionBuilder
     ) {
-        return new DeviceType<>(
-            constructor,
-            null,
-            Objects.requireNonNull(definitionBuilder, "definitionBuilder")
-        );
+        return new DeviceType<>(constructor, null, Objects.requireNonNull(definitionBuilder, "definitionBuilder"));
     }
 
-    static <T extends Device> DeviceType<T> primitive(
-        int definitionId,
-        Supplier<T> constructor
-    ) {
-        return new DeviceType<>(
-            constructor,
-            new DeviceDefinition(definitionId),
-            null
-        );
+    public static <T extends Device> DeviceType<T> primitive(int definitionId, Supplier<T> constructor) {
+        return new DeviceType<>(constructor, new DeviceDefinition(definitionId), null);
     }
 
     T construct() {
-        return Objects.requireNonNull(
-            constructor.get(),
-            "Device constructor returned null"
-        );
+        return Objects.requireNonNull(constructor.get(), "Device constructor returned null");
     }
 
     void buildDefinition(DeviceDefinitionBuilder builder) {
@@ -62,8 +48,7 @@ public final class DeviceType<T extends Device> {
         definitionBuilder.accept(Objects.requireNonNull(builder, "builder"));
     }
 
-    @Nullable
-    DeviceDefinition currentDefinition() {
+    @Nullable DeviceDefinition currentDefinition() {
         DeviceDefinition primitiveDefinition = this.primitiveDefinition;
 
         if (primitiveDefinition != null) {
@@ -75,8 +60,7 @@ public final class DeviceType<T extends Device> {
         return registration == null ? null : registration.definition();
     }
 
-    @Nullable
-    DeviceDefinition existingDefinition(ElectricalRuntime runtime) {
+    @Nullable DeviceDefinition existingDefinition(ElectricalRuntime runtime) {
         Objects.requireNonNull(runtime, "runtime");
 
         DeviceDefinition primitiveDefinition = this.primitiveDefinition;
@@ -104,10 +88,7 @@ public final class DeviceType<T extends Device> {
         return definition;
     }
 
-    synchronized void bind(
-        ElectricalRuntime runtime,
-        DeviceDefinition definition
-    ) {
+    synchronized void bind(ElectricalRuntime runtime, DeviceDefinition definition) {
         Objects.requireNonNull(runtime, "runtime");
         Objects.requireNonNull(definition, "definition");
 
@@ -132,9 +113,6 @@ public final class DeviceType<T extends Device> {
         }
     }
 
-    private record Registration(
-        ElectricalRuntime runtime,
-        DeviceDefinition definition
-    ) {
+    private record Registration(ElectricalRuntime runtime, DeviceDefinition definition) {
     }
 }
