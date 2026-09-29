@@ -45,9 +45,12 @@ public final class ElectricalEngine implements AutoCloseable {
 
             return new ElectricalEngine(arena, handle);
         } catch (RuntimeException | Error failure) {
+            boolean engineReleased = MemorySegment.NULL.equals(rawHandle);
+
             if (cleanupRegistered) {
                 try {
                     arena.close();
+                    engineReleased = true;
                 } catch (RuntimeException | Error closeFailure) {
                     failure.addSuppressed(closeFailure);
                 }
@@ -55,6 +58,7 @@ public final class ElectricalEngine implements AutoCloseable {
                 if (!MemorySegment.NULL.equals(rawHandle)) {
                     try {
                         NativeBindings.destroyEngine(rawHandle);
+                        engineReleased = true;
                     } catch (RuntimeException | Error destroyFailure) {
                         failure.addSuppressed(destroyFailure);
                     }
@@ -67,7 +71,9 @@ public final class ElectricalEngine implements AutoCloseable {
                 }
             }
 
-            engineAlreadyInstantiated.set(false);
+            if (engineReleased) {
+                engineAlreadyInstantiated.set(false);
+            }
 
             throw failure;
         }
