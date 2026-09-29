@@ -7,12 +7,6 @@ public final class NativeBindings {
     private static final Linker LINKER = Linker.nativeLinker();
     private static final SymbolLookup SYMBOLS = NativeLibrary.load();
 
-    private static MethodHandle downcall(String name, FunctionDescriptor descriptor) {
-        MemorySegment symbol = SYMBOLS.find(name)
-            .orElseThrow(() -> new IllegalStateException("Missing native symbol: " + name));
-
-        return LINKER.downcallHandle(symbol, descriptor);
-    }
 
     private static final MethodHandle ABI_VERSION =
         downcall("hynergy_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
@@ -25,6 +19,8 @@ public final class NativeBindings {
         }
     }
 
+
+
     private static final MethodHandle ABI_REVISION =
         downcall("hynergy_abi_revision", FunctionDescriptor.of(ValueLayout.JAVA_INT));
 
@@ -36,8 +32,11 @@ public final class NativeBindings {
         }
     }
 
-    private static final MethodHandle ENGINE_CREATE = downcall("hynergy_engine_create",
-        FunctionDescriptor.of(ValueLayout.ADDRESS, // return EngineHandle*
+
+
+    private static final MethodHandle ENGINE_CREATE = downcall(
+        "hynergy_engine_create", FunctionDescriptor.of(
+            ValueLayout.ADDRESS, // return EngineHandle*
             ValueLayout.JAVA_INT // max_worker_threads
         )
     );
@@ -50,6 +49,8 @@ public final class NativeBindings {
         }
     }
 
+
+
     private static final MethodHandle ENGINE_DESTROY =
         downcall("hynergy_engine_destroy", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
 
@@ -57,14 +58,40 @@ public final class NativeBindings {
         try {
             ENGINE_DESTROY.invokeExact(engine);
         } catch (Throwable throwable) {
-            throw new IllegalStateException("Failed to destroy native electrical engine",
-                throwable
-            );
+            throw new IllegalStateException("Failed to destroy native electrical engine", throwable);
         }
     }
 
-    private static final MethodHandle ENGINE_CREATE_WORLD = downcall("hynergy_engine_create_world",
-        FunctionDescriptor.of(ValueLayout.JAVA_INT, // return u32
+
+
+    private static final MethodHandle ENGINE_REGISTER_DEFINITION = downcall(
+        "hynergy_engine_register_definition", FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, // return u32
+            ValueLayout.ADDRESS, // EngineHandle*
+            ValueLayout.ADDRESS, // input
+            ValueLayout.JAVA_INT, // input_len
+            ValueLayout.ADDRESS // DefinitionRegistrationResult*
+        )
+    );
+
+    public static int registerDefinition(
+        MemorySegment engine,
+        MemorySegment input,
+        int inputLength,
+        MemorySegment result
+    ) {
+        try {
+            return (int) ENGINE_REGISTER_DEFINITION.invokeExact(engine, input, inputLength, result);
+        } catch (Throwable throwable) {
+            throw new IllegalStateException("Failed to register native electrical device definition", throwable);
+        }
+    }
+
+
+
+    private static final MethodHandle ENGINE_CREATE_WORLD = downcall(
+        "hynergy_engine_create_world", FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, // return u32
             ValueLayout.ADDRESS,  // EngineHandle*
             ValueLayout.JAVA_INT, // tick_frequency_hz
             ValueLayout.ADDRESS   // WorldHandle*
@@ -79,6 +106,8 @@ public final class NativeBindings {
         }
     }
 
+
+
     private static final MethodHandle WORLD_DESTROY =
         downcall("hynergy_world_destroy", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
 
@@ -90,33 +119,31 @@ public final class NativeBindings {
         }
     }
 
-    private static final MethodHandle WORLD_APPLY_COMMANDS =
-        downcall("hynergy_world_apply_commands",
-            FunctionDescriptor.of(ValueLayout.JAVA_INT, // return u32
-                ValueLayout.ADDRESS,  // WorldHandle*
-                ValueLayout.ADDRESS,  // input
-                ValueLayout.JAVA_INT, // input_len
-                ValueLayout.ADDRESS   // CommandResult*
-            )
-        );
 
-    public static int applyCommands(MemorySegment world,
-        MemorySegment input,
-        int inputLength,
-        MemorySegment result
-    ) {
+
+    private static final MethodHandle WORLD_APPLY_COMMANDS = downcall(
+        "hynergy_world_apply_commands", FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, // return u32
+            ValueLayout.ADDRESS,  // WorldHandle*
+            ValueLayout.ADDRESS,  // input
+            ValueLayout.JAVA_INT, // input_len
+            ValueLayout.ADDRESS   // CommandResult*
+        )
+    );
+
+    public static int applyCommands(MemorySegment world, MemorySegment input, int inputLength, MemorySegment result) {
         try {
             return (int) WORLD_APPLY_COMMANDS.invokeExact(world, input, inputLength, result);
         } catch (Throwable throwable) {
-            throw new IllegalStateException("Failed to apply native electrical world commands",
-                throwable
-            );
+            throw new IllegalStateException("Failed to apply native electrical world commands", throwable);
         }
     }
 
+
+
     private static final MethodHandle WORLD_SUBSCRIBE_OBSERVER = downcall(
-        "hynergy_world_subscribe_observer",
-        FunctionDescriptor.of(ValueLayout.JAVA_INT, // return u32
+        "hynergy_world_subscribe_observer", FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, // return u32
             ValueLayout.ADDRESS,  // WorldHandle*
             ValueLayout.JAVA_INT, // device_id
             ValueLayout.JAVA_INT, // observer_id
@@ -124,26 +151,24 @@ public final class NativeBindings {
         )
     );
 
-    public static int subscribeObserver(MemorySegment world,
+    public static int subscribeObserver(
+        MemorySegment world,
         int deviceId,
         int observerId,
         MemorySegment subscriptionId
     ) {
         try {
-            return (int) WORLD_SUBSCRIBE_OBSERVER.invokeExact(world,
-                deviceId,
-                observerId,
-                subscriptionId
-            );
+            return (int) WORLD_SUBSCRIBE_OBSERVER.invokeExact(world, deviceId, observerId, subscriptionId);
         } catch (Throwable throwable) {
-            throw new IllegalStateException("Failed to create native electrical subscription",
-                throwable
-            );
+            throw new IllegalStateException("Failed to create native electrical subscription", throwable);
         }
     }
 
-    private static final MethodHandle WORLD_UNSUBSCRIBE = downcall("hynergy_world_unsubscribe",
-        FunctionDescriptor.of(ValueLayout.JAVA_INT, // return u32
+
+
+    private static final MethodHandle WORLD_UNSUBSCRIBE = downcall(
+        "hynergy_world_unsubscribe", FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, // return u32
             ValueLayout.ADDRESS,  // WorldHandle*
             ValueLayout.JAVA_INT  // subscription_id
         )
@@ -153,9 +178,16 @@ public final class NativeBindings {
         try {
             return (int) WORLD_UNSUBSCRIBE.invokeExact(world, subscriptionId);
         } catch (Throwable throwable) {
-            throw new IllegalStateException("Failed to remove native electrical subscription",
-                throwable
-            );
+            throw new IllegalStateException("Failed to remove native electrical subscription", throwable);
         }
+    }
+
+
+
+    private static MethodHandle downcall(String name, FunctionDescriptor descriptor) {
+        MemorySegment symbol =
+            SYMBOLS.find(name).orElseThrow(() -> new IllegalStateException("Missing native symbol: " + name));
+
+        return LINKER.downcallHandle(symbol, descriptor);
     }
 }
