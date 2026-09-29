@@ -6,7 +6,7 @@ import lombok.Value;
 
 @Value
 public class DeviceDefinition {
-    @Getter(AccessLevel.PACKAGE)
+    @Getter(AccessLevel.NONE)
     int id;
 
     DeviceDefinition(int id) {
@@ -15,5 +15,9 @@ public class DeviceDefinition {
         }
 
         this.id = id;
+    }
+
+    int id() {
+        return id;
     }
 }

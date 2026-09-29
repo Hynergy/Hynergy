@@ -100,7 +100,7 @@ public final class ElectricalWorld implements AutoCloseable {
     int addDevice(DeviceDefinition definition) {
         requireUsable();
 
-        if (definition.getId() == 0) {
+        if (definition.id() == 0) {
             throw new IllegalArgumentException("Definition ID must not be zero");
         }
 
@@ -108,7 +108,7 @@ public final class ElectricalWorld implements AutoCloseable {
         int generation = deviceIds.generation(id);
 
         try {
-            commandBuffer.addDevice(id, definition.getId());
+            commandBuffer.addDevice(id, definition.id());
         } catch (RuntimeException | Error failure) {
             cancelPendingAdd(deviceIds, id, generation, failure);
 
