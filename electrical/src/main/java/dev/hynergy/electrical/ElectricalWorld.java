@@ -25,44 +25,34 @@ public final class ElectricalWorld implements AutoCloseable {
         static final int INTERNAL_PANIC = -1;
     }
 
+    private final Arena arena;
+    private final MemorySegment handle;
+
     private final WorldIdAllocator wireIds;
     private final WorldIdAllocator deviceIds;
 
     private final WorldCommandBuffer commandBuffer;
-    private final Arena scratchArena;
     private final MemorySegment commandResult;
     private final MemorySegment subscriptionIdResult;
 
-    private MemorySegment handle;
     private boolean poisoned;
 
-    ElectricalWorld(MemorySegment handle) {
-        if (MemorySegment.NULL.equals(handle)) {
-            throw new IllegalArgumentException("World handle must not be null");
-        }
+    ElectricalWorld(Arena arena, MemorySegment handle) {
+        this.arena = arena;
+        this.handle = handle;
 
         WorldCommandBuffer commandBuffer = null;
-        Arena scratchArena = null;
 
         try {
             this.wireIds = new WorldIdAllocator();
             this.deviceIds = new WorldIdAllocator();
 
             commandBuffer = new WorldCommandBuffer();
-            scratchArena = Arena.ofConfined();
 
-            this.commandResult = scratchArena.allocate(NativeLayouts.COMMAND_RESULT);
+            this.commandResult = arena.allocate(NativeLayouts.COMMAND_RESULT);
 
-            this.subscriptionIdResult = scratchArena.allocate(ValueLayout.JAVA_INT);
+            this.subscriptionIdResult = arena.allocate(ValueLayout.JAVA_INT);
         } catch (RuntimeException | Error failure) {
-            if (scratchArena != null) {
-                try {
-                    scratchArena.close();
-                } catch (RuntimeException | Error closeFailure) {
-                    failure.addSuppressed(closeFailure);
-                }
-            }
-
             if (commandBuffer != null) {
                 try {
                     commandBuffer.close();
@@ -74,9 +64,7 @@ public final class ElectricalWorld implements AutoCloseable {
             throw failure;
         }
 
-        this.handle = handle;
         this.commandBuffer = commandBuffer;
-        this.scratchArena = scratchArena;
     }
 
     int addWire() {
@@ -371,7 +359,7 @@ public final class ElectricalWorld implements AutoCloseable {
     }
 
     MemorySegment requireOpen() {
-        if (MemorySegment.NULL.equals(handle)) {
+        if (!arena.scope().isAlive()) {
             throw new IllegalStateException("Electrical world is closed");
         }
 
@@ -390,17 +378,30 @@ public final class ElectricalWorld implements AutoCloseable {
 
     @Override
     public void close() {
-        if (MemorySegment.NULL.equals(handle)) {
+        if (!arena.scope().isAlive()) {
             return;
         }
 
-        MemorySegment world = handle;
+        RuntimeException failure = null;
 
-        commandBuffer.close();
-        scratchArena.close();
+        try {
+            commandBuffer.close();
+        } catch (RuntimeException exception) {
+            failure = exception;
+        }
 
-        handle = MemorySegment.NULL;
+        try {
+            arena.close();
+        } catch (RuntimeException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        }
 
-        NativeBindings.destroyWorld(world);
+        if (failure != null) {
+            throw failure;
+        }
     }
 }
