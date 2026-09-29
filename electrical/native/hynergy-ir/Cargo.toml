@@ -2,6 +2,7 @@
 name = "hynergy-ir"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 hynergy-mna = { path = "../hynergy-mna" }

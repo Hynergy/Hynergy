@@ -2,6 +2,7 @@
 name = "hynergy-mna"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 faer = {
