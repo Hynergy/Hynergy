@@ -8,11 +8,10 @@ import dev.hynergy.electrical.Wire;
 public final class TickDelay extends Device {
     public static final DeviceType<TickDelay> TYPE = DeviceType.primitive(11, TickDelay::new);
 
-    private static final int TERMINAL_A = 0;
-    private static final int TERMINAL_B = 1;
-    private static final int TERMINAL_C = 2;
-    private static final int TERMINAL_D = 3;
-
+    private static final int TERMINAL_INPUT_POSITIVE = 0;
+    private static final int TERMINAL_INPUT_NEGATIVE = 1;
+    private static final int TERMINAL_OUTPUT_POSITIVE = 2;
+    private static final int TERMINAL_OUTPUT_NEGATIVE = 3;
 
     private TickDelay() {
     }
@@ -21,36 +20,35 @@ public final class TickDelay extends Device {
         return system.create(TYPE);
     }
 
-
-    public void attachA(Wire wire) {
-        attachTerminal(TERMINAL_A, wire);
+    public void attachInputPositive(Wire wire) {
+        attachTerminal(TERMINAL_INPUT_POSITIVE, wire);
     }
 
-    public void detachA(Wire wire) {
-        detachTerminal(TERMINAL_A, wire);
+    public void detachInputPositive(Wire wire) {
+        detachTerminal(TERMINAL_INPUT_POSITIVE, wire);
     }
 
-    public void attachB(Wire wire) {
-        attachTerminal(TERMINAL_B, wire);
+    public void attachInputNegative(Wire wire) {
+        attachTerminal(TERMINAL_INPUT_NEGATIVE, wire);
     }
 
-    public void detachB(Wire wire) {
-        detachTerminal(TERMINAL_B, wire);
+    public void detachInputNegative(Wire wire) {
+        detachTerminal(TERMINAL_INPUT_NEGATIVE, wire);
     }
 
-    public void attachC(Wire wire) {
-        attachTerminal(TERMINAL_C, wire);
+    public void attachOutputPositive(Wire wire) {
+        attachTerminal(TERMINAL_OUTPUT_POSITIVE, wire);
     }
 
-    public void detachC(Wire wire) {
-        detachTerminal(TERMINAL_C, wire);
+    public void detachOutputPositive(Wire wire) {
+        detachTerminal(TERMINAL_OUTPUT_POSITIVE, wire);
     }
 
-    public void attachD(Wire wire) {
-        attachTerminal(TERMINAL_D, wire);
+    public void attachOutputNegative(Wire wire) {
+        attachTerminal(TERMINAL_OUTPUT_NEGATIVE, wire);
     }
 
-    public void detachD(Wire wire) {
-        detachTerminal(TERMINAL_D, wire);
+    public void detachOutputNegative(Wire wire) {
+        detachTerminal(TERMINAL_OUTPUT_NEGATIVE, wire);
     }
 }

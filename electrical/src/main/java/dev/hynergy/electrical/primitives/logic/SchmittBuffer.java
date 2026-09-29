@@ -8,86 +8,81 @@ import dev.hynergy.electrical.Wire;
 public final class SchmittBuffer extends Device {
     public static final DeviceType<SchmittBuffer> TYPE = DeviceType.primitive(18, SchmittBuffer::new);
 
+    private static final int TERMINAL_OUTPUT = 0;
+    private static final int TERMINAL_VDD = 1;
+    private static final int TERMINAL_VSS = 2;
+    private static final int TERMINAL_INPUT = 3;
 
-    private static final int TERMINAL_A = 0;
-    private static final int TERMINAL_B = 1;
-    private static final int TERMINAL_C = 2;
-    private static final int TERMINAL_D = 3;
-
-    private static final int PARAMETER_VSS_THRESHOLD = 0;
-    private static final int PARAMETER_HYSTERESIS = 1;
-    private static final int PARAMETER_G_MAX = 2;
-    private static final int PARAMETER_G_MIN = 3;
-
+    private static final int PARAMETER_THRESHOLD_RELATIVE_TO_VSS = 0;
+    private static final int PARAMETER_HYSTERESIS_WIDTH = 1;
+    private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 2;
+    private static final int PARAMETER_MINIMUM_CONDUCTANCE = 3;
 
     private SchmittBuffer() {
     }
 
     public static SchmittBuffer create(
         ElectricSystem system,
-        double vssThreshold,
-        double hysteresis,
-        double gMin,
-        double gMax
+        double thresholdRelativeToVss,
+        double hysteresisWidth,
+        double maximumConductance,
+        double minimumConductance
     ) {
         SchmittBuffer device = system.create(TYPE);
 
-        device.setVssThreshold(vssThreshold);
-        device.setHysteresis(hysteresis);
-
-        device.setGMax(gMax);
-        device.setGMin(gMin);
+        device.setThresholdRelativeToVss(thresholdRelativeToVss);
+        device.setHysteresisWidth(hysteresisWidth);
+        device.setMaximumConductance(maximumConductance);
+        device.setMinimumConductance(minimumConductance);
 
         return device;
     }
 
-
-    public void setVssThreshold(double value) {
-        setParameter(PARAMETER_VSS_THRESHOLD, value);
+    public void setThresholdRelativeToVss(double value) {
+        setParameter(PARAMETER_THRESHOLD_RELATIVE_TO_VSS, value);
     }
 
-    public void setHysteresis(double value) {
-        setParameter(PARAMETER_HYSTERESIS, value);
+    public void setHysteresisWidth(double value) {
+        setParameter(PARAMETER_HYSTERESIS_WIDTH, value);
     }
 
-    public void setGMax(double value) {
-        setParameter(PARAMETER_G_MAX, value);
+    public void setMaximumConductance(double value) {
+        setParameter(PARAMETER_MAXIMUM_CONDUCTANCE, value);
     }
 
-    public void setGMin(double value) {
-        setParameter(PARAMETER_G_MIN, value);
+    public void setMinimumConductance(double value) {
+        setParameter(PARAMETER_MINIMUM_CONDUCTANCE, value);
     }
 
-
-    public void attachA(Wire wire) {
-        attachTerminal(TERMINAL_A, wire);
+    public void attachOutput(Wire wire) {
+        attachTerminal(TERMINAL_OUTPUT, wire);
     }
 
-    public void detachA(Wire wire) {
-        detachTerminal(TERMINAL_A, wire);
+    public void detachOutput(Wire wire) {
+        detachTerminal(TERMINAL_OUTPUT, wire);
     }
 
-    public void attachB(Wire wire) {
-        attachTerminal(TERMINAL_B, wire);
+    public void attachVdd(Wire wire) {
+        attachTerminal(TERMINAL_VDD, wire);
     }
 
-    public void detachB(Wire wire) {
-        detachTerminal(TERMINAL_B, wire);
+    public void detachVdd(Wire wire) {
+        detachTerminal(TERMINAL_VDD, wire);
     }
 
-    public void attachC(Wire wire) {
-        attachTerminal(TERMINAL_C, wire);
+    public void attachVss(Wire wire) {
+        attachTerminal(TERMINAL_VSS, wire);
     }
 
-    public void detachC(Wire wire) {
-        detachTerminal(TERMINAL_C, wire);
+    public void detachVss(Wire wire) {
+        detachTerminal(TERMINAL_VSS, wire);
     }
 
-    public void attachD(Wire wire) {
-        attachTerminal(TERMINAL_D, wire);
+    public void attachInput(Wire wire) {
+        attachTerminal(TERMINAL_INPUT, wire);
     }
 
-    public void detachD(Wire wire) {
-        detachTerminal(TERMINAL_D, wire);
+    public void detachInput(Wire wire) {
+        detachTerminal(TERMINAL_INPUT, wire);
     }
 }

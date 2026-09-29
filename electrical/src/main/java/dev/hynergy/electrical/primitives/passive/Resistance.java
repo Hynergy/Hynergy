@@ -8,8 +8,8 @@ import dev.hynergy.electrical.Wire;
 public final class Resistance extends Device {
     public static final DeviceType<Resistance> TYPE = DeviceType.primitive(1, Resistance::new);
 
-    private static final int TERMINAL_A = 0;
-    private static final int TERMINAL_B = 1;
+    private static final int TERMINAL_POSITIVE = 0;
+    private static final int TERMINAL_NEGATIVE = 1;
 
     private static final int PARAMETER_RESISTANCE = 0;
 
@@ -28,19 +28,19 @@ public final class Resistance extends Device {
         setParameter(PARAMETER_RESISTANCE, resistance);
     }
 
-    public void attachA(Wire wire) {
-        attachTerminal(TERMINAL_A, wire);
+    public void attachPositive(Wire wire) {
+        attachTerminal(TERMINAL_POSITIVE, wire);
     }
 
-    public void attachB(Wire wire) {
-        attachTerminal(TERMINAL_B, wire);
+    public void attachNegative(Wire wire) {
+        attachTerminal(TERMINAL_NEGATIVE, wire);
     }
 
-    public void detachA(Wire wire) {
-        detachTerminal(TERMINAL_A, wire);
+    public void detachPositive(Wire wire) {
+        detachTerminal(TERMINAL_POSITIVE, wire);
     }
 
-    public void detachB(Wire wire) {
-        detachTerminal(TERMINAL_B, wire);
+    public void detachNegative(Wire wire) {
+        detachTerminal(TERMINAL_NEGATIVE, wire);
     }
 }

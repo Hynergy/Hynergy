@@ -8,8 +8,8 @@ import dev.hynergy.electrical.Wire;
 public final class VoltageSource extends Device {
     public static final DeviceType<VoltageSource> TYPE = DeviceType.primitive(3, VoltageSource::new);
 
-    private static final int TERMINAL_A = 0;
-    private static final int TERMINAL_B = 1;
+    private static final int TERMINAL_POSITIVE = 0;
+    private static final int TERMINAL_NEGATIVE = 1;
 
     private static final int PARAMETER_VOLTAGE = 0;
 
@@ -24,23 +24,23 @@ public final class VoltageSource extends Device {
         return device;
     }
 
-    public void setVoltage(double value) {
-        setParameter(PARAMETER_VOLTAGE, value);
+    public void setVoltage(double voltage) {
+        setParameter(PARAMETER_VOLTAGE, voltage);
     }
 
-    public void attachA(Wire wire) {
-        attachTerminal(TERMINAL_A, wire);
+    public void attachPositive(Wire wire) {
+        attachTerminal(TERMINAL_POSITIVE, wire);
     }
 
-    public void attachB(Wire wire) {
-        attachTerminal(TERMINAL_B, wire);
+    public void attachNegative(Wire wire) {
+        attachTerminal(TERMINAL_NEGATIVE, wire);
     }
 
-    public void detachA(Wire wire) {
-        detachTerminal(TERMINAL_A, wire);
+    public void detachPositive(Wire wire) {
+        detachTerminal(TERMINAL_POSITIVE, wire);
     }
 
-    public void detachB(Wire wire) {
-        detachTerminal(TERMINAL_B, wire);
+    public void detachNegative(Wire wire) {
+        detachTerminal(TERMINAL_NEGATIVE, wire);
     }
 }
