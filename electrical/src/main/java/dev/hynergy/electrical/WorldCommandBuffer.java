@@ -266,6 +266,7 @@ final class WorldCommandBuffer implements AutoCloseable {
         segment = newSegment;
         capacity = newCapacity;
 
+        assert oldArena != null;
         oldArena.close();
     }
 

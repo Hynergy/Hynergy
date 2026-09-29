@@ -10,36 +10,67 @@ import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ElectricalEngine implements AutoCloseable {
-    private MemorySegment handle;
+    private final Arena arena;
+    private final MemorySegment handle;
 
     private static final AtomicBoolean engineAlreadyInstantiated = new AtomicBoolean(false);
     private final AtomicBoolean definitionRegistrationPoisoned = new AtomicBoolean(false);
 
-    private ElectricalEngine(MemorySegment handle) {
+
+    private ElectricalEngine(Arena arena, MemorySegment handle) {
+        this.arena = arena;
         this.handle = handle;
     }
+
 
     public static ElectricalEngine create() {
         if (!engineAlreadyInstantiated.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine already instantiated");
         }
 
-        MemorySegment handle;
+        Arena arena = Arena.ofShared();
+        MemorySegment rawHandle = MemorySegment.NULL;
+        boolean cleanupRegistered = false;
 
         try {
-            handle = NativeBindings.createEngine(1);
+            rawHandle = NativeBindings.createEngine(1);
+
+            if (MemorySegment.NULL.equals(rawHandle)) {
+                throw new IllegalStateException("Native electrical engine creation returned a null handle");
+            }
+
+            MemorySegment handle = rawHandle.reinterpret(arena, NativeBindings::destroyEngine);
+
+            cleanupRegistered = true;
+
+            return new ElectricalEngine(arena, handle);
         } catch (RuntimeException | Error failure) {
+            if (cleanupRegistered) {
+                try {
+                    arena.close();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            } else {
+                if (!MemorySegment.NULL.equals(rawHandle)) {
+                    try {
+                        NativeBindings.destroyEngine(rawHandle);
+                    } catch (RuntimeException | Error destroyFailure) {
+                        failure.addSuppressed(destroyFailure);
+                    }
+                }
+
+                try {
+                    arena.close();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+
             engineAlreadyInstantiated.set(false);
+
             throw failure;
         }
-
-        if (MemorySegment.NULL.equals(handle)) {
-            engineAlreadyInstantiated.set(false);
-
-            throw new IllegalStateException("Native electrical engine creation returned a null handle");
-        }
-
-        return new ElectricalEngine(handle);
     }
 
     /**
@@ -194,16 +225,18 @@ public final class ElectricalEngine implements AutoCloseable {
             throw new IllegalArgumentException("Tick frequency must be greater than zero");
         }
 
-        MemorySegment worldHandle;
+        MemorySegment engine = requireOpen();
+        Arena arena = Arena.ofConfined();
 
-        try (Arena arena = Arena.ofConfined()) {
+        try {
             MemorySegment worldResult = arena.allocate(ValueLayout.ADDRESS);
 
-            int code = NativeBindings.createWorld(requireOpen(), tickFrequencyHz, worldResult);
+            int code = NativeBindings.createWorld(engine, tickFrequencyHz, worldResult);
 
             switch (code) {
                 case WorldCode.SUCCESS -> {
                 }
+
                 case WorldCode.NULL_ENGINE ->
                     throw new IllegalStateException("Native ABI reported a null engine handle");
 
@@ -220,20 +253,32 @@ public final class ElectricalEngine implements AutoCloseable {
                     "Unknown native world creation status: " + Integer.toUnsignedLong(code));
             }
 
-            worldHandle = worldResult.get(ValueLayout.ADDRESS, 0);
+            MemorySegment rawHandle = worldResult.get(ValueLayout.ADDRESS, 0);
 
-            if (MemorySegment.NULL.equals(worldHandle)) {
-                throw new IllegalStateException("Native world creation succeeded with a null " + "handle");
+            if (MemorySegment.NULL.equals(rawHandle)) {
+                throw new IllegalStateException("Native world creation succeeded with a null handle");
             }
-        }
 
-        try {
-            return new ElectricalWorld(worldHandle);
+            final MemorySegment handle;
+
+            try {
+                handle = rawHandle.reinterpret(arena, NativeBindings::destroyWorld);
+            } catch (RuntimeException | Error failure) {
+                try {
+                    NativeBindings.destroyWorld(rawHandle);
+                } catch (RuntimeException | Error destroyFailure) {
+                    failure.addSuppressed(destroyFailure);
+                }
+
+                throw failure;
+            }
+
+            return new ElectricalWorld(arena, handle);
         } catch (RuntimeException | Error failure) {
             try {
-                NativeBindings.destroyWorld(worldHandle);
-            } catch (RuntimeException | Error destroyFailure) {
-                failure.addSuppressed(destroyFailure);
+                arena.close();
+            } catch (RuntimeException | Error closeFailure) {
+                failure.addSuppressed(closeFailure);
             }
 
             throw failure;
@@ -241,7 +286,7 @@ public final class ElectricalEngine implements AutoCloseable {
     }
 
     MemorySegment requireOpen() {
-        if (handle.equals(MemorySegment.NULL)) {
+        if (!arena.scope().isAlive()) {
             throw new IllegalStateException("Electrical engine is closed");
         }
 
@@ -250,13 +295,12 @@ public final class ElectricalEngine implements AutoCloseable {
 
     @Override
     public void close() {
-        if (MemorySegment.NULL.equals(handle)) {
+        if (!arena.scope().isAlive()) {
             return;
         }
 
-        NativeBindings.destroyEngine(handle);
+        arena.close();
 
-        handle = MemorySegment.NULL;
         engineAlreadyInstantiated.set(false);
     }
 
