@@ -1,6 +1,5 @@
 package dev.hynergy.electrical;
 
-import org.jspecify.annotations.NonNull;
 import org.jspecify.annotations.Nullable;
 
 import java.lang.foreign.Arena;
@@ -37,7 +36,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
          *
          * @return the bound
          */
-        public static @NonNull Bound inclusive(double value) {
+        public static Bound inclusive(double value) {
             return new Bound(value, true);
         }
 
@@ -48,7 +47,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
          *
          * @return the bound
          */
-        public static @NonNull Bound exclusive(double value) {
+        public static Bound exclusive(double value) {
             return new Bound(value, false);
         }
     }
@@ -167,7 +166,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @throws IllegalStateException if the builder is closed
      */
-    public @NonNull DeviceDefinitionBuilder reset() {
+    public DeviceDefinitionBuilder reset() {
         requireOpen();
         resetState();
 
@@ -292,8 +291,8 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @return this builder
      */
-    public @NonNull DeviceDefinitionBuilder beginElement(
-        @NonNull DeviceDefinition definition
+    public DeviceDefinitionBuilder beginElement(
+        DeviceDefinition definition
     ) {
         requireTopLevel();
         Objects.requireNonNull(definition, "definition");
@@ -343,7 +342,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @return this builder
      */
-    public @NonNull DeviceDefinitionBuilder elementTerminal(
+    public DeviceDefinitionBuilder elementTerminal(
         int nodeId
     ) {
         requireElementOpen();
@@ -373,7 +372,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @throws IllegalArgumentException if the value is not finite
      */
-    public @NonNull DeviceDefinitionBuilder elementLiteral(
+    public DeviceDefinitionBuilder elementLiteral(
         double value
     ) {
         requireElementOpen();
@@ -404,7 +403,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @return this builder
      */
-    public @NonNull DeviceDefinitionBuilder elementParameter(
+    public DeviceDefinitionBuilder elementParameter(
         int parameterId
     ) {
         requireElementOpen();
@@ -520,7 +519,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @return the encoded definition
      */
-    @NonNull MemorySegment encodedSegment() {
+    MemorySegment encodedSegment() {
         requireComplete();
 
         return buffer.asSlice(0, position);
@@ -583,7 +582,8 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
 
         int parameterId = nextParameterId();
 
-        int flags = boundFlags(lower, CONSTRAINT_LOWER, CONSTRAINT_LOWER_INCLUSIVE) | boundFlags(upper,
+        int flags = boundFlags(lower, CONSTRAINT_LOWER, CONSTRAINT_LOWER_INCLUSIVE) | boundFlags(
+            upper,
             CONSTRAINT_UPPER,
             CONSTRAINT_UPPER_INCLUSIVE
         );
@@ -875,7 +875,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      * @param count the number of existing items
      * @param name the item name for the error message
      */
-    private static void requireExistingId(int id, long count, @NonNull String name) {
+    private static void requireExistingId(int id, long count, String name) {
         long unsigned = Integer.toUnsignedLong(id);
 
         if (unsigned >= count) {

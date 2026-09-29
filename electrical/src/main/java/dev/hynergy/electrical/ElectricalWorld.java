@@ -2,7 +2,6 @@ package dev.hynergy.electrical;
 
 import dev.hynergy.electrical.internal.NativeBindings;
 import dev.hynergy.electrical.internal.NativeLayouts;
-import org.jspecify.annotations.NonNull;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -371,7 +370,7 @@ public final class ElectricalWorld implements AutoCloseable {
             "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code) + ")");
     }
 
-    @NonNull MemorySegment requireOpen() {
+    MemorySegment requireOpen() {
         if (MemorySegment.NULL.equals(handle)) {
             throw new IllegalStateException("Electrical world is closed");
         }
@@ -379,7 +378,7 @@ public final class ElectricalWorld implements AutoCloseable {
         return handle;
     }
 
-    private @NonNull MemorySegment requireUsable() {
+    private MemorySegment requireUsable() {
         MemorySegment world = requireOpen();
 
         if (poisoned) {
