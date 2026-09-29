@@ -16,9 +16,7 @@ final class NativeLibrary {
         String platform = switch (arch) {
             case "amd64", "x86_64" -> "x86_64";
             case "aarch64", "arm64" -> "aarch64";
-            default -> throw new IllegalStateException(
-                    "Unsupported architecture: " + System.getProperty("os.arch")
-            );
+            default -> throw new IllegalStateException("Unsupported architecture: " + System.getProperty("os.arch"));
         };
 
         String fileName;
@@ -34,19 +32,14 @@ final class NativeLibrary {
             osName = "linux";
             fileName = "libhynergy_electrical.so";
         } else {
-            throw new IllegalStateException(
-                    "Unsupported operating system: " + System.getProperty("os.name")
-            );
+            throw new IllegalStateException("Unsupported operating system: " + System.getProperty("os.name"));
         }
 
-        String resourcePath =
-                "/natives/" + osName + "-" + platform + "/" + fileName;
+        String resourcePath = "/natives/" + osName + "-" + platform + "/" + fileName;
 
         try (InputStream input = NativeLibrary.class.getResourceAsStream(resourcePath)) {
             if (input == null) {
-                throw new IllegalStateException(
-                        "Native electrical library resource not found: " + resourcePath
-                );
+                throw new IllegalStateException("Native electrical library resource not found: " + resourcePath);
             }
 
             Path directory = Files.createTempDirectory("hynergy-electrical-");
@@ -61,10 +54,7 @@ final class NativeLibrary {
 
             return SymbolLookup.loaderLookup();
         } catch (IOException exception) {
-            throw new IllegalStateException(
-                    "Failed to extract native electrical library: " + resourcePath,
-                    exception
-            );
+            throw new IllegalStateException("Failed to extract native electrical library: " + resourcePath, exception);
         }
     }
 }

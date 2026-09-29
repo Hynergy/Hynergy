@@ -1,5 +1,7 @@
 package dev.hynergy.electrical;
 
+import org.jspecify.annotations.Nullable;
+
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -32,7 +34,7 @@ final class WorldCommandBuffer implements AutoCloseable {
     private static final ValueLayout.OfDouble F64_LE =
         ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
-    private Arena arena;
+    private @Nullable Arena arena;
     private MemorySegment segment;
     private int capacity;
     private int position;

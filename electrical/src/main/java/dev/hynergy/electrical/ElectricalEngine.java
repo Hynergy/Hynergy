@@ -2,7 +2,6 @@ package dev.hynergy.electrical;
 
 import dev.hynergy.electrical.internal.NativeBindings;
 import dev.hynergy.electrical.internal.NativeLayouts;
-import org.jspecify.annotations.NonNull;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -56,8 +55,8 @@ public final class ElectricalEngine implements AutoCloseable {
      * @throws IllegalArgumentException if the device definition is not valid
      * @throws IllegalStateException if registration cannot continue
      */
-    public @NonNull DeviceDefinition registerDefinition(
-        @NonNull DeviceDefinitionBuilder builder
+    public DeviceDefinition registerDefinition(
+        DeviceDefinitionBuilder builder
     ) {
         Objects.requireNonNull(builder, "builder");
 
