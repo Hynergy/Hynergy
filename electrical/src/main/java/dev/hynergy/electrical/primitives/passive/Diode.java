@@ -8,49 +8,49 @@ import dev.hynergy.electrical.Wire;
 public final class Diode extends Device {
     public static final DeviceType<Diode> TYPE = DeviceType.primitive(12, Diode::new);
 
+    private static final int TERMINAL_ANODE = 0;
+    private static final int TERMINAL_CATHODE = 1;
 
-    private static final int TERMINAL_A = 0;
-    private static final int TERMINAL_B = 1;
-
-    private static final int PARAMETER_G_MAX = 0;
-    private static final int PARAMETER_G_MIN = 1;
-
+    private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 0;
+    private static final int PARAMETER_MINIMUM_CONDUCTANCE = 1;
 
     private Diode() {
     }
 
-    public static Diode create(ElectricSystem system, double gMin, double gMax) {
+    public static Diode create(
+        ElectricSystem system,
+        double maximumConductance,
+        double minimumConductance
+    ) {
         Diode device = system.create(TYPE);
 
-        device.setGMin(gMin);
-        device.setGMax(gMax);
+        device.setMaximumConductance(maximumConductance);
+        device.setMinimumConductance(minimumConductance);
 
         return device;
     }
 
-
-    public void setGMax(double value) {
-        setParameter(PARAMETER_G_MAX, value);
+    public void setMaximumConductance(double value) {
+        setParameter(PARAMETER_MAXIMUM_CONDUCTANCE, value);
     }
 
-    public void setGMin(double value) {
-        setParameter(PARAMETER_G_MIN, value);
+    public void setMinimumConductance(double value) {
+        setParameter(PARAMETER_MINIMUM_CONDUCTANCE, value);
     }
 
-
-    public void attachA(Wire wire) {
-        attachTerminal(TERMINAL_A, wire);
+    public void attachAnode(Wire wire) {
+        attachTerminal(TERMINAL_ANODE, wire);
     }
 
-    public void attachB(Wire wire) {
-        attachTerminal(TERMINAL_B, wire);
+    public void attachCathode(Wire wire) {
+        attachTerminal(TERMINAL_CATHODE, wire);
     }
 
-    public void detachA(Wire wire) {
-        detachTerminal(TERMINAL_A, wire);
+    public void detachAnode(Wire wire) {
+        detachTerminal(TERMINAL_ANODE, wire);
     }
 
-    public void detachB(Wire wire) {
-        detachTerminal(TERMINAL_B, wire);
+    public void detachCathode(Wire wire) {
+        detachTerminal(TERMINAL_CATHODE, wire);
     }
 }

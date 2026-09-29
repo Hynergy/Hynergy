@@ -9,39 +9,36 @@ public final class VoltageControlledConductance extends Device {
     public static final DeviceType<VoltageControlledConductance> TYPE =
         DeviceType.primitive(10, VoltageControlledConductance::new);
 
-
-    private static final int TERMINAL_A = 0;
-    private static final int TERMINAL_B = 1;
-    private static final int TERMINAL_C = 2;
+    private static final int TERMINAL_OUTPUT_POSITIVE = 0;
+    private static final int TERMINAL_OUTPUT_NEGATIVE = 1;
+    private static final int TERMINAL_CONTROL = 2;
 
     private static final int PARAMETER_THRESHOLD_VOLTAGE = 0;
     private static final int PARAMETER_TRANSITION_VOLTAGE = 1;
-    private static final int PARAMETER_G_MIN = 2;
-    private static final int PARAMETER_G_MAX = 3;
-
+    private static final int PARAMETER_MINIMUM_CONDUCTANCE = 2;
+    private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 3;
 
     private VoltageControlledConductance() {
     }
 
     public static VoltageControlledConductance create(
         ElectricSystem system,
-        double vThreshold,
-        double vTransition,
-        double gMin,
-        double gMax
+        double thresholdVoltage,
+        double transitionVoltage,
+        double minimumConductance,
+        double maximumConductance
     ) {
         VoltageControlledConductance device = system.create(TYPE);
 
-        device.setVoltageThreshold(vThreshold);
-        device.setTransitionVoltage(vTransition);
-        device.setGMax(gMax);
-        device.setGMin(gMin);
+        device.setThresholdVoltage(thresholdVoltage);
+        device.setTransitionVoltage(transitionVoltage);
+        device.setMinimumConductance(minimumConductance);
+        device.setMaximumConductance(maximumConductance);
 
         return device;
     }
 
-
-    public void setVoltageThreshold(double value) {
+    public void setThresholdVoltage(double value) {
         setParameter(PARAMETER_THRESHOLD_VOLTAGE, value);
     }
 
@@ -49,36 +46,35 @@ public final class VoltageControlledConductance extends Device {
         setParameter(PARAMETER_TRANSITION_VOLTAGE, value);
     }
 
-    public void setGMax(double value) {
-        setParameter(PARAMETER_G_MAX, value);
+    public void setMinimumConductance(double value) {
+        setParameter(PARAMETER_MINIMUM_CONDUCTANCE, value);
     }
 
-    public void setGMin(double value) {
-        setParameter(PARAMETER_G_MIN, value);
+    public void setMaximumConductance(double value) {
+        setParameter(PARAMETER_MAXIMUM_CONDUCTANCE, value);
     }
 
-
-    public void attachA(Wire wire) {
-        attachTerminal(TERMINAL_A, wire);
+    public void attachOutputPositive(Wire wire) {
+        attachTerminal(TERMINAL_OUTPUT_POSITIVE, wire);
     }
 
-    public void detachA(Wire wire) {
-        detachTerminal(TERMINAL_A, wire);
+    public void detachOutputPositive(Wire wire) {
+        detachTerminal(TERMINAL_OUTPUT_POSITIVE, wire);
     }
 
-    public void attachB(Wire wire) {
-        attachTerminal(TERMINAL_B, wire);
+    public void attachOutputNegative(Wire wire) {
+        attachTerminal(TERMINAL_OUTPUT_NEGATIVE, wire);
     }
 
-    public void detachB(Wire wire) {
-        detachTerminal(TERMINAL_B, wire);
+    public void detachOutputNegative(Wire wire) {
+        detachTerminal(TERMINAL_OUTPUT_NEGATIVE, wire);
     }
 
-    public void attachC(Wire wire) {
-        attachTerminal(TERMINAL_C, wire);
+    public void attachControl(Wire wire) {
+        attachTerminal(TERMINAL_CONTROL, wire);
     }
 
-    public void detachC(Wire wire) {
-        detachTerminal(TERMINAL_C, wire);
+    public void detachControl(Wire wire) {
+        detachTerminal(TERMINAL_CONTROL, wire);
     }
 }
