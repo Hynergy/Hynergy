@@ -9,7 +9,7 @@ import java.lang.foreign.ValueLayout;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public final class ElectricalEngine implements AutoCloseable {
+final class ElectricalEngine implements AutoCloseable {
     private final Arena arena;
     private final MemorySegment handle;
 

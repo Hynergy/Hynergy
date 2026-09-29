@@ -7,7 +7,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
-public final class ElectricalWorld implements AutoCloseable {
+final class ElectricalWorld implements AutoCloseable {
 
     private static final class SubscriptionCode {
         static final int SUCCESS = 0;
