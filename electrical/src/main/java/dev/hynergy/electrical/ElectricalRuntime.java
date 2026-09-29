@@ -1,10 +1,17 @@
 package dev.hynergy.electrical;
 
+import java.util.IdentityHashMap;
+
 public final class ElectricalRuntime implements AutoCloseable {
+
     private final ElectricalEngine engine;
 
     private boolean closed;
     private int systemCount;
+
+    private final IdentityHashMap<DeviceType<?>, DeviceDefinition> deviceDefinitions = new IdentityHashMap<>();
+
+
 
     private ElectricalRuntime(ElectricalEngine engine) {
         this.engine = engine;
@@ -14,12 +21,26 @@ public final class ElectricalRuntime implements AutoCloseable {
         return new ElectricalRuntime(ElectricalEngine.create());
     }
 
-    public synchronized DeviceDefinition registerDefinition(
-        DeviceDefinitionBuilder builder
+    
+
+    public synchronized <T extends Device> DeviceDefinition register(
+        DeviceType<T> type
     ) {
         requireOpen();
-        return engine.registerDefinition(builder);
+
+        DeviceDefinition existing = deviceDefinitions.get(type);
+
+        if (existing != null) {
+            return existing;
+        }
+
+        DeviceDefinition definition = type.register(this);
+
+        deviceDefinitions.put(type, definition);
+
+        return definition;
     }
+
 
     public synchronized ElectricSystem createSystem(int tickFrequencyHz) {
         requireOpen();
@@ -39,6 +60,26 @@ public final class ElectricalRuntime implements AutoCloseable {
         systemCount--;
     }
 
+
+
+    private void requireOpen() {
+        if (closed) {
+            throw new IllegalStateException("Electrical runtime is closed");
+        }
+    }
+
+    DeviceDefinition requireDefinition(DeviceType<?> type) {
+        DeviceDefinition definition = deviceDefinitions.get(type);
+
+        if (definition == null) {
+            throw new IllegalStateException("Device type is not registered");
+        }
+
+        return definition;
+    }
+
+
+
     @Override
     public synchronized void close() {
         if (closed) {
@@ -51,11 +92,5 @@ public final class ElectricalRuntime implements AutoCloseable {
 
         engine.close();
         closed = true;
-    }
-
-    private void requireOpen() {
-        if (closed) {
-            throw new IllegalStateException("Electrical runtime is closed");
-        }
     }
 }
