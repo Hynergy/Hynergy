@@ -14,7 +14,7 @@ use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, RwLock};
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 pub const ABI_REVISION: u32 = 0;
 
 #[derive(Clone)]
@@ -112,8 +112,7 @@ pub enum DefinitionRegistrationCode {
     NullEngine = 1,
     NullInput = 2,
     NullResult = 3,
-    InputTooLarge = 4,
-
+    // 4 is reserved; ABI 5 exposed an unused InputTooLarge code.
     InvalidMagic = 5,
     UnsupportedVersion = 6,
     InvalidFlags = 7,
@@ -138,7 +137,7 @@ pub enum DefinitionRegistrationCode {
     InvalidDefinition = 29,
     InvalidPrimitiveParameters = 30,
     UnusedInternalNode = 31,
-    DisconnectedInternalComponent = 32,
+    // 32 is reserved; ABI 5 exposed the obsolete DisconnectedInternalComponent code.
     IncompatibleParameterConstraints = 33,
     UnusedParameter = 34,
     DevicePartitionIdExhausted = 35,
@@ -150,7 +149,6 @@ pub enum DefinitionRegistrationCode {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefinitionRegistrationResult {
-    pub code: u32,
     pub command_index: u32,
     pub byte_offset: u32,
     pub definition_id: u32,
@@ -159,20 +157,14 @@ pub struct DefinitionRegistrationResult {
 impl DefinitionRegistrationResult {
     const fn success(definition_id: u32) -> Self {
         Self {
-            code: DefinitionRegistrationCode::Success as u32,
             command_index: u32::MAX,
             byte_offset: u32::MAX,
             definition_id,
         }
     }
 
-    const fn failure(
-        code: DefinitionRegistrationCode,
-        command_index: u32,
-        byte_offset: u32,
-    ) -> Self {
+    const fn failure(command_index: u32, byte_offset: u32) -> Self {
         Self {
-            code: code as u32,
             command_index,
             byte_offset,
             definition_id: u32::MAX,
@@ -241,17 +233,15 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
         return DefinitionRegistrationCode::NullResult as u32;
     }
 
-    let output = if engine.is_null() {
-        DefinitionRegistrationResult::failure(
+    let (code, output) = if engine.is_null() {
+        (
             DefinitionRegistrationCode::NullEngine,
-            u32::MAX,
-            u32::MAX,
+            DefinitionRegistrationResult::failure(u32::MAX, u32::MAX),
         )
     } else if input.is_null() {
-        DefinitionRegistrationResult::failure(
+        (
             DefinitionRegistrationCode::NullInput,
-            u32::MAX,
-            u32::MAX,
+            DefinitionRegistrationResult::failure(u32::MAX, u32::MAX),
         )
     } else {
         let registration = catch_unwind(AssertUnwindSafe(|| {
@@ -261,25 +251,30 @@ pub unsafe extern "C" fn hynergy_engine_register_definition(
             let definition = hynergy_protocol::decode_definition_buffer(&definitions, input)?;
             engine.definitions.register(definition)
         }));
+
         match registration {
-            Ok(Ok(definition_id)) => DefinitionRegistrationResult::success(definition_id.get()),
+            Ok(Ok(definition_id)) => (
+                DefinitionRegistrationCode::Success,
+                DefinitionRegistrationResult::success(definition_id.get()),
+            ),
             Ok(Err(error)) => map_registration_error(error),
-            Err(_) => DefinitionRegistrationResult::failure(
+            Err(_) => (
                 DefinitionRegistrationCode::InternalPanic,
-                u32::MAX,
-                u32::MAX,
+                DefinitionRegistrationResult::failure(u32::MAX, u32::MAX),
             ),
         }
     };
 
-    let code = output.code;
     unsafe {
         result.write(output);
     }
-    code
+
+    code as u32
 }
 
-fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegistrationResult {
+fn map_registration_error(
+    error: DefinitionRegistrationError,
+) -> (DefinitionRegistrationCode, DefinitionRegistrationResult) {
     let code = match error.kind() {
         DefinitionRegistrationErrorKind::InvalidMagic => DefinitionRegistrationCode::InvalidMagic,
         DefinitionRegistrationErrorKind::UnsupportedVersion => {
@@ -342,9 +337,6 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
         DefinitionRegistrationErrorKind::UnusedInternalNode => {
             DefinitionRegistrationCode::UnusedInternalNode
         }
-        DefinitionRegistrationErrorKind::DisconnectedInternalComponent => {
-            DefinitionRegistrationCode::DisconnectedInternalComponent
-        }
         DefinitionRegistrationErrorKind::IncompatibleParameterConstraints => {
             DefinitionRegistrationCode::IncompatibleParameterConstraints
         }
@@ -359,7 +351,10 @@ fn map_registration_error(error: DefinitionRegistrationError) -> DefinitionRegis
         }
     };
 
-    DefinitionRegistrationResult::failure(code, error.command_index(), error.byte_offset())
+    (
+        code,
+        DefinitionRegistrationResult::failure(error.command_index(), error.byte_offset()),
+    )
 }
 
 #[repr(u32)]
@@ -453,8 +448,7 @@ pub enum CommandCode {
     NullWorld = 1,
     NullInput = 2,
     NullResult = 3,
-    InputTooLarge = 4,
-
+    // 4 is reserved; ABI 5 exposed an unused InputTooLarge code.
     InvalidMagic = 5,
     UnsupportedVersion = 6,
     InvalidFlags = 7,
@@ -485,7 +479,6 @@ pub enum CommandCode {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandResult {
-    pub code: u32,
     pub command_index: u32,
     pub byte_offset: u32,
     pub reserved: u32,
@@ -494,16 +487,14 @@ pub struct CommandResult {
 impl CommandResult {
     const fn success() -> Self {
         Self {
-            code: CommandCode::Success as u32,
             command_index: u32::MAX,
             byte_offset: u32::MAX,
             reserved: 0,
         }
     }
 
-    const fn failure(code: CommandCode, command_index: u32, byte_offset: u32) -> Self {
+    const fn failure(command_index: u32, byte_offset: u32) -> Self {
         Self {
-            code: code as u32,
             command_index,
             byte_offset,
             reserved: 0,
@@ -536,10 +527,16 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
         return CommandCode::NullResult as u32;
     }
 
-    let output = if world.is_null() {
-        CommandResult::failure(CommandCode::NullWorld, u32::MAX, u32::MAX)
+    let (code, output) = if world.is_null() {
+        (
+            CommandCode::NullWorld,
+            CommandResult::failure(u32::MAX, u32::MAX),
+        )
     } else if input.is_null() {
-        CommandResult::failure(CommandCode::NullInput, u32::MAX, u32::MAX)
+        (
+            CommandCode::NullInput,
+            CommandResult::failure(u32::MAX, u32::MAX),
+        )
     } else {
         let application = catch_unwind(AssertUnwindSafe(|| {
             let world = unsafe { &mut *world };
@@ -554,24 +551,25 @@ pub unsafe extern "C" fn hynergy_world_apply_commands(
         }));
 
         match application {
-            Ok(Ok(())) => CommandResult::success(),
+            Ok(Ok(())) => (CommandCode::Success, CommandResult::success()),
 
             Ok(Err(error)) => map_world_command_error(error),
 
-            Err(_) => CommandResult::failure(CommandCode::InternalPanic, u32::MAX, u32::MAX),
+            Err(_) => (
+                CommandCode::InternalPanic,
+                CommandResult::failure(u32::MAX, u32::MAX),
+            ),
         }
     };
-
-    let code = output.code;
 
     unsafe {
         result.write(output);
     }
 
-    code
+    code as u32
 }
 
-fn map_world_command_error(error: WorldCommandError) -> CommandResult {
+fn map_world_command_error(error: WorldCommandError) -> (CommandCode, CommandResult) {
     let code = match error.kind() {
         WorldCommandErrorKind::InvalidMagic => CommandCode::InvalidMagic,
         WorldCommandErrorKind::UnsupportedVersion => CommandCode::UnsupportedVersion,
@@ -601,7 +599,10 @@ fn map_world_command_error(error: WorldCommandError) -> CommandResult {
         WorldCommandErrorKind::ResourceExhausted => CommandCode::ResourceExhausted,
     };
 
-    CommandResult::failure(code, error.command_index(), error.byte_offset())
+    (
+        code,
+        CommandResult::failure(error.command_index(), error.byte_offset()),
+    )
 }
 
 #[repr(u32)]
@@ -631,8 +632,6 @@ pub enum TickCode {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickResult {
-    pub code: u32,
-
     pub record_count: u32,
     pub required_capacity: u32,
 
@@ -644,7 +643,6 @@ pub struct TickResult {
 impl TickResult {
     const fn success(record_count: u32, required_capacity: u32) -> Self {
         Self {
-            code: TickCode::Success as u32,
             record_count,
             required_capacity,
             device_id: u32::MAX,
@@ -653,9 +651,8 @@ impl TickResult {
         }
     }
 
-    const fn failure(code: TickCode, required_capacity: u32) -> Self {
+    const fn failure(required_capacity: u32) -> Self {
         Self {
-            code: code as u32,
             record_count: 0,
             required_capacity,
             device_id: u32::MAX,
@@ -665,55 +662,66 @@ impl TickResult {
     }
 }
 
-fn map_tick_error(error: EngineTickError, required_capacity: u32) -> TickResult {
+fn map_tick_error(error: EngineTickError, required_capacity: u32) -> (TickCode, TickResult) {
     match error {
-        EngineTickError::UnknownWorld => {
-            TickResult::failure(TickCode::InternalInvariant, required_capacity)
-        }
+        EngineTickError::UnknownWorld => (
+            TickCode::InternalInvariant,
+            TickResult::failure(required_capacity),
+        ),
 
-        EngineTickError::MissingParameter { device, parameter } => TickResult {
-            code: TickCode::MissingParameter as u32,
-            record_count: 0,
-            required_capacity,
-            device_id: device.get(),
-            parameter_id: parameter.id(),
-            iterations: u32::MAX,
-        },
+        EngineTickError::MissingParameter { device, parameter } => (
+            TickCode::MissingParameter,
+            TickResult {
+                record_count: 0,
+                required_capacity,
+                device_id: device.get(),
+                parameter_id: parameter.id(),
+                iterations: u32::MAX,
+            },
+        ),
 
-        EngineTickError::Singular => TickResult::failure(TickCode::Singular, required_capacity),
+        EngineTickError::Singular => (TickCode::Singular, TickResult::failure(required_capacity)),
 
-        EngineTickError::NonlinearDidNotConverge { iterations } => TickResult {
-            code: TickCode::NonlinearDidNotConverge as u32,
-            record_count: 0,
-            required_capacity,
-            device_id: u32::MAX,
-            parameter_id: u32::MAX,
-            iterations: u32::try_from(iterations).unwrap_or(u32::MAX),
-        },
+        EngineTickError::NonlinearDidNotConverge { iterations } => (
+            TickCode::NonlinearDidNotConverge,
+            TickResult {
+                record_count: 0,
+                required_capacity,
+                device_id: u32::MAX,
+                parameter_id: u32::MAX,
+                iterations: u32::try_from(iterations).unwrap_or(u32::MAX),
+            },
+        ),
 
-        EngineTickError::NonFiniteMatrix => {
-            TickResult::failure(TickCode::NonFiniteMatrix, required_capacity)
-        }
+        EngineTickError::NonFiniteMatrix => (
+            TickCode::NonFiniteMatrix,
+            TickResult::failure(required_capacity),
+        ),
 
-        EngineTickError::NonFiniteSolution => {
-            TickResult::failure(TickCode::NonFiniteSolution, required_capacity)
-        }
+        EngineTickError::NonFiniteSolution => (
+            TickCode::NonFiniteSolution,
+            TickResult::failure(required_capacity),
+        ),
 
-        EngineTickError::ResourceExhausted => {
-            TickResult::failure(TickCode::ResourceExhausted, required_capacity)
-        }
+        EngineTickError::ResourceExhausted => (
+            TickCode::ResourceExhausted,
+            TickResult::failure(required_capacity),
+        ),
 
-        EngineTickError::BackendFailure => {
-            TickResult::failure(TickCode::BackendFailure, required_capacity)
-        }
+        EngineTickError::BackendFailure => (
+            TickCode::BackendFailure,
+            TickResult::failure(required_capacity),
+        ),
 
-        EngineTickError::CompilationFailed => {
-            TickResult::failure(TickCode::CompilationFailed, required_capacity)
-        }
+        EngineTickError::CompilationFailed => (
+            TickCode::CompilationFailed,
+            TickResult::failure(required_capacity),
+        ),
 
-        EngineTickError::InternalInvariant => {
-            TickResult::failure(TickCode::InternalInvariant, required_capacity)
-        }
+        EngineTickError::InternalInvariant => (
+            TickCode::InternalInvariant,
+            TickResult::failure(required_capacity),
+        ),
     }
 }
 
@@ -736,7 +744,7 @@ fn map_tick_error(error: EngineTickError, required_capacity: u32) -> TickResult 
 /// `records` can be null only when no active subscriptions exist.
 ///
 /// The function returns a [`TickCode`] value. If `result` is not null, the
-/// function also writes that code and the tick details to `result`.
+/// function writes the tick details to `result`.
 ///
 /// # Safety
 ///
@@ -758,8 +766,8 @@ pub unsafe extern "C" fn hynergy_world_tick(
         return TickCode::NullResult as u32;
     }
 
-    let output = if world.is_null() {
-        TickResult::failure(TickCode::NullWorld, 0)
+    let (code, output) = if world.is_null() {
+        (TickCode::NullWorld, TickResult::failure(0))
     } else {
         let execution = catch_unwind(AssertUnwindSafe(|| {
             let world = unsafe { &mut *world };
@@ -768,11 +776,11 @@ pub unsafe extern "C" fn hynergy_world_tick(
                 .expect("active subscription count must fit u32");
 
             if record_capacity < required {
-                return TickResult::failure(TickCode::BufferTooSmall, required);
+                return (TickCode::BufferTooSmall, TickResult::failure(required));
             }
 
             if required != 0 && records.is_null() {
-                return TickResult::failure(TickCode::NullOutput, required);
+                return (TickCode::NullOutput, TickResult::failure(required));
             }
 
             let definitions = world.definitions.snapshot();
@@ -807,22 +815,23 @@ pub unsafe extern "C" fn hynergy_world_tick(
                 }
             }
 
-            TickResult::success(
-                u32::try_from(updates.len()).expect("update count must fit u32"),
-                required,
+            (
+                TickCode::Success,
+                TickResult::success(
+                    u32::try_from(updates.len()).expect("update count must fit u32"),
+                    required,
+                ),
             )
         }));
 
-        execution.unwrap_or_else(|_| TickResult::failure(TickCode::InternalPanic, 0))
+        execution.unwrap_or_else(|_| (TickCode::InternalPanic, TickResult::failure(0)))
     };
-
-    let code = output.code;
 
     unsafe {
         result.write(output);
     }
 
-    code
+    code as u32
 }
 
 #[repr(u32)]
@@ -872,23 +881,22 @@ pub struct SubscriptionRecord {
 /// Creates a subscription to a device observer in a world.
 ///
 /// `device_id` identifies a device in this world. `observer_id` identifies an
-/// observer in that device's definition. On success, `subscription_id` in
-/// `result` contains the new subscription ID. On failure, it contains `u32::MAX`.
+/// observer in that device's definition. On success, `subscription_id` receives
+/// the new subscription ID. On failure, it receives zero.
 ///
 /// The caller receives observer values through [`hynergy_world_tick`]. The
 /// caller can pass the subscription ID to [`hynergy_world_unsubscribe`] to
 /// remove the subscription.
 ///
-/// The function returns a [`SubscriptionCode`] value. If `result` is not null,
-/// the function also writes that code and the subscription ID to `result`.
+/// The function returns a [`SubscriptionCode`] value.
 ///
 /// # Safety
 ///
 /// `world` must point to a live [`WorldHandle`] with exclusive access for
-/// this call. If `result` is not null, it must point to aligned, writable
-/// storage for one [`SubscriptionCreationResult`]. The result and world
-/// storage must not overlap. The same world handle must not be used
-/// concurrently; distinct world handles may be used concurrently.
+/// this call. If `subscription_id` is not null, it must point to writable
+/// storage for one `u32`. The subscription ID and world storage must not
+/// overlap. The same world handle must not be used concurrently; distinct
+/// world handles may be used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hynergy_world_subscribe_observer(
     world: *mut WorldHandle,
@@ -1515,7 +1523,6 @@ mod tests {
         assert_eq!(
             result,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::InvalidPrimitiveParameters as u32,
                 command_index: 4,
                 byte_offset: element_offset as u32,
                 definition_id: u32::MAX,
@@ -1549,7 +1556,6 @@ mod tests {
         assert_eq!(
             result,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::UnusedInternalNode as u32,
                 command_index: commands.len() as u32,
                 byte_offset: bytes.len() as u32,
                 definition_id: u32::MAX,
@@ -1596,7 +1602,6 @@ mod tests {
 
     fn definition_result_sentinel() -> DefinitionRegistrationResult {
         DefinitionRegistrationResult {
-            code: 0xaaaa_aaaa,
             command_index: 0xbbbb_bbbb,
             byte_offset: 0xcccc_cccc,
             definition_id: 0xdddd_dddd,
@@ -1610,7 +1615,6 @@ mod tests {
 
     fn command_result_sentinel() -> CommandResult {
         CommandResult {
-            code: 0xaaaa_aaaa,
             command_index: 0xbbbb_bbbb,
             byte_offset: 0xcccc_cccc,
             reserved: 0xdddd_dddd,
@@ -1663,7 +1667,6 @@ mod tests {
 
     fn tick_result_sentinel() -> TickResult {
         TickResult {
-            code: 0xaaaa_aaaa,
             record_count: 0xbbbb_bbbb,
             required_capacity: 0xcccc_cccc,
             device_id: 0xdddd_dddd,
@@ -1852,20 +1855,18 @@ mod tests {
 
     #[test]
     fn tick_result_layout_is_stable() {
-        assert_eq!(size_of::<TickResult>(), 24);
+        assert_eq!(size_of::<TickResult>(), 20);
 
         assert_eq!(align_of::<TickResult>(), align_of::<u32>(),);
 
-        assert_eq!(offset_of!(TickResult, code), 0);
-        assert_eq!(offset_of!(TickResult, record_count), 4);
+        assert_eq!(offset_of!(TickResult, record_count), 0);
+        assert_eq!(offset_of!(TickResult, required_capacity), 4);
 
-        assert_eq!(offset_of!(TickResult, required_capacity), 8,);
+        assert_eq!(offset_of!(TickResult, device_id), 8);
 
-        assert_eq!(offset_of!(TickResult, device_id), 12);
+        assert_eq!(offset_of!(TickResult, parameter_id), 12);
 
-        assert_eq!(offset_of!(TickResult, parameter_id), 16,);
-
-        assert_eq!(offset_of!(TickResult, iterations), 20,);
+        assert_eq!(offset_of!(TickResult, iterations), 16);
     }
 
     #[test]
@@ -1887,7 +1888,6 @@ mod tests {
             NullEngine = 1,
             NullInput = 2,
             NullResult = 3,
-            InputTooLarge = 4,
 
             InvalidMagic = 5,
             UnsupportedVersion = 6,
@@ -1913,7 +1913,6 @@ mod tests {
             InvalidDefinition = 29,
             InvalidPrimitiveParameters = 30,
             UnusedInternalNode = 31,
-            DisconnectedInternalComponent = 32,
             IncompatibleParameterConstraints = 33,
             UnusedParameter = 34,
             DevicePartitionIdExhausted = 35,
@@ -1936,7 +1935,6 @@ mod tests {
             NullWorld = 1,
             NullInput = 2,
             NullResult = 3,
-            InputTooLarge = 4,
 
             InvalidMagic = 5,
             UnsupportedVersion = 6,
@@ -1960,6 +1958,7 @@ mod tests {
             InvalidParameter = 29,
             ParameterConstraintViolation = 30,
             UnknownDefinition = 31,
+            ResourceExhausted = 32,
 
             InternalPanic = u32::MAX,
         });
@@ -2009,33 +2008,31 @@ mod tests {
 
     #[test]
     fn definition_registration_result_layout_is_stable() {
-        assert_eq!(size_of::<DefinitionRegistrationResult>(), 16,);
+        assert_eq!(size_of::<DefinitionRegistrationResult>(), 12);
 
         assert_eq!(
             align_of::<DefinitionRegistrationResult>(),
             align_of::<u32>(),
         );
 
-        assert_eq!(offset_of!(DefinitionRegistrationResult, code), 0,);
-        assert_eq!(offset_of!(DefinitionRegistrationResult, command_index), 4,);
-        assert_eq!(offset_of!(DefinitionRegistrationResult, byte_offset), 8,);
-        assert_eq!(offset_of!(DefinitionRegistrationResult, definition_id), 12,);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, command_index), 0);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, byte_offset), 4);
+        assert_eq!(offset_of!(DefinitionRegistrationResult, definition_id), 8);
     }
 
     #[test]
     fn command_result_layout_is_stable() {
-        assert_eq!(size_of::<CommandResult>(), 16);
+        assert_eq!(size_of::<CommandResult>(), 12);
         assert_eq!(align_of::<CommandResult>(), align_of::<u32>(),);
-        assert_eq!(offset_of!(CommandResult, code), 0);
-        assert_eq!(offset_of!(CommandResult, command_index), 4,);
-        assert_eq!(offset_of!(CommandResult, byte_offset), 8,);
-        assert_eq!(offset_of!(CommandResult, reserved), 12,);
+        assert_eq!(offset_of!(CommandResult, command_index), 0);
+        assert_eq!(offset_of!(CommandResult, byte_offset), 4);
+        assert_eq!(offset_of!(CommandResult, reserved), 8);
     }
 
     #[test]
     fn abi_version_and_revision_are_stable() {
         assert_eq!(hynergy_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 5);
+        assert_eq!(ABI_VERSION, 6);
 
         assert_eq!(hynergy_abi_revision(), ABI_REVISION);
         assert_eq!(ABI_REVISION, 0);
@@ -2075,7 +2072,6 @@ mod tests {
         assert_eq!(
             DefinitionRegistrationResult::success(17),
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 definition_id: 17,
@@ -2083,9 +2079,8 @@ mod tests {
         );
 
         assert_eq!(
-            DefinitionRegistrationResult::failure(DefinitionRegistrationCode::InvalidMagic, 3, 12,),
+            DefinitionRegistrationResult::failure(3, 12),
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::InvalidMagic as u32,
                 command_index: 3,
                 byte_offset: 12,
                 definition_id: u32::MAX,
@@ -2095,7 +2090,6 @@ mod tests {
         assert_eq!(
             CommandResult::success(),
             CommandResult {
-                code: CommandCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 reserved: 0,
@@ -2103,9 +2097,8 @@ mod tests {
         );
 
         assert_eq!(
-            CommandResult::failure(CommandCode::InvalidId, 4, 28),
+            CommandResult::failure(4, 28),
             CommandResult {
-                code: CommandCode::InvalidId as u32,
                 command_index: 4,
                 byte_offset: 28,
                 reserved: 0,
@@ -2115,7 +2108,6 @@ mod tests {
         assert_eq!(
             TickResult::success(2, 5),
             TickResult {
-                code: TickCode::Success as u32,
                 record_count: 2,
                 required_capacity: 5,
                 device_id: u32::MAX,
@@ -2125,9 +2117,8 @@ mod tests {
         );
 
         assert_eq!(
-            TickResult::failure(TickCode::BackendFailure, 5),
+            TickResult::failure(5),
             TickResult {
-                code: TickCode::BackendFailure as u32,
                 record_count: 0,
                 required_capacity: 5,
                 device_id: u32::MAX,
@@ -2142,7 +2133,6 @@ mod tests {
         let byte = 0_u8;
 
         let mut definition = DefinitionRegistrationResult {
-            code: 0xaaaa_aaaa,
             command_index: 0xbbbb_bbbb,
             byte_offset: 0xcccc_cccc,
             definition_id: 0xdddd_dddd,
@@ -2158,7 +2148,6 @@ mod tests {
         assert_eq!(
             definition,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::NullEngine as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 definition_id: u32::MAX,
@@ -2189,7 +2178,6 @@ mod tests {
         }
 
         let mut command = CommandResult {
-            code: 0xaaaa_aaaa,
             command_index: 0xbbbb_bbbb,
             byte_offset: 0xcccc_cccc,
             reserved: 0xdddd_dddd,
@@ -2205,7 +2193,6 @@ mod tests {
         assert_eq!(
             command,
             CommandResult {
-                code: CommandCode::NullWorld as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 reserved: 0,
@@ -2213,7 +2200,6 @@ mod tests {
         );
 
         let mut tick = TickResult {
-            code: 0xaaaa_aaaa,
             record_count: 0xbbbb_bbbb,
             required_capacity: 0xcccc_cccc,
             device_id: 0xdddd_dddd,
@@ -2231,7 +2217,6 @@ mod tests {
         assert_eq!(
             tick,
             TickResult {
-                code: TickCode::NullWorld as u32,
                 record_count: 0,
                 required_capacity: 0,
                 device_id: u32::MAX,
@@ -2464,7 +2449,6 @@ mod tests {
         assert_eq!(
             result,
             TickResult {
-                code: TickCode::BufferTooSmall as u32,
                 record_count: 0,
                 required_capacity: 1,
                 device_id: u32::MAX,
@@ -2485,7 +2469,6 @@ mod tests {
         assert_eq!(
             result,
             TickResult {
-                code: TickCode::Success as u32,
                 record_count: 1,
                 required_capacity: 1,
                 device_id: u32::MAX,
@@ -2600,7 +2583,6 @@ mod tests {
             TickCode::Success as u32,
         );
 
-        assert_eq!(result.code, TickCode::Success as u32);
         assert_eq!(result.record_count, 1);
         assert_eq!(result.required_capacity, 1);
 
@@ -2638,7 +2620,6 @@ mod tests {
         assert_eq!(
             result,
             TickResult {
-                code: TickCode::Success as u32,
                 record_count: 1,
                 required_capacity: 1,
                 device_id: u32::MAX,
@@ -2764,7 +2745,6 @@ mod tests {
         assert_eq!(
             result,
             TickResult {
-                code: TickCode::Success as u32,
                 record_count: 0,
                 required_capacity: 0,
                 device_id: u32::MAX,
@@ -2904,7 +2884,6 @@ mod tests {
         assert_eq!(
             first,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 definition_id: Engine::COMPOSITE_DEFINITION_ID_BASE,
@@ -2914,7 +2893,6 @@ mod tests {
         assert_eq!(
             second,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 definition_id: Engine::COMPOSITE_DEFINITION_ID_BASE + 1,
@@ -2940,7 +2918,6 @@ mod tests {
         assert_eq!(
             result,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::InvalidMagic as u32,
                 command_index: u32::MAX,
                 byte_offset: 0,
                 definition_id: u32::MAX
@@ -2985,7 +2962,6 @@ mod tests {
         assert_eq!(
             result,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::NullEngine as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 definition_id: u32::MAX
@@ -3005,7 +2981,6 @@ mod tests {
         assert_eq!(
             result,
             DefinitionRegistrationResult {
-                code: DefinitionRegistrationCode::NullInput as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 definition_id: u32::MAX
@@ -3144,7 +3119,6 @@ mod tests {
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::NullWorld as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 reserved: 0,
@@ -3166,7 +3140,6 @@ mod tests {
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::NullInput as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 reserved: 0,
@@ -3195,7 +3168,6 @@ mod tests {
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::Success as u32,
                 command_index: u32::MAX,
                 byte_offset: u32::MAX,
                 reserved: 0,
@@ -3231,7 +3203,6 @@ mod tests {
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::InvalidMagic as u32,
                 command_index: u32::MAX,
                 byte_offset: 0,
                 reserved: 0,
@@ -3258,7 +3229,6 @@ mod tests {
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::InvalidCommandLength as u32,
                 command_index: 0,
                 byte_offset: 16,
                 reserved: 0,
@@ -3506,7 +3476,6 @@ mod tests {
         assert_eq!(
             result,
             CommandResult {
-                code: CommandCode::IdAlreadyAssigned as u32,
                 command_index: 1,
                 byte_offset: 26,
                 reserved: 0,
