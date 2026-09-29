@@ -647,10 +647,9 @@ impl IslandRuntime {
             || !rhs_reference_valid;
 
         let mut iterations_used = 0usize;
+        evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
 
         if bootstrap {
-            evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
-
             let converged = self.solve_discrete_verification(scratch)?;
             iterations_used = 1;
 
@@ -659,9 +658,8 @@ impl IslandRuntime {
             }
         }
 
+        // Verification leaves the workspace evaluated for the new solution.
         while iterations_used < NONLINEAR_MAX_ITERATIONS {
-            evaluate_iteration(&self.ir, &mut self.workspace, &self.solution);
-
             let closure_needed = {
                 let plan = self
                     .discrete_plan
@@ -1181,6 +1179,9 @@ fn advance_iteration_latches(ir: &CompiledIslandIr, workspace: &mut ValueWorkspa
 
 #[inline]
 fn evaluate_iteration(ir: &CompiledIslandIr, workspace: &mut ValueWorkspace, solution: &[f64]) {
+    #[cfg(test)]
+    test::FULL_ITERATION_EVALUATIONS.with(|count| count.set(count.get() + 1));
+
     for &(unknown, input) in ir.solution_inputs() {
         workspace.set_input(input, solution[unknown.index()]);
     }
@@ -1346,6 +1347,10 @@ impl StaticChanges {
 
 #[cfg(test)]
 mod test {
+    std::thread_local! {
+        pub(super) static FULL_ITERATION_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     use crate::compile::definition::{CompiledDefinition, DefinitionStateId};
     use crate::compile::island::{
         DeviceObserver, DeviceState, IslandNode, IslandPartitionSpec, compile_island_parts,
@@ -2757,6 +2762,53 @@ mod test {
             2,
             "the changed discrete matrix must be factorized before acceptance",
         );
+    }
+
+    #[test]
+    fn discrete_verification_reuses_evaluated_candidate() {
+        for (input, expected_solves) in [(0.0, 1), (5.0, 2)] {
+            let (network, compiled) = fast_not_island(input);
+            let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
+            let evaluations_before = FULL_ITERATION_EVALUATIONS.get();
+            runtime
+                .solve_tick_with_state_reader(&network, |_| None)
+                .unwrap();
+
+            assert_eq!(runtime.solve_count(), expected_solves);
+            assert_eq!(
+                FULL_ITERATION_EVALUATIONS.get() - evaluations_before,
+                1 + expected_solves,
+                "evaluate once at entry and once per candidate",
+            );
+        }
+    }
+
+    #[test]
+    fn warm_discrete_ticks_refresh_inputs_and_reuse_verification_output() {
+        let definitions = DefinitionRegistry::new();
+        let (mut network, compiled) = fast_not_island(0.0);
+        let mut runtime = IslandRuntime::new(compiled, &network, DEFAULT_TIMESTEP).unwrap();
+        runtime
+            .solve_tick_with_state_reader(&network, |_| None)
+            .unwrap();
+        let output = IslandNode::terminal(DeviceId::try_from(1).unwrap(), TerminalId::new(0));
+        let input_source = DeviceId::try_from(3).unwrap();
+
+        for (input, expected_output) in [(5.0, 5.0 * 0.01 / 10.01), (0.0, 5.0 * 10.0 / 10.01)] {
+            network
+                .set_device_parameter(&definitions, input_source, ParameterId::new(0), input)
+                .unwrap();
+            runtime.mark_numerical_dirty();
+            let evaluations_before = FULL_ITERATION_EVALUATIONS.get();
+            let solves_before = runtime.solve_count();
+            runtime
+                .solve_tick_with_state_reader(&network, |_| None)
+                .unwrap();
+
+            assert!((runtime.node_voltage(output).unwrap() - expected_output).abs() < 1.0e-9);
+            assert_eq!(runtime.solve_count() - solves_before, 2);
+            assert_eq!(FULL_ITERATION_EVALUATIONS.get() - evaluations_before, 3);
+        }
     }
 
     #[test]

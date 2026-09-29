@@ -72,7 +72,6 @@ pub enum DefinitionRegistrationErrorKind {
     InvalidDefinition,
     InvalidPrimitiveParameters,
     UnusedInternalNode,
-    DisconnectedInternalComponent,
     IncompatibleParameterConstraints,
     UnusedParameter,
     DevicePartitionIdExhausted,
