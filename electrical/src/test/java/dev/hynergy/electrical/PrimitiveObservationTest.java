@@ -94,11 +94,11 @@ final class PrimitiveObservationTest {
             assertActive(
                 not.observeOutputVoltage(NOOP_LISTENER),
                 not.observeInputVoltage(NOOP_LISTENER),
-                not.observeOutputCurrent(NOOP_LISTENER),
+                not.observeSupplyCurrent(NOOP_LISTENER),
 
                 schmitt.observeOutputVoltage(NOOP_LISTENER),
                 schmitt.observeInputVoltage(NOOP_LISTENER),
-                schmitt.observeOutputCurrent(NOOP_LISTENER)
+                schmitt.observeSupplyCurrent(NOOP_LISTENER)
             );
         }
     }
@@ -118,22 +118,22 @@ final class PrimitiveObservationTest {
                 and.observeOutputVoltage(NOOP_LISTENER),
                 and.observeInputVoltageA(NOOP_LISTENER),
                 and.observeInputVoltageB(NOOP_LISTENER),
-                and.observeOutputCurrent(NOOP_LISTENER),
+                and.observeSupplyCurrent(NOOP_LISTENER),
 
                 nand.observeOutputVoltage(NOOP_LISTENER),
                 nand.observeInputVoltageA(NOOP_LISTENER),
                 nand.observeInputVoltageB(NOOP_LISTENER),
-                nand.observeOutputCurrent(NOOP_LISTENER),
+                nand.observeSupplyCurrent(NOOP_LISTENER),
 
                 or.observeOutputVoltage(NOOP_LISTENER),
                 or.observeInputVoltageA(NOOP_LISTENER),
                 or.observeInputVoltageB(NOOP_LISTENER),
-                or.observeOutputCurrent(NOOP_LISTENER),
+                or.observeSupplyCurrent(NOOP_LISTENER),
 
                 nor.observeOutputVoltage(NOOP_LISTENER),
                 nor.observeInputVoltageA(NOOP_LISTENER),
                 nor.observeInputVoltageB(NOOP_LISTENER),
-                nor.observeOutputCurrent(NOOP_LISTENER)
+                nor.observeSupplyCurrent(NOOP_LISTENER)
             );
         }
     }
