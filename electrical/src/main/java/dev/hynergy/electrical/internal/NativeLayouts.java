@@ -52,11 +52,11 @@ public final class NativeLayouts {
         ValueLayout.JAVA_INT.withName("iterations")
     );
 
-    public static final long TICK_RESULT_RECORD_COUNT_OFFSET = offsetOf(SUBSCRIPTION_RECORD, "record_count");
-    public static final long TICK_RESULT_REQUIRED_CAPACITY_OFFSET = offsetOf(SUBSCRIPTION_RECORD, "required_capacity");
-    public static final long TICK_RESULT_DEVICE_ID_OFFSET = offsetOf(SUBSCRIPTION_RECORD, "device_id");
-    public static final long TICK_RESULT_PARAMETER_ID_OFFSET = offsetOf(SUBSCRIPTION_RECORD, "parameter_id");
-    public static final long TICK_RESULT_ITERATIONS_OFFSET = offsetOf(SUBSCRIPTION_RECORD, "iterations");
+    public static final long TICK_RESULT_RECORD_COUNT_OFFSET = offsetOf(TICK_RESULT, "record_count");
+    public static final long TICK_RESULT_REQUIRED_CAPACITY_OFFSET = offsetOf(TICK_RESULT, "required_capacity");
+    public static final long TICK_RESULT_DEVICE_ID_OFFSET = offsetOf(TICK_RESULT, "device_id");
+    public static final long TICK_RESULT_PARAMETER_ID_OFFSET = offsetOf(TICK_RESULT, "parameter_id");
+    public static final long TICK_RESULT_ITERATIONS_OFFSET = offsetOf(TICK_RESULT, "iterations");
 
 
 
