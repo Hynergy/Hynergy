@@ -5,8 +5,11 @@ import org.jspecify.annotations.Nullable;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 
 final class SubscriptionRecordBuffer implements AutoCloseable {
+    private static final long RECORD_SIZE = NativeLayouts.SUBSCRIPTION_RECORD.byteSize();
+
     private @Nullable Arena arena;
     private MemorySegment records = MemorySegment.NULL;
     private int capacity;
@@ -76,6 +79,31 @@ final class SubscriptionRecordBuffer implements AutoCloseable {
         }
 
         return capacity;
+    }
+
+    int subscriptionIdAt(int index) {
+        return records.get(ValueLayout.JAVA_INT, recordOffset(index) + NativeLayouts.SUBSCRIPTION_RECORD_ID_OFFSET);
+    }
+
+    int subscriptionStatusAt(int index) {
+        return records.get(ValueLayout.JAVA_INT, recordOffset(index) + NativeLayouts.SUBSCRIPTION_RECORD_STATUS_OFFSET);
+    }
+
+    double subscriptionValueAt(int index) {
+        return records.get(
+            ValueLayout.JAVA_DOUBLE,
+            recordOffset(index) + NativeLayouts.SUBSCRIPTION_RECORD_VALUE_OFFSET
+        );
+    }
+
+    private long recordOffset(int index) {
+        requireOpen();
+
+        if (index < 0 || index >= capacity) {
+            throw new IndexOutOfBoundsException("Subscription record index out of bounds: " + index);
+        }
+
+        return (long) index * RECORD_SIZE;
     }
 
     private static void closeAfterFailure(Arena arena, Throwable failure) {

@@ -181,7 +181,7 @@ final class ElectricalWorld implements AutoCloseable {
             case TickCode.INTERNAL_INVARIANT -> "native simulation invariant failed";
 
             case TickCode.INTERNAL_PANIC -> "native engine panicked";
-            
+
             default -> "unknown native tick status";
         };
 
@@ -431,6 +431,18 @@ final class ElectricalWorld implements AutoCloseable {
         if (code != SubscriptionCode.SUCCESS) {
             handleSubscriptionFailure("remove subscription", code);
         }
+    }
+
+    int subscriptionIdAt(int index) {
+        return subscriptionBuffer.subscriptionIdAt(index);
+    }
+
+    int subscriptionStatusAt(int index) {
+        return subscriptionBuffer.subscriptionStatusAt(index);
+    }
+
+    double subscriptionValueAt(int index) {
+        return subscriptionBuffer.subscriptionValueAt(index);
     }
 
     private void cancelPendingAdd(WorldIdAllocator allocator, int id, int generation, Throwable failure) {
