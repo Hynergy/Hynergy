@@ -20,7 +20,7 @@ sections of this document.
 ---
 
 - Temurin or JetBrains JDK 26.
-- Rust 1.85.0 or newer (stable toolchain).
+- Rust 1.98.1 or newer (stable toolchain).
 - Lombok (compile-time only; In IntelliJ IDEA:
   ` Settings > Build, Execution, Deployment > Compiler > Annotation Processors` and check
   `Enable Annotation Processor`).
