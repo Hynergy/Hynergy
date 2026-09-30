@@ -13,7 +13,7 @@ import java.util.function.Supplier;
  *
  * <p>Use {@link #create(Supplier, Consumer)} to define a custom device
  * type. Register the type in an {@link ElectricalRuntime} before an
- * {@link ElectricSystem} creates a device of that type.</p>
+ * {@link ElectricalSystem} creates a device of that type.</p>
  *
  * @param <T> the device class
  */

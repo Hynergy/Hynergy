@@ -33,7 +33,7 @@ public final class CurrentSource extends Device {
      *
      * @return the current source
      */
-    public static CurrentSource create(ElectricSystem system, double current) {
+    public static CurrentSource create(ElectricalSystem system, double current) {
         CurrentSource device = system.create(TYPE);
 
         device.setCurrent(current);

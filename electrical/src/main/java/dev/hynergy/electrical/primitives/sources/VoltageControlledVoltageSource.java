@@ -39,7 +39,7 @@ public final class VoltageControlledVoltageSource extends Device {
      *
      * @return the voltage-controlled voltage source
      */
-    public static VoltageControlledVoltageSource create(ElectricSystem system, double voltageGain) {
+    public static VoltageControlledVoltageSource create(ElectricalSystem system, double voltageGain) {
         VoltageControlledVoltageSource device = system.create(TYPE);
 
         device.setVoltageGain(voltageGain);

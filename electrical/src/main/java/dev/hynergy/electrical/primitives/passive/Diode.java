@@ -42,7 +42,7 @@ public final class Diode extends Device {
      *
      * @return the diode
      */
-    public static Diode create(ElectricSystem system, double maximumConductance, double minimumConductance) {
+    public static Diode create(ElectricalSystem system, double maximumConductance, double minimumConductance) {
         Diode device = system.create(TYPE);
 
         device.setMaximumConductance(maximumConductance);

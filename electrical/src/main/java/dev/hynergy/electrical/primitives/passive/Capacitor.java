@@ -33,7 +33,7 @@ public final class Capacitor extends Device {
      *
      * @return the capacitor
      */
-    public static Capacitor create(ElectricSystem system, double capacitance) {
+    public static Capacitor create(ElectricalSystem system, double capacitance) {
         Capacitor device = system.create(TYPE);
 
         device.setCapacitance(capacitance);

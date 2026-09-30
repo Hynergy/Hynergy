@@ -6,8 +6,8 @@
  * you create an electrical system.</p>
  *
  * <p>Create wires and devices in an
- * {@link dev.hynergy.electrical.ElectricSystem}. Call
- * {@link dev.hynergy.electrical.ElectricSystem#tick()} to advance the
+ * {@link ElectricalSystem}. Call
+ * {@link ElectricalSystem#tick()} to advance the
  * simulation.</p>
  *
  * <p>An electrical system is thread-confined. Call its methods only from

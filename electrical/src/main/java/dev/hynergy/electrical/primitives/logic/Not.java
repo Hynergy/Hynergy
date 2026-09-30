@@ -48,7 +48,7 @@ public final class Not extends Device {
      * @return the NOT gate
      */
     public static Not create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdRelativeToVss,
         double maximumConductance,
         double minimumConductance

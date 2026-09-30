@@ -27,7 +27,7 @@ hytaleTools {
     modId = "core"
     modDescription = property("mod_description").toString()
     modUrl = property("mod_url").toString()
-    mainClass = "dev.hynergy.HynergyPlugin"
+    mainClass = "dev.hynergy.core.HynergyPlugin"
     modCredits = property("mod_author").toString()
     manifestDependencies = property("manifest_dependencies").toString()
     manifestOptionalDependencies = property("manifest_opt_dependencies").toString()
@@ -45,4 +45,8 @@ repositories {
 
 dependencies {
     implementation(project(":electrical"))
+    implementation("org.jspecify:jspecify:1.0.0")
+    implementation("it.unimi.dsi:fastutil:8.5.19")
+    compileOnly("org.projectlombok:lombok:1.18.48")
+    annotationProcessor("org.projectlombok:lombok:1.18.48")
 }

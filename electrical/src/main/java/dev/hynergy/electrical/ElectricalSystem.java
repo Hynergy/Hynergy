@@ -19,7 +19,7 @@ import java.util.Objects;
  *
  * <p>Close the system when it is no longer necessary.</p>
  */
-public final class ElectricSystem implements AutoCloseable {
+public final class ElectricalSystem implements AutoCloseable {
     private final ElectricalRuntime runtime;
     private final ElectricalWorld world;
 
@@ -29,7 +29,7 @@ public final class ElectricSystem implements AutoCloseable {
     private boolean poisoned;
     private boolean ticking;
 
-    ElectricSystem(ElectricalRuntime runtime, ElectricalWorld world) {
+    ElectricalSystem(ElectricalRuntime runtime, ElectricalWorld world) {
         this.runtime = runtime;
         this.world = world;
     }

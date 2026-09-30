@@ -33,7 +33,7 @@ public final class Resistance extends Device {
      *
      * @return the resistor
      */
-    public static Resistance create(ElectricSystem system, double resistance) {
+    public static Resistance create(ElectricalSystem system, double resistance) {
         Resistance device = system.create(TYPE);
 
         device.setResistance(resistance);

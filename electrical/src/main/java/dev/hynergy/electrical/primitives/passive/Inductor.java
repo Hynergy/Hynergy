@@ -33,7 +33,7 @@ public final class Inductor extends Device {
      *
      * @return the inductor
      */
-    public static Inductor create(ElectricSystem system, double inductance) {
+    public static Inductor create(ElectricalSystem system, double inductance) {
         Inductor device = system.create(TYPE);
 
         device.setInductance(inductance);

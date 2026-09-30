@@ -36,7 +36,7 @@ public final class TickDelay extends Device {
      *
      * @return the tick delay
      */
-    public static TickDelay create(ElectricSystem system) {
+    public static TickDelay create(ElectricalSystem system) {
         return system.create(TYPE);
     }
 

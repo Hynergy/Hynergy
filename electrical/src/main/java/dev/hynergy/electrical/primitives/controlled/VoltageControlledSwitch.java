@@ -51,7 +51,7 @@ public final class VoltageControlledSwitch extends Device {
      * @return the voltage-controlled switch
      */
     public static VoltageControlledSwitch create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdVoltage,
         double maximumConductance,
         double minimumConductance

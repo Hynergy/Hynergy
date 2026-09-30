@@ -33,7 +33,7 @@ public final class VoltageSource extends Device {
      *
      * @return the voltage source
      */
-    public static VoltageSource create(ElectricSystem system, double voltage) {
+    public static VoltageSource create(ElectricalSystem system, double voltage) {
         VoltageSource device = system.create(TYPE);
 
         device.setVoltage(voltage);

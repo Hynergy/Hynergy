@@ -51,7 +51,7 @@ public final class SchmittBuffer extends Device {
      * @return the Schmitt buffer
      */
     public static SchmittBuffer create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdRelativeToVss,
         double hysteresisWidth,
         double maximumConductance,

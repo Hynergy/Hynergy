@@ -291,7 +291,7 @@ final class ObservationSubscriptionRegistryTest {
     private static final class TestContext implements AutoCloseable {
 
         private final ElectricalRuntime runtime = ElectricalRuntime.create();
-        private final ElectricSystem system = runtime.createSystem(20);
+        private final ElectricalSystem system = runtime.createSystem(20);
 
         @Override
         public void close() {

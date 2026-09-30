@@ -33,7 +33,7 @@ public final class Conductance extends Device {
      *
      * @return the conductance element
      */
-    public static Conductance create(ElectricSystem system, double conductance) {
+    public static Conductance create(ElectricalSystem system, double conductance) {
         Conductance device = system.create(TYPE);
 
         device.setConductance(conductance);
