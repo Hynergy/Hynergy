@@ -9,22 +9,6 @@ import java.lang.foreign.ValueLayout;
 
 final class ElectricalWorld implements AutoCloseable {
 
-    private static final class SubscriptionCode {
-        static final int SUCCESS = 0;
-
-        static final int NULL_WORLD = 1;
-        static final int NULL_RESULT = 2;
-        static final int INVALID_DEVICE_ID = 4;
-        static final int INVALID_SUBSCRIPTION_ID = 5;
-
-        static final int UNKNOWN_DEVICE = 20;
-        static final int UNKNOWN_OBSERVER = 21;
-        static final int ID_EXHAUSTED = 22;
-        static final int UNKNOWN_SUBSCRIPTION = 23;
-
-        static final int INTERNAL_PANIC = -1;
-    }
-
     private final Arena arena;
     private final MemorySegment handle;
 
@@ -32,8 +16,12 @@ final class ElectricalWorld implements AutoCloseable {
     private final WorldIdAllocator deviceIds;
 
     private final WorldCommandBuffer commandBuffer;
+    private final SubscriptionRecordBuffer subscriptionBuffer;
+
     private final MemorySegment commandResult;
     private final MemorySegment subscriptionIdResult;
+    private final MemorySegment tickResult;
+
 
     private boolean poisoned;
 
@@ -42,16 +30,18 @@ final class ElectricalWorld implements AutoCloseable {
         this.handle = handle;
 
         WorldCommandBuffer commandBuffer = null;
+        SubscriptionRecordBuffer subscriptionBuffer = null;
 
         try {
             this.wireIds = new WorldIdAllocator();
             this.deviceIds = new WorldIdAllocator();
 
             commandBuffer = new WorldCommandBuffer();
+            subscriptionBuffer = new SubscriptionRecordBuffer();
 
             this.commandResult = arena.allocate(NativeLayouts.COMMAND_RESULT);
-
             this.subscriptionIdResult = arena.allocate(ValueLayout.JAVA_INT);
+            this.tickResult = arena.allocate(NativeLayouts.TICK_RESULT);
         } catch (RuntimeException | Error failure) {
             if (commandBuffer != null) {
                 try {
@@ -61,11 +51,144 @@ final class ElectricalWorld implements AutoCloseable {
                 }
             }
 
+            if (subscriptionBuffer != null) {
+                try {
+                    subscriptionBuffer.close();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+
             throw failure;
         }
 
         this.commandBuffer = commandBuffer;
+        this.subscriptionBuffer = subscriptionBuffer;
     }
+
+    int tick() {
+        applyCommands();
+
+        MemorySegment world = requireUsable();
+        boolean resized = false;
+
+        while (true) {
+            final int code;
+
+            try {
+                code = NativeBindings.tickWorld(
+                    world,
+                    subscriptionBuffer.segment(),
+                    subscriptionBuffer.capacity(),
+                    tickResult
+                );
+            } catch (RuntimeException | Error failure) {
+                poisoned = true;
+                throw failure;
+            }
+
+            if (code == TickCode.SUCCESS) {
+                return readSuccessfulTickResult();
+            }
+
+            if (code == TickCode.BUFFER_TOO_SMALL) {
+                if (resized) {
+                    poisoned = true;
+
+                    throw new IllegalStateException(
+                        "Native world still requires a larger subscription buffer after resize");
+                }
+
+                int requiredCapacity =
+                    tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_REQUIRED_CAPACITY_OFFSET);
+
+                if (requiredCapacity < 0) {
+                    throw new IllegalStateException(
+                        "Native subscription count exceeds the supported Java capacity: " + Integer.toUnsignedLong(
+                            requiredCapacity));
+                }
+
+                if (requiredCapacity <= subscriptionBuffer.capacity()) {
+                    poisoned = true;
+
+                    throw new IllegalStateException(
+                        "Native world reported an invalid required subscription capacity: " + requiredCapacity);
+                }
+
+                subscriptionBuffer.ensureCapacity(requiredCapacity);
+                resized = true;
+
+                continue;
+            }
+
+            poisoned = true;
+
+            throw tickFailure(code);
+        }
+    }
+
+    private int readSuccessfulTickResult() {
+        int recordCount = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_RECORD_COUNT_OFFSET);
+
+        int requiredCapacity = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_REQUIRED_CAPACITY_OFFSET);
+
+        if (recordCount < 0 || requiredCapacity < 0 || recordCount > requiredCapacity
+            || requiredCapacity > subscriptionBuffer.capacity()) {
+            poisoned = true;
+
+            throw new IllegalStateException("Native world returned invalid subscription record counts");
+        }
+
+        return recordCount;
+    }
+
+    private IllegalStateException tickFailure(int code) {
+        String reason = switch (code) {
+            case TickCode.NULL_WORLD -> "native world handle is null";
+
+            case TickCode.NULL_RESULT -> "native tick result pointer is null";
+
+            case TickCode.NULL_OUTPUT -> "native subscription output pointer is null";
+
+            case TickCode.MISSING_PARAMETER -> {
+                int deviceId = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_DEVICE_ID_OFFSET);
+
+                int parameterId = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_PARAMETER_ID_OFFSET);
+
+                yield "device " + Integer.toUnsignedLong(deviceId) + " is missing parameter " + Integer.toUnsignedLong(
+                    parameterId);
+            }
+
+            case TickCode.SINGULAR -> "native solver reported a singular system";
+
+            case TickCode.NONLINEAR_DID_NOT_CONVERGE -> {
+                int iterations = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_ITERATIONS_OFFSET);
+
+                yield "native nonlinear solver did not converge after " + Integer.toUnsignedLong(iterations)
+                    + " iterations";
+            }
+
+            case TickCode.NON_FINITE_MATRIX -> "native solver produced a non-finite matrix";
+
+            case TickCode.NON_FINITE_SOLUTION -> "native solver produced a non-finite solution";
+
+            case TickCode.RESOURCE_EXHAUSTED -> "native simulation resource limit was exceeded";
+
+            case TickCode.BACKEND_FAILURE -> "native solver backend failed";
+
+            case TickCode.COMPILATION_FAILED -> "native island compilation failed";
+
+            case TickCode.INTERNAL_INVARIANT -> "native simulation invariant failed";
+
+            case TickCode.INTERNAL_PANIC -> "native engine panicked";
+            
+            default -> "unknown native tick status";
+        };
+
+        return new IllegalStateException(
+            "Failed to tick electrical world: " + reason + " (code=" + Integer.toUnsignedLong(code) + ")");
+    }
+
 
     int addWire() {
         requireUsable();
@@ -391,6 +514,16 @@ final class ElectricalWorld implements AutoCloseable {
         }
 
         try {
+            subscriptionBuffer.close();
+        } catch (RuntimeException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        }
+
+        try {
             arena.close();
         } catch (RuntimeException exception) {
             if (failure == null) {
@@ -403,5 +536,46 @@ final class ElectricalWorld implements AutoCloseable {
         if (failure != null) {
             throw failure;
         }
+    }
+
+
+
+    private static final class SubscriptionCode {
+        static final int SUCCESS = 0;
+
+        static final int NULL_WORLD = 1;
+        static final int NULL_RESULT = 2;
+        static final int INVALID_DEVICE_ID = 4;
+        static final int INVALID_SUBSCRIPTION_ID = 5;
+
+        static final int UNKNOWN_DEVICE = 20;
+        static final int UNKNOWN_OBSERVER = 21;
+        static final int ID_EXHAUSTED = 22;
+        static final int UNKNOWN_SUBSCRIPTION = 23;
+
+        static final int INTERNAL_PANIC = -1;
+    }
+
+
+
+    private static final class TickCode {
+        static final int SUCCESS = 0;
+
+        static final int NULL_WORLD = 1;
+        static final int NULL_RESULT = 2;
+        static final int NULL_OUTPUT = 3;
+        static final int BUFFER_TOO_SMALL = 5;
+
+        static final int MISSING_PARAMETER = 20;
+        static final int SINGULAR = 21;
+        static final int NONLINEAR_DID_NOT_CONVERGE = 22;
+        static final int NON_FINITE_MATRIX = 23;
+        static final int NON_FINITE_SOLUTION = 24;
+        static final int RESOURCE_EXHAUSTED = 25;
+        static final int BACKEND_FAILURE = 26;
+        static final int COMPILATION_FAILED = 27;
+        static final int INTERNAL_INVARIANT = 28;
+
+        static final int INTERNAL_PANIC = -1;
     }
 }
