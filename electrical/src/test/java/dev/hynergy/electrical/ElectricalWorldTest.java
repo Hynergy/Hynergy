@@ -161,4 +161,47 @@ final class ElectricalWorldTest {
             assertDoesNotThrow(world::applyCommands);
         }
     }
+
+    @Test
+    void unknownSubscriptionIsOwnershipConsistencyFailure() {
+        try (ElectricalEngine engine = ElectricalEngine.create(); ElectricalWorld world = engine.createWorld(30)) {
+            ElectricalWorld.SubscriptionOperationException failure =
+                assertThrows(ElectricalWorld.SubscriptionOperationException.class, () -> world.unsubscribe(1));
+
+            assertTrue(failure.isOwnershipConsistencyFailure());
+        }
+    }
+
+    @Test
+    void unknownObserverIsNotOwnershipConsistencyFailure() {
+        try (ElectricalEngine engine = ElectricalEngine.create();
+            DeviceDefinitionBuilder builder = new DeviceDefinitionBuilder();
+            ElectricalWorld world = engine.createWorld(30)) {
+            DeviceDefinition definition = engine.registerDefinition(builder);
+
+            int deviceId = world.addDevice(definition);
+            int generation = world.deviceGeneration(deviceId);
+
+            ElectricalWorld.SubscriptionOperationException failure = assertThrows(
+                ElectricalWorld.SubscriptionOperationException.class,
+                () -> world.subscribeObserver(deviceId, generation, 0)
+            );
+
+            assertFalse(failure.isOwnershipConsistencyFailure());
+        }
+    }
+
+    @Test
+    void isOpenTracksWorldLifetime() {
+        try (ElectricalEngine engine = ElectricalEngine.create()) {
+            ElectricalWorld world = engine.createWorld(30);
+
+            assertTrue(world.isOpen());
+
+            world.close();
+
+            assertFalse(world.isOpen());
+            assertDoesNotThrow(world::close);
+        }
+    }
 }

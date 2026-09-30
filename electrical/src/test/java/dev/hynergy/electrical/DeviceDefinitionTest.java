@@ -16,7 +16,7 @@ final class DeviceDefinitionTest {
     void definitionIdUsesFullUnsignedRange() {
         DeviceDefinition definition = new DeviceDefinition(-1);
 
-        assertEquals(-1, definition.getId());
-        assertEquals(0xffff_ffffL, Integer.toUnsignedLong(definition.getId()));
+        assertEquals(-1, definition.id());
+        assertEquals(0xffff_ffffL, Integer.toUnsignedLong(definition.id()));
     }
 }

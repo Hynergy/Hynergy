@@ -32,7 +32,7 @@ public abstract class Device {
         return this.system == system;
     }
 
-    final int id() {
+    protected final int id() {
         requireBound();
         return id;
     }
