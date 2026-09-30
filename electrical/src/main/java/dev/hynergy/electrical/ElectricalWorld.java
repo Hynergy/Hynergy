@@ -596,8 +596,6 @@ final class ElectricalWorld implements AutoCloseable {
         static final int INTERNAL_PANIC = -1;
     }
 
-
-
     private static final class TickCode {
         static final int SUCCESS = 0;
 
@@ -617,5 +615,13 @@ final class ElectricalWorld implements AutoCloseable {
         static final int INTERNAL_INVARIANT = 28;
 
         static final int INTERNAL_PANIC = -1;
+    }
+
+    static final class SubscriptionStatusCode {
+        static final int AVAILABLE = 0;
+        static final int UNAVAILABLE = 1;
+
+        private SubscriptionStatusCode() {
+        }
     }
 }

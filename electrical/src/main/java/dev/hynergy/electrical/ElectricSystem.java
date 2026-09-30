@@ -12,10 +12,96 @@ public final class ElectricSystem implements AutoCloseable {
 
     private boolean closed;
     private boolean poisoned;
+    private boolean ticking;
 
     ElectricSystem(ElectricalRuntime runtime, ElectricalWorld world) {
         this.runtime = runtime;
         this.world = world;
+    }
+
+
+    public void tick() {
+        requireUsable();
+
+        if (ticking) {
+            throw new IllegalStateException("Recursive calls to tick are not allowed");
+        }
+
+        ticking = true;
+
+        try {
+            int recordCount = world.tick();
+
+            if (recordCount == 0) {
+                return;
+            }
+
+            Throwable callbackFailure = null;
+            Throwable publicationFailure = null;
+            boolean publishing = false;
+
+            try {
+                subscriptions.beginPublication();
+                publishing = true;
+
+                for (int index = 0; index < recordCount; index++) {
+                    int subscriptionId = world.subscriptionIdAt(index);
+                    int statusCode = world.subscriptionStatusAt(index);
+                    double value = world.subscriptionValueAt(index);
+
+                    ObservationStatus status = observationStatus(statusCode);
+
+                    ObservationSubscription subscription = subscriptions.get(subscriptionId);
+
+                    if (subscription == null) {
+                        throw new IllegalStateException(
+                            "Native tick returned unknown subscription ID: " + Integer.toUnsignedLong(subscriptionId));
+                    }
+
+                    try {
+                        subscription.listener().onUpdate(status, value);
+                    } catch (RuntimeException | Error failure) {
+                        callbackFailure = appendFailure(callbackFailure, failure);
+                    }
+                }
+            } catch (RuntimeException | Error failure) {
+                poisoned = true;
+                publicationFailure = failure;
+            } finally {
+                if (publishing) {
+                    try {
+                        subscriptions.endPublication();
+                    } catch (RuntimeException | Error failure) {
+                        poisoned = true;
+                        publicationFailure = appendFailure(publicationFailure, failure);
+                    }
+                }
+            }
+
+            if (publicationFailure != null) {
+                if (callbackFailure != null) {
+                    publicationFailure.addSuppressed(callbackFailure);
+                }
+
+                rethrow(publicationFailure);
+            }
+
+            if (callbackFailure != null) {
+                rethrow(callbackFailure);
+            }
+        } finally {
+            ticking = false;
+        }
+    }
+
+    private static ObservationStatus observationStatus(int statusCode) {
+        return switch (statusCode) {
+            case ElectricalWorld.SubscriptionStatusCode.AVAILABLE -> ObservationStatus.AVAILABLE;
+            case ElectricalWorld.SubscriptionStatusCode.UNAVAILABLE -> ObservationStatus.UNAVAILABLE;
+            
+            default -> throw new IllegalStateException(
+                "Unknown native observation status: " + Integer.toUnsignedLong(statusCode));
+        };
     }
 
     public Wire createWire() {
@@ -211,6 +297,10 @@ public final class ElectricSystem implements AutoCloseable {
     public void close() {
         if (closed) {
             return;
+        }
+
+        if (ticking) {
+            throw new IllegalStateException("Electrical system cannot close while a tick is in progress");
         }
 
         Throwable failure = null;
