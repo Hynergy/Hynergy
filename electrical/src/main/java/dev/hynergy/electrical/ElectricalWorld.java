@@ -429,7 +429,7 @@ final class ElectricalWorld implements AutoCloseable {
         }
 
         if (code != SubscriptionCode.SUCCESS) {
-            handleSubscriptionFailure("remove subscription", code);
+            handleSubscriptionFailure("destroy subscription", code);
         }
     }
 

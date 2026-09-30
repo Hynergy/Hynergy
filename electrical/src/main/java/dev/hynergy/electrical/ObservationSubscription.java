@@ -4,6 +4,16 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.Objects;
 
+/**
+ * Controls one electrical observation subscription.
+ *
+ * <p>A subscription stays active until it is unsubscribed, until its
+ * device is removed, or until its electrical system closes.</p>
+ *
+ * <p>An inactive subscription cannot receive a record from a future
+ * tick. A completed tick can still contain a record for a subscription
+ * that becomes inactive during publication.</p>
+ */
 public final class ObservationSubscription {
     private final int nativeId;
     private final int deviceId;
@@ -26,10 +36,14 @@ public final class ObservationSubscription {
         this.listener = Objects.requireNonNull(listener, "listener");
     }
 
-    public boolean isActive() {
-        return system != null;
-    }
-
+    /**
+     * Stops this observation subscription.
+     *
+     * <p>If the subscription is inactive, this method has no effect.</p>
+     *
+     * <p>If this method is called during observation publication, the
+     * completed tick can still contain a record for this subscription.</p>
+     */
     public void unsubscribe() {
         ElectricSystem system = this.system;
 
@@ -66,5 +80,15 @@ public final class ObservationSubscription {
 
     void releaseListener() {
         listener = null;
+    }
+
+
+    /**
+     * Tests whether this subscription can receive records from a future tick.
+     *
+     * @return {@code true} if the subscription is active
+     */
+    public boolean isActive() {
+        return system != null;
     }
 }

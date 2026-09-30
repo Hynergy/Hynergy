@@ -4,6 +4,21 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.Objects;
 
+/**
+ * Contains one electrical simulation world.
+ *
+ * <p>Create wires and devices in this system. Call {@link #tick()} to
+ * advance the simulation.</p>
+ *
+ * <p>Call methods on this system only from the thread that created it.
+ * A wire or device belongs to one electrical system. Do not use it with
+ * another system.</p>
+ *
+ * <p>Observation callbacks run during {@link #tick()}. A callback can
+ * change the system. The change applies to the next tick.</p>
+ *
+ * <p>Close the system when it is no longer necessary.</p>
+ */
 public final class ElectricSystem implements AutoCloseable {
     private final ElectricalRuntime runtime;
     private final ElectricalWorld world;
@@ -19,7 +34,31 @@ public final class ElectricSystem implements AutoCloseable {
         this.world = world;
     }
 
-
+    /**
+     * Advances the electrical simulation by one tick.
+     *
+     * <p>This method applies pending electrical changes before it advances the
+     * simulation. It then publishes observation updates for the completed
+     * tick.</p>
+     *
+     * <p>An observation callback can change the system. The change does not
+     * change the completed tick. The change applies to the next tick.</p>
+     *
+     * <p>A subscription that is created during publication cannot receive a
+     * record from the completed tick.</p>
+     *
+     * <p>If a subscription becomes inactive during publication, a record that
+     * is already part of the completed tick can still call its listener.</p>
+     *
+     * <p>If an observation listener throws a runtime exception or an error,
+     * publication continues for the other records. This method reports the
+     * listener failure after publication completes.</p>
+     *
+     * <p>Do not call this method from an observation callback.</p>
+     *
+     * @throws IllegalStateException if the system is closed, if the system is
+     *     unusable, or if a tick is already in progress
+     */
     public void tick() {
         requireUsable();
 
@@ -98,12 +137,21 @@ public final class ElectricSystem implements AutoCloseable {
         return switch (statusCode) {
             case ElectricalWorld.SubscriptionStatusCode.AVAILABLE -> ObservationStatus.AVAILABLE;
             case ElectricalWorld.SubscriptionStatusCode.UNAVAILABLE -> ObservationStatus.UNAVAILABLE;
-            
+
             default -> throw new IllegalStateException(
                 "Unknown native observation status: " + Integer.toUnsignedLong(statusCode));
         };
     }
 
+    /**
+     * Creates a wire in this electrical system.
+     *
+     * <p>The wire belongs to this system.</p>
+     *
+     * @return the new wire
+     *
+     * @throws IllegalStateException if the system is closed or unusable
+     */
     public Wire createWire() {
         requireUsable();
 
@@ -133,6 +181,21 @@ public final class ElectricSystem implements AutoCloseable {
         world.removeWire(wire.id(), wire.generation());
     }
 
+    /**
+     * Creates a device of the specified type.
+     *
+     * <p>A custom device type must be registered in the runtime that owns
+     * this system.</p>
+     *
+     * @param type the device type
+     * @param <T> the device class
+     *
+     * @return the new device
+     *
+     * @throws NullPointerException if {@code type} is null
+     * @throws IllegalStateException if the system is closed or unusable, or
+     *     if the device type is not registered in this runtime
+     */
     public <T extends Device> T create(DeviceType<T> type) {
         requireUsable();
 
@@ -293,6 +356,20 @@ public final class ElectricSystem implements AutoCloseable {
         throw new AssertionError(failure);
     }
 
+    /**
+     * Closes this electrical system and releases its resources.
+     *
+     * <p>This operation makes all observation subscriptions inactive.
+     * Do not use devices or wires from this system after this method
+     * completes.</p>
+     *
+     * <p>A second call after a successful close has no effect.</p>
+     *
+     * <p>Do not call this method during a tick or from an observation
+     * callback.</p>
+     *
+     * @throws IllegalStateException if a tick is in progress
+     */
     @Override
     public void close() {
         if (closed) {

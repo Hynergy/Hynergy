@@ -7,18 +7,28 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
- * Encodes a device definition in the HYDF format.
+ * Builds a composite electrical device definition.
  *
- * <p>The builder writes directly to native memory. The builder keeps its
- * current buffer capacity when {@link #reset()} resets the definition.</p>
+ * <p>Plugin code receives this builder from the definition callback of
+ * {@link DeviceType#create(Supplier, Consumer)}.</p>
  *
- * <p>The builder is reusable. The builder is not thread-safe. Use the builder
- * on the thread that creates it.</p>
+ * <p>The runtime owns the builder that it supplies to the callback.
+ * Do not close that builder. Do not keep a reference to it after the
+ * callback returns.</p>
  *
- * <p>Close the builder when it is no longer necessary.</p>
+ * <p>Add terminals, internal nodes, parameters, child elements, and
+ * observers to the definition. IDs are zero-based. The builder assigns
+ * IDs in the order in which objects are added.</p>
+ *
+ * <p>For each child element, add all terminal mappings before you add
+ * parameter values.</p>
+ *
+ * <p>This class is not thread-safe.</p>
  */
 public final class DeviceDefinitionBuilder implements AutoCloseable {
 
@@ -26,7 +36,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      * Specifies one parameter bound.
      *
      * @param value the bound value
-     * @param inclusive {@code true} when the bound includes the value
+     * @param inclusive {@code true} if the bound includes the value
      */
     public record Bound(double value, boolean inclusive) {
 
@@ -121,7 +131,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     /**
      * Creates a builder with the default initial buffer capacity.
      */
-    public DeviceDefinitionBuilder() {
+    DeviceDefinitionBuilder() {
         this(DEFAULT_INITIAL_CAPACITY, null);
     }
 
@@ -143,10 +153,7 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     DeviceDefinitionBuilder(
         Function<DeviceType<?>, DeviceDefinition> definitionResolver
     ) {
-        this(
-            DEFAULT_INITIAL_CAPACITY,
-            Objects.requireNonNull(definitionResolver, "definitionResolver")
-        );
+        this(DEFAULT_INITIAL_CAPACITY, Objects.requireNonNull(definitionResolver, "definitionResolver"));
     }
 
     private DeviceDefinitionBuilder(
@@ -211,14 +218,15 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds one terminal.
+     * Adds one external terminal and its node.
      *
-     * <p>The operation also creates the node for the terminal.</p>
+     * <p>The terminal ID is the zero-based order in which terminals are
+     * added. This method returns the node ID for the terminal.</p>
      *
      * @return the node ID
      *
-     * @throws IllegalStateException if an element is open or the builder is
-     *     closed
+     * @throws IllegalStateException if a child element is open or the builder
+     *     is closed
      */
     public int addTerminal() {
         requireTopLevel();
@@ -239,8 +247,8 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
      *
      * @return the node ID
      *
-     * @throws IllegalStateException if an element is open or the builder is
-     *     closed
+     * @throws IllegalStateException if a child element is open or the builder
+     *     is closed
      */
     public int addNode() {
         requireTopLevel();
@@ -257,7 +265,10 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds an unrestricted parameter.
+     * Adds one parameter without constraints.
+     *
+     * <p>The parameter ID is the zero-based order in which parameters are
+     * added.</p>
      *
      * @return the parameter ID
      */
@@ -266,11 +277,11 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds a parameter.
+     * Adds one parameter with value constraints.
      *
-     * @param lower the lower bound, or {@code null}
-     * @param upper the upper bound, or {@code null}
-     * @param nonZero {@code true} if zero is not valid
+     * @param lower the lower bound, or {@code null} if there is no lower bound
+     * @param upper the upper bound, or {@code null} if there is no upper bound
+     * @param nonZero {@code true} if zero is not permitted
      *
      * @return the parameter ID
      */
@@ -279,16 +290,16 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds a parameter with reciprocal constraints.
+     * Adds one parameter with value and reciprocal constraints.
      *
-     * <p>The reciprocal range is present even when both reciprocal bounds are
-     * {@code null}. An empty reciprocal range requires a finite reciprocal.</p>
+     * <p>If both reciprocal bounds are {@code null}, the reciprocal must be
+     * finite but has no numeric bound.</p>
      *
-     * @param lower the lower bound, or {@code null}
-     * @param upper the upper bound, or {@code null}
-     * @param nonZero {@code true} if zero is not valid
-     * @param reciprocalLower the reciprocal lower bound, or {@code null}
-     * @param reciprocalUpper the reciprocal upper bound, or {@code null}
+     * @param lower the lower value bound, or {@code null}
+     * @param upper the upper value bound, or {@code null}
+     * @param nonZero {@code true} if zero is not permitted
+     * @param reciprocalLower the lower reciprocal bound, or {@code null}
+     * @param reciprocalUpper the upper reciprocal bound, or {@code null}
      *
      * @return the parameter ID
      */
@@ -303,17 +314,23 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Starts an element that uses a device type.
+     * Starts one child element.
      *
-     * <p>If this builder has a definition resolver, the resolver registers an
-     * unresolved child type before this method writes its definition ID.</p>
+     * <p>The runtime resolves and registers the child device type if
+     * necessary.</p>
+     *
+     * <p>Add one terminal mapping for each terminal in the child definition.
+     * Use the terminal order of the child definition. Then add one value for
+     * each child parameter. Use the parameter order of the child definition.
+     * Call {@link #endElement()} when the child element is complete.</p>
      *
      * @param type the child device type
      *
      * @return this builder
      *
-     * @throws IllegalStateException if the type is not registered and this
-     *     builder cannot resolve device types
+     * @throws NullPointerException if {@code type} is null
+     * @throws IllegalStateException if another child element is open, if the
+     *     builder is closed, or if the child type cannot be resolved
      */
     public DeviceDefinitionBuilder beginElement(
         DeviceType<?> type
@@ -326,17 +343,13 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
         DeviceDefinition definition;
 
         if (definitionResolver != null) {
-            definition = Objects.requireNonNull(
-                definitionResolver.apply(type),
-                "Device type resolver returned null"
-            );
+            definition = Objects.requireNonNull(definitionResolver.apply(type), "Device type resolver returned null");
         } else {
             definition = type.currentDefinition();
 
             if (definition == null) {
                 throw new IllegalStateException(
-                    "Device type is not registered and this builder cannot resolve device types"
-                );
+                    "Device type is not registered and this builder cannot resolve device types");
             }
         }
 
@@ -398,9 +411,11 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds one terminal mapping to the current element.
+     * Maps the next child terminal to a node in this definition.
      *
-     * @param nodeId the node ID
+     * <p>Add all terminal mappings before you add a parameter value.</p>
+     *
+     * @param nodeId the node ID in this definition
      *
      * @return this builder
      */
@@ -459,9 +474,9 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds one definition parameter reference to the current element.
+     * Sets the next child parameter from a parameter in this definition.
      *
-     * @param parameterId the parameter ID
+     * @param parameterId the parameter ID in this definition
      *
      * @return this builder
      */
@@ -488,7 +503,10 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Finishes the current element.
+     * Finishes the current child element.
+     *
+     * <p>The element ID is the zero-based order in which child elements are
+     * added.</p>
      *
      * @return the element ID
      */
@@ -521,6 +539,12 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     /**
      * Adds one voltage observer.
      *
+     * <p>The observer value is the positive-node voltage minus the
+     * negative-node voltage.</p>
+     *
+     * <p>The observer ID is the zero-based order in which observers are
+     * added.</p>
+     *
      * @param positiveNode the positive node ID
      * @param negativeNode the negative node ID
      *
@@ -547,9 +571,12 @@ public final class DeviceDefinitionBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds one observer that uses an observer from a child element.
+     * Adds an observer that reads an observer from a child element.
      *
-     * @param elementId the element ID
+     * <p>The observer ID is the zero-based order in which observers are
+     * added.</p>
+     *
+     * @param elementId the child element ID
      * @param observerId the observer ID in the child definition
      *
      * @return the observer ID in this definition

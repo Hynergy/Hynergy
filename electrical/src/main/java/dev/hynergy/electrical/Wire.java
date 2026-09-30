@@ -1,5 +1,11 @@
 package dev.hynergy.electrical;
 
+/**
+ * Identifies one wire in an {@link ElectricSystem}.
+ *
+ * <p>A wire connects device terminals to the same electrical network.
+ * The wire belongs to the system that created it.</p>
+ */
 public final class Wire {
     private final ElectricSystem system;
     private final int id;

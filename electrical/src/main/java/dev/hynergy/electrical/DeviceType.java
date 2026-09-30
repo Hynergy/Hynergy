@@ -6,6 +6,17 @@ import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+/**
+ * Describes one type of electrical device.
+ *
+ * <p>Define one shared device type for each custom device class.</p>
+ *
+ * <p>Use {@link #create(Supplier, Consumer)} to define a custom device
+ * type. Register the type in an {@link ElectricalRuntime} before an
+ * {@link ElectricSystem} creates a device of that type.</p>
+ *
+ * @param <T> the device class
+ */
 public final class DeviceType<T extends Device> {
     private final Supplier<T> constructor;
     private final @Nullable DeviceDefinition primitiveDefinition;
@@ -23,6 +34,25 @@ public final class DeviceType<T extends Device> {
         this.definitionBuilder = definitionBuilder;
     }
 
+    /**
+     * Creates a custom device type.
+     *
+     * <p>The constructor must return a new, unbound device on each call.</p>
+     *
+     * <p>The runtime calls {@code definitionBuilder} when it registers the
+     * type. The runtime owns the builder that it supplies to the callback.
+     * Do not close the builder. Do not keep a reference to the builder after
+     * the callback returns.</p>
+     *
+     * @param constructor the function that creates a device
+     * @param definitionBuilder the function that builds the electrical
+     *     definition
+     * @param <T> the device class
+     *
+     * @return the device type
+     *
+     * @throws NullPointerException if an argument is null
+     */
     public static <T extends Device> DeviceType<T> create(
         Supplier<T> constructor,
         Consumer<DeviceDefinitionBuilder> definitionBuilder

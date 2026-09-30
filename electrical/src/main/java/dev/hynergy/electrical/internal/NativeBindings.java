@@ -198,7 +198,7 @@ public final class NativeBindings {
         try {
             return (int) WORLD_UNSUBSCRIBE.invokeExact(world, subscriptionId);
         } catch (Throwable throwable) {
-            throw new IllegalStateException("Failed to remove native electrical subscription", throwable);
+            throw new IllegalStateException("Failed to destroy native electrical subscription", throwable);
         }
     }
 

@@ -55,7 +55,7 @@ final class ElectricSystemObservationTest {
             ObservationSubscription voltage = system.subscribe(resistor, 0, NOOP_LISTENER);
             ObservationSubscription current = system.subscribe(resistor, 1, NOOP_LISTENER);
 
-            resistor.remove();
+            resistor.destroy();
 
             assertFalse(voltage.isActive());
             assertFalse(current.isActive());
@@ -78,7 +78,7 @@ final class ElectricSystemObservationTest {
             ObservationSubscription firstSubscription = system.subscribe(first, 0, NOOP_LISTENER);
             ObservationSubscription secondSubscription = system.subscribe(second, 0, NOOP_LISTENER);
 
-            first.remove();
+            first.destroy();
 
             assertFalse(firstSubscription.isActive());
             assertTrue(secondSubscription.isActive());
@@ -419,7 +419,7 @@ final class ElectricSystemObservationTest {
                 callbacks.incrementAndGet();
 
                 if (removed.compareAndSet(false, true)) {
-                    resistor.remove();
+                    resistor.destroy();
 
                     assertFalse(firstHolder.get().isActive());
                     assertFalse(secondHolder.get().isActive());
