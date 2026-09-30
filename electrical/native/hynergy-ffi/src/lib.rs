@@ -2239,7 +2239,7 @@ mod tests {
             SubscriptionCode::NullWorld as u32,
         );
 
-        assert_eq!(subscription, u32::MAX);
+        assert_eq!(subscription, 0);
 
         assert_eq!(
             unsafe { super::hynergy_world_unsubscribe(std::ptr::null_mut(), 1) },
@@ -2363,7 +2363,7 @@ mod tests {
             SubscriptionCode::UnknownDevice as u32,
         );
 
-        assert_eq!(result, u32::MAX,);
+        assert_eq!(result, 0,);
 
         result = subscription_result_sentinel();
 
@@ -2372,7 +2372,7 @@ mod tests {
             SubscriptionCode::UnknownObserver as u32,
         );
 
-        assert_eq!(result, u32::MAX,);
+        assert_eq!(result, 0);
 
         unsafe {
             hynergy_engine_destroy(engine);
@@ -2392,7 +2392,7 @@ mod tests {
             SubscriptionCode::InvalidDeviceId as u32,
         );
 
-        assert_eq!(result, u32::MAX,);
+        assert_eq!(result, 0,);
 
         assert_eq!(
             unsafe { hynergy_world_unsubscribe(engine, world, 0,) },
