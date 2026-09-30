@@ -222,6 +222,7 @@ jobs:
             'gradlew' \
             'gradlew.bat' \
             'gradle/*' \
+            'build-logic/*' \
             '.github/workflows/ci.yml'
           then
             electrical=true
@@ -237,6 +238,7 @@ jobs:
             'gradlew' \
             'gradlew.bat' \
             'gradle/*' \
+            'build-logic/*' \
             '.github/workflows/ci.yml'
           then
             gradle=true

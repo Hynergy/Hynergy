@@ -1,46 +1,35 @@
 plugins {
-    java
+    id("hynergy.java-conventions")
     id("com.azuredoom.hytale-tools")
 }
 
-group = property("group").toString()
-
-val electricalProject = rootProject.project(":electrical")
+val electricalProject = project(":electrical")
 
 tasks.named<Jar>("jar") {
-    archiveBaseName.set(project.property("mod_name").toString())
-    archiveVersion.set(project.property("version").toString())
+    archiveBaseName.set(providers.gradleProperty("mod_name"))
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
     from(electricalProject.tasks.named<Jar>("jar").map { zipTree(it.archiveFile) })
 }
 
-java {
-    toolchain.languageVersion.set(JavaLanguageVersion.of(property("java_version").toString().toInt()))
-}
-
 hytaleTools {
-    modId = "core"
-    mainClass = "dev.hynergy.core.HynergyPlugin"
+    modId.set("core")
+    mainClass.set("dev.hynergy.core.HynergyPlugin")
 
-    modDescription = property("mod_description").toString()
-    modUrl = property("mod_url").toString()
-    modCredits = property("mod_author").toString()
+    modDescription.set(providers.gradleProperty("mod_description"))
+    modUrl.set(providers.gradleProperty("mod_url"))
+    modCredits.set(providers.gradleProperty("mod_author"))
 
-    manifestDependencies =
-        property("manifest_dependencies").toString()
+    manifestDependencies.set(
+        providers.gradleProperty("manifest_dependencies")
+    )
 
-    includesPack = true
-}
-
-repositories {
-    mavenCentral()
+    includesPack.set(
+        providers.gradleProperty("includes_pack").map(String::toBoolean)
+    )
 }
 
 dependencies {
     implementation(project(":electrical"))
-    implementation("org.jspecify:jspecify:1.0.0")
-    implementation("it.unimi.dsi:fastutil:8.5.19")
-    compileOnly("org.projectlombok:lombok:1.18.48")
-    annotationProcessor("org.projectlombok:lombok:1.18.48")
+    compileOnly(libs.jspecify)
 }

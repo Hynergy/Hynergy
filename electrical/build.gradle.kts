@@ -1,35 +1,23 @@
 import java.util.*
 
 plugins {
-    java
-}
-
-group = "dev.hynergy"
-version = "0.0.1-dev"
-
-repositories {
-    mavenCentral()
-}
-
-java {
-    toolchain.languageVersion.set(
-        JavaLanguageVersion.of(property("java_version").toString().toInt())
-    )
+    id("hynergy.java-conventions")
+    `java-library`
 }
 
 dependencies {
-    testImplementation(platform("org.junit:junit-bom:6.0.0"))
-    testImplementation("org.junit.jupiter:junit-jupiter")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    implementation("org.jspecify:jspecify:1.0.0")
-    implementation("it.unimi.dsi:fastutil:8.5.19")
-    compileOnly("org.projectlombok:lombok:1.18.48")
-    annotationProcessor("org.projectlombok:lombok:1.18.48")
+    implementation(libs.fastutil)
+    compileOnlyApi(libs.jspecify)
+
+    compileOnly(libs.lombok)
+    annotationProcessor(libs.lombok)
+
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
 }
 
 tasks.test {
-    useJUnitPlatform()
-
     jvmArgs("--enable-native-access=ALL-UNNAMED")
 }
 

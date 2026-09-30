@@ -1,19 +1,12 @@
 plugins {
-    id("com.azuredoom.hytale-workspace") version "1.+"
-}
-
-subprojects {
-    tasks.register("prepareKotlinBuildScriptModel") {
-        description = "Prepares the Kotlin build script model for this project."
-        dependsOn(rootProject.tasks.named("prepareKotlinBuildScriptModel"))
-    }
+    id("com.azuredoom.hytale-workspace")
 }
 
 hytaleWorkspace {
-    modProjects = listOf(":core")
-    hostProject = ":core"
+    modProjects.set(listOf(":core"))
+    hostProject.set(":core")
 
-    manifestGroup = property("group").toString()
-    hytaleVersion = property("hytale_version").toString()
-    patchline = property("patchline").toString()
+    manifestGroup.set(providers.gradleProperty("group"))
+    hytaleVersion.set(providers.gradleProperty("hytale_version"))
+    patchline.set(providers.gradleProperty("patchline"))
 }
