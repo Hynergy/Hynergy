@@ -18,10 +18,10 @@ public final class ObservationSubscription {
     private final int nativeId;
     private final int deviceId;
 
-    private @Nullable ElectricSystem system;
+    private @Nullable ElectricalSystem system;
     private @Nullable ObservationListener listener;
 
-    ObservationSubscription(ElectricSystem system, int nativeId, int deviceId, ObservationListener listener) {
+    ObservationSubscription(ElectricalSystem system, int nativeId, int deviceId, ObservationListener listener) {
         if (nativeId == 0) {
             throw new IllegalArgumentException("Native subscription ID must not be zero");
         }
@@ -45,7 +45,7 @@ public final class ObservationSubscription {
      * completed tick can still contain a record for this subscription.</p>
      */
     public void unsubscribe() {
-        ElectricSystem system = this.system;
+        ElectricalSystem system = this.system;
 
         if (system != null) {
             system.unsubscribe(this);
@@ -60,7 +60,7 @@ public final class ObservationSubscription {
         return deviceId;
     }
 
-    boolean belongsTo(ElectricSystem system) {
+    boolean belongsTo(ElectricalSystem system) {
         return this.system == system;
     }
 

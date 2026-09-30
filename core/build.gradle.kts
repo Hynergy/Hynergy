@@ -20,23 +20,17 @@ java {
 }
 
 hytaleTools {
-    javaVersion = property("java_version").toString().toInt()
-    hytaleVersion = property("hytale_version").toString()
-    manifestServerVersion = property("manifestServerVersion").toString()
-    manifestGroup = property("manifest_group").toString()
     modId = "core"
+    mainClass = "dev.hynergy.core.HynergyPlugin"
+
     modDescription = property("mod_description").toString()
     modUrl = property("mod_url").toString()
-    mainClass = "dev.hynergy.HynergyPlugin"
     modCredits = property("mod_author").toString()
-    manifestDependencies = property("manifest_dependencies").toString()
-    manifestOptionalDependencies = property("manifest_opt_dependencies").toString()
-    curseforgeId = property("curseforge_id").toString()
-    disabledByDefault = property("disabled_by_default").toString().toBoolean()
-    includesPack = property("includes_pack").toString().toBoolean()
-    injectServerJavadocsIntoSources = property("inject_server_javadocs_into_sources").toString().toBoolean()
-    generateAssetsBinary = property("generate_assets_binary").toString().toBoolean()
-    patchline = property("patchline").toString()
+
+    manifestDependencies =
+        property("manifest_dependencies").toString()
+
+    includesPack = true
 }
 
 repositories {
@@ -45,4 +39,8 @@ repositories {
 
 dependencies {
     implementation(project(":electrical"))
+    implementation("org.jspecify:jspecify:1.0.0")
+    implementation("it.unimi.dsi:fastutil:8.5.19")
+    compileOnly("org.projectlombok:lombok:1.18.48")
+    annotationProcessor("org.projectlombok:lombok:1.18.48")
 }

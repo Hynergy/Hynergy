@@ -50,7 +50,7 @@ public final class Nand extends Device {
      * @return the gate
      */
     public static Nand create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdRelativeToVss,
         double maximumConductance,
         double minimumConductance

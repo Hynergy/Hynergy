@@ -10,7 +10,7 @@ import java.util.Objects;
  * <p>A custom electrical device extends this class and defines a shared
  * {@link DeviceType}.</p>
  *
- * <p>An {@link ElectricSystem} binds each device that it creates. Plugin
+ * <p>An {@link ElectricalSystem} binds each device that it creates. Plugin
  * code must not bind a device directly.</p>
  *
  * <p>Use the protected methods to set parameters, attach terminals,
@@ -18,7 +18,7 @@ import java.util.Objects;
  */
 @SuppressWarnings("resource")
 public abstract class Device {
-    private @Nullable ElectricSystem system;
+    private @Nullable ElectricalSystem system;
 
     private int id;
     private int generation;
@@ -54,7 +54,7 @@ public abstract class Device {
         return requireBound().subscribe(this, observerId, listener);
     }
 
-    final void bind(ElectricSystem system, int id, int generation) {
+    final void bind(ElectricalSystem system, int id, int generation) {
         requireUnbound();
 
         this.system = Objects.requireNonNull(system, "system");
@@ -62,7 +62,7 @@ public abstract class Device {
         this.generation = generation;
     }
 
-    final boolean belongsTo(ElectricSystem system) {
+    final boolean belongsTo(ElectricalSystem system) {
         return this.system == system;
     }
 
@@ -144,8 +144,8 @@ public abstract class Device {
         }
     }
 
-    private ElectricSystem requireBound() {
-        ElectricSystem system = this.system;
+    private ElectricalSystem requireBound() {
+        ElectricalSystem system = this.system;
 
         if (system == null) {
             throw new IllegalStateException("Electrical device is not bound");

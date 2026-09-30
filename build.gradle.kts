@@ -13,7 +13,7 @@ hytaleWorkspace {
     modProjects = listOf(":core")
     hostProject = ":core"
 
-    manifestGroup = property("manifest_group").toString()
+    manifestGroup = property("group").toString()
     hytaleVersion = property("hytale_version").toString()
     patchline = property("patchline").toString()
 }

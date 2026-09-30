@@ -50,7 +50,7 @@ public final class Or extends Device {
      * @return the gate
      */
     public static Or create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdRelativeToVss,
         double maximumConductance,
         double minimumConductance

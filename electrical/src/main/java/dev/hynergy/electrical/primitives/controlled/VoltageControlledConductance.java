@@ -52,7 +52,7 @@ public final class VoltageControlledConductance extends Device {
      * @return the voltage-controlled conductance
      */
     public static VoltageControlledConductance create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdVoltage,
         double transitionVoltage,
         double minimumConductance,

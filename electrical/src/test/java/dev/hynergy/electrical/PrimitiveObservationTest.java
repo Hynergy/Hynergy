@@ -20,7 +20,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void twoTerminalPrimitivesExposeVoltageAndCurrentObservers() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistance = system.create(Resistance.TYPE);
 
             Conductance conductance = system.create(Conductance.TYPE);
@@ -55,7 +56,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void controlledPrimitivesExposeSemanticObservers() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             VoltageControlledCurrentSource currentSource = system.create(VoltageControlledCurrentSource.TYPE);
 
             VoltageControlledVoltageSource voltageSource = system.create(VoltageControlledVoltageSource.TYPE);
@@ -86,7 +88,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void singleInputLogicPrimitivesExposeSemanticObservers() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Not not = system.create(Not.TYPE);
 
             SchmittBuffer schmitt = system.create(SchmittBuffer.TYPE);
@@ -105,7 +108,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void twoInputLogicPrimitivesExposeSemanticObservers() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             And and = system.create(And.TYPE);
 
             Nand nand = system.create(Nand.TYPE);
@@ -140,7 +144,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void tickDelayExposesSemanticObservers() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             TickDelay delay = system.create(TickDelay.TYPE);
 
             assertActive(
@@ -153,7 +158,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void semanticResistanceObserversPublishExpectedValues() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             VoltageSource source = VoltageSource.create(system, 5.0);
 
             Resistance resistance = Resistance.create(system, 10.0);
@@ -207,7 +213,8 @@ final class PrimitiveObservationTest {
 
     @Test
     void semanticObserverRejectsNullListener() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistance = system.create(Resistance.TYPE);
 
             assertThrows(NullPointerException.class, () -> resistance.observeVoltage(null));
@@ -226,7 +233,11 @@ final class PrimitiveObservationTest {
         }
     }
 
-    private static void connectSourceAndResistance(ElectricSystem system, VoltageSource source, Resistance resistance) {
+    private static void connectSourceAndResistance(
+        ElectricalSystem system,
+        VoltageSource source,
+        Resistance resistance
+    ) {
         Wire positive = system.createWire();
         Wire negative = system.createWire();
 

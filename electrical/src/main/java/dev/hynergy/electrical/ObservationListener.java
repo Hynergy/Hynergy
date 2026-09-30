@@ -7,12 +7,12 @@ package dev.hynergy.electrical;
  * A later tick sends an update when availability changes or when an
  * available value changes.</p>
  *
- * <p>The listener runs during {@link ElectricSystem#tick()}.
+ * <p>The listener runs during {@link ElectricalSystem#tick()}.
  * The listener can change the electrical system. The change applies to
  * the next tick.</p>
  *
- * <p>Do not call {@link ElectricSystem#tick()} or
- * {@link ElectricSystem#close()} from this listener.</p>
+ * <p>Do not call {@link ElectricalSystem#tick()} or
+ * {@link ElectricalSystem#close()} from this listener.</p>
  *
  * <p>If this listener throws a runtime exception or an error, publication
  * continues for the other records.</p>

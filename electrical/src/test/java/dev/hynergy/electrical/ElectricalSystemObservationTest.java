@@ -11,13 +11,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-final class ElectricSystemObservationTest {
+final class ElectricalSystemObservationTest {
     private static final ObservationListener NOOP_LISTENER = (status, value) -> {
     };
 
     @Test
     void subscribeReturnsActiveHandle() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             ObservationSubscription subscription = system.subscribe(resistor, 0, NOOP_LISTENER);
@@ -31,7 +32,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void unsubscribeIsIdempotent() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             ObservationSubscription subscription = system.subscribe(resistor, 0, NOOP_LISTENER);
@@ -49,7 +51,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void removingDeviceInvalidatesAllItsSubscriptions() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             ObservationSubscription voltage = system.subscribe(resistor, 0, NOOP_LISTENER);
@@ -70,7 +73,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void removingDeviceDoesNotInvalidateOtherDeviceSubscriptions() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance first = Resistance.create(system, 10.0);
 
             Resistance second = Resistance.create(system, 20.0);
@@ -89,7 +93,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void invalidObserverDoesNotPoisonSystem() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             assertThrows(
@@ -106,8 +111,8 @@ final class ElectricSystemObservationTest {
     @Test
     void subscriptionCannotBeUnsubscribedThroughAnotherSystem() {
         try (ElectricalRuntime runtime = ElectricalRuntime.create();
-            ElectricSystem first = runtime.createSystem(20);
-            ElectricSystem second = runtime.createSystem(20)) {
+            ElectricalSystem first = runtime.createSystem(20);
+            ElectricalSystem second = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(first, 10.0);
 
             ObservationSubscription subscription = first.subscribe(resistor, 0, NOOP_LISTENER);
@@ -124,7 +129,7 @@ final class ElectricSystemObservationTest {
     @Test
     void closingSystemInvalidatesAllSubscriptions() {
         try (ElectricalRuntime runtime = ElectricalRuntime.create()) {
-            ElectricSystem system = runtime.createSystem(20);
+            ElectricalSystem system = runtime.createSystem(20);
 
             Resistance resistor = Resistance.create(system, 10.0);
 
@@ -145,7 +150,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void firstTickPublishesInitialObservation() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger callbacks = new AtomicInteger();
@@ -159,7 +165,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void unchangedTickDoesNotRepublishObservation() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger callbacks = new AtomicInteger();
@@ -177,7 +184,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void callbackMutationAffectsNextTick() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             VoltageSource source = VoltageSource.create(system, 5.0);
             Resistance resistor = Resistance.create(system, 10.0);
 
@@ -213,7 +221,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void unsubscribeDuringPublicationPreservesCompletedSnapshot() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger callbacks = new AtomicInteger();
@@ -259,7 +268,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void subscriptionCreatedDuringPublicationStartsOnNextTick() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger createdCallbacks = new AtomicInteger();
@@ -288,7 +298,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void listenerFailureDoesNotAbortPublicationOrPoisonSystem() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             IllegalStateException listenerFailure = new IllegalStateException("listener failure");
@@ -315,7 +326,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void multipleListenerFailuresAreSuppressed() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             RuntimeException firstFailure = new IllegalStateException("first");
@@ -350,7 +362,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void recursiveTickIsRejectedWithoutAbortingOuterPublication() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger recursiveFailures = new AtomicInteger();
@@ -379,7 +392,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void closeDuringPublicationIsRejectedWithoutClosingSystem() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger closeFailures = new AtomicInteger();
@@ -406,7 +420,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void deviceRemovalDuringPublicationInvalidatesImmediatelyButPreservesSnapshot() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             AtomicInteger callbacks = new AtomicInteger();
@@ -450,7 +465,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void tickGrowsSubscriptionBufferAndPublishesAllRecords() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             Resistance resistor = Resistance.create(system, 10.0);
 
             int subscriptionCount = 20;
@@ -476,7 +492,8 @@ final class ElectricSystemObservationTest {
 
     @Test
     void singularIslandPublishesUnavailableAndRecoversWhenTopologyIsRestored() {
-        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create();
+            ElectricalSystem system = runtime.createSystem(20)) {
             VoltageSource source = VoltageSource.create(system, 5.0);
 
             Wire positive = system.createWire();
@@ -524,7 +541,7 @@ final class ElectricSystemObservationTest {
         }
     }
 
-    private static void connectSourceAndResistor(ElectricSystem system, VoltageSource source, Resistance resistor) {
+    private static void connectSourceAndResistor(ElectricalSystem system, VoltageSource source, Resistance resistor) {
         Wire positive = system.createWire();
         Wire negative = system.createWire();
 

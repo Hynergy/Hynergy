@@ -50,7 +50,7 @@ public final class And extends Device {
      * @return the gate
      */
     public static And create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdRelativeToVss,
         double maximumConductance,
         double minimumConductance

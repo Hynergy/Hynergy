@@ -40,7 +40,7 @@ public final class VoltageControlledCurrentSource extends Device {
      *
      * @return the voltage-controlled current source
      */
-    public static VoltageControlledCurrentSource create(ElectricSystem system, double transconductance) {
+    public static VoltageControlledCurrentSource create(ElectricalSystem system, double transconductance) {
         VoltageControlledCurrentSource device = system.create(TYPE);
 
         device.setTransconductance(transconductance);

@@ -7,10 +7,12 @@ import java.util.Objects;
 /**
  * Owns the electrical engine and its device type registrations.
  *
- * <p>Create one runtime before you create an {@link ElectricSystem}.
+ * <p>Create one runtime before you create an {@link ElectricalSystem}.
  * Register custom device types before you create a system.</p>
  *
- * <p>Close all systems before you close the runtime.</p>
+ * <p>Close all electrical systems before you call {@link #close()}, or call
+ * {@link #requestClose()} to close the runtime automatically after its active
+ * systems close.</p>
  *
  * <p>Only one electrical runtime can be active in the process.</p>
  */
@@ -20,6 +22,7 @@ public final class ElectricalRuntime implements AutoCloseable {
     private final ArrayList<DeviceType<?>> boundTypes = new ArrayList<>();
     private final IdentityHashMap<DeviceType<?>, Boolean> registeringTypes = new IdentityHashMap<>();
 
+    private boolean closeRequested;
     private boolean closed;
     private int systemCount;
 
@@ -54,13 +57,16 @@ public final class ElectricalRuntime implements AutoCloseable {
      * @return the registered device definition
      *
      * @throws NullPointerException if {@code type} is null
-     * @throws IllegalStateException if the runtime is closed, if a system is
-     *     active, or if registration fails
+     * @throws IllegalStateException if the runtime is closed, if closing has
+     *     been requested, if an electrical system is active, or if registration
+     *     fails
      */
     public synchronized <T extends Device> DeviceDefinition register(
         DeviceType<T> type
     ) {
         requireOpen();
+        requireActive();
+
         Objects.requireNonNull(type, "type");
 
         DeviceDefinition existing = type.existingDefinition(this);
@@ -85,11 +91,12 @@ public final class ElectricalRuntime implements AutoCloseable {
      *
      * @throws IllegalArgumentException if {@code tickFrequencyHz} is not
      *     greater than zero
-     * @throws IllegalStateException if the runtime is closed or device type
-     *     registration is in progress
+     * @throws IllegalStateException if the runtime is closed, if closing has
+     *     been requested, or if device type registration is in progress
      */
-    public synchronized ElectricSystem createSystem(int tickFrequencyHz) {
+    public synchronized ElectricalSystem createSystem(int tickFrequencyHz) {
         requireOpen();
+        requireActive();
 
         if (!registeringTypes.isEmpty()) {
             throw new IllegalStateException(
@@ -100,7 +107,7 @@ public final class ElectricalRuntime implements AutoCloseable {
 
         systemCount++;
 
-        return new ElectricSystem(this, world);
+        return new ElectricalSystem(this, world);
     }
 
     synchronized void releaseSystem() {
@@ -109,6 +116,10 @@ public final class ElectricalRuntime implements AutoCloseable {
         }
 
         systemCount--;
+
+        if (closeRequested && systemCount == 0) {
+            close();
+        }
     }
 
     DeviceDefinition requireDefinition(DeviceType<?> type) {
@@ -136,7 +147,7 @@ public final class ElectricalRuntime implements AutoCloseable {
             try {
                 type.bind(this, definition);
             } catch (RuntimeException | Error failure) {
-                boundTypes.remove(boundTypes.size() - 1);
+                boundTypes.removeLast();
                 throw failure;
             }
 
@@ -146,19 +157,42 @@ public final class ElectricalRuntime implements AutoCloseable {
         }
     }
 
-    private void requireOpen() {
-        if (closed) {
-            throw new IllegalStateException("Electrical runtime is closed");
+    /**
+     * Requests this runtime to close after its active electrical systems close.
+     *
+     * <p>This method prevents new device registrations and new electrical
+     * systems from being created. Existing electrical systems remain usable
+     * until they are closed.</p>
+     *
+     * <p>If no electrical systems are active, this method closes the runtime
+     * immediately. Otherwise, the runtime closes automatically when the last
+     * active electrical system closes.</p>
+     *
+     * <p>A second call has no effect.</p>
+     */
+    public synchronized void requestClose() {
+        if (closed || closeRequested) {
+            return;
+        }
+
+        closeRequested = true;
+
+        if (systemCount == 0) {
+            close();
         }
     }
 
     /**
      * Closes this runtime and releases its resources.
      *
+     * <p>This method closes the runtime immediately. All electrical systems
+     * must be closed before this method is called. Use {@link #requestClose()}
+     * when the runtime must close after its active electrical systems close.</p>
+     *
      * <p>A second call after a successful close has no effect.</p>
      *
-     * @throws IllegalStateException if a system is active or device type
-     *     registration is in progress
+     * @throws IllegalStateException if an electrical system is active or device
+     *     type registration is in progress
      */
     @Override
     public synchronized void close() {
@@ -182,5 +216,21 @@ public final class ElectricalRuntime implements AutoCloseable {
 
         boundTypes.clear();
         closed = true;
+    }
+
+    private void requireOpen() {
+        if (closed) {
+            throw new IllegalStateException("Electrical runtime is closed");
+        }
+    }
+
+    private void requireActive() {
+        if (closed) {
+            throw new IllegalStateException("Electrical runtime is closed");
+        }
+
+        if (closeRequested) {
+            throw new IllegalStateException("Electrical runtime is closing");
+        }
     }
 }

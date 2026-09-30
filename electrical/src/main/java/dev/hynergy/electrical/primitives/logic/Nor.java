@@ -50,7 +50,7 @@ public final class Nor extends Device {
      * @return the gate
      */
     public static Nor create(
-        ElectricSystem system,
+        ElectricalSystem system,
         double thresholdRelativeToVss,
         double maximumConductance,
         double minimumConductance
