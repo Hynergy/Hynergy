@@ -464,6 +464,9 @@ final class ElectricalWorld implements AutoCloseable {
     }
 
     private void handleSubscriptionFailure(String operation, int code) {
+        boolean ownershipConsistencyFailure =
+            code == SubscriptionCode.INVALID_SUBSCRIPTION_ID || code == SubscriptionCode.UNKNOWN_SUBSCRIPTION;
+
         String reason = switch (code) {
             case SubscriptionCode.NULL_WORLD -> "native world handle is null";
 
@@ -486,15 +489,40 @@ final class ElectricalWorld implements AutoCloseable {
                 yield "native engine panicked";
             }
 
-            default -> "unknown native subscription status";
+            default -> {
+                poisoned = true;
+                yield "unknown native subscription status";
+            }
         };
 
-        throw new IllegalStateException(
-            "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code) + ")");
+        throw new SubscriptionOperationException(
+            "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code) + ")",
+            ownershipConsistencyFailure
+        );
+    }
+
+    static final class SubscriptionOperationException extends IllegalStateException {
+
+        private final boolean ownershipConsistencyFailure;
+
+        private SubscriptionOperationException(String message, boolean ownershipConsistencyFailure) {
+            super(message);
+
+            this.ownershipConsistencyFailure = ownershipConsistencyFailure;
+        }
+
+        boolean isOwnershipConsistencyFailure() {
+            return ownershipConsistencyFailure;
+        }
+    }
+
+
+    boolean isOpen() {
+        return arena.scope().isAlive();
     }
 
     MemorySegment requireOpen() {
-        if (!arena.scope().isAlive()) {
+        if (!isOpen()) {
             throw new IllegalStateException("Electrical world is closed");
         }
 
@@ -513,7 +541,7 @@ final class ElectricalWorld implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!arena.scope().isAlive()) {
+        if (!isOpen()) {
             return;
         }
 
