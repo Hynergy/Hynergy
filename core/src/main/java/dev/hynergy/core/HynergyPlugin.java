@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Level;
 
+@SuppressWarnings("unused")
 public class HynergyPlugin extends JavaPlugin {
 
     public static final @NonNull HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
