@@ -1,9 +1,6 @@
 package dev.hynergy.electrical.primitives.logic;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class Or extends Device {
     public static final DeviceType<Or> TYPE = DeviceType.primitive(16, Or::new);
@@ -17,6 +14,11 @@ public final class Or extends Device {
     private static final int PARAMETER_THRESHOLD_RELATIVE_TO_VSS = 0;
     private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 1;
     private static final int PARAMETER_MINIMUM_CONDUCTANCE = 2;
+
+    private static final int OBSERVER_OUTPUT_VOLTAGE = 0;
+    private static final int OBSERVER_INPUT_A_VOLTAGE = 1;
+    private static final int OBSERVER_INPUT_B_VOLTAGE = 2;
+    private static final int OBSERVER_OUTPUT_CURRENT = 3;
 
     private Or() {
     }
@@ -86,5 +88,29 @@ public final class Or extends Device {
 
     public void detachInputB(Wire wire) {
         detachTerminal(TERMINAL_INPUT_B, wire);
+    }
+
+    public ObservationSubscription observeOutputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeInputVoltageA(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_INPUT_A_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeInputVoltageB(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_INPUT_B_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeOutputCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_CURRENT, listener);
     }
 }

@@ -1,9 +1,6 @@
 package dev.hynergy.electrical.primitives.sources;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class VoltageControlledCurrentSource extends Device {
     public static final DeviceType<VoltageControlledCurrentSource> TYPE =
@@ -15,6 +12,11 @@ public final class VoltageControlledCurrentSource extends Device {
     private static final int TERMINAL_CONTROL_NEGATIVE = 3;
 
     private static final int PARAMETER_TRANSCONDUCTANCE = 0;
+
+    private static final int OBSERVER_OUTPUT_VOLTAGE = 0;
+    private static final int OBSERVER_CONTROL_VOLTAGE = 1;
+    private static final int OBSERVER_OUTPUT_CURRENT = 2;
+
 
     private VoltageControlledCurrentSource() {
     }
@@ -61,5 +63,24 @@ public final class VoltageControlledCurrentSource extends Device {
 
     public void detachControlNegative(Wire wire) {
         detachTerminal(TERMINAL_CONTROL_NEGATIVE, wire);
+    }
+
+
+    public ObservationSubscription observeOutputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeControlVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_CONTROL_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeOutputCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_CURRENT, listener);
     }
 }

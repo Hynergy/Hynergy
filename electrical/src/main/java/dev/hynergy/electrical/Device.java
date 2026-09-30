@@ -14,10 +14,8 @@ public abstract class Device {
     protected Device() {
     }
 
-    final void requireUnbound() {
-        if (system != null) {
-            throw new IllegalStateException("Electrical device is already bound");
-        }
+    protected final ObservationSubscription observe(int observerId, ObservationListener listener) {
+        return requireBound().subscribe(this, observerId, listener);
     }
 
     final void bind(ElectricSystem system, int id, int generation) {
@@ -56,6 +54,12 @@ public abstract class Device {
 
     protected final void detachTerminal(int terminalId, Wire wire) {
         requireBound().detachTerminal(this, terminalId, wire);
+    }
+
+    final void requireUnbound() {
+        if (system != null) {
+            throw new IllegalStateException("Electrical device is already bound");
+        }
     }
 
     private ElectricSystem requireBound() {

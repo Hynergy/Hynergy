@@ -1,9 +1,6 @@
 package dev.hynergy.electrical.primitives.logic;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class Not extends Device {
     public static final DeviceType<Not> TYPE = DeviceType.primitive(13, Not::new);
@@ -16,6 +13,10 @@ public final class Not extends Device {
     private static final int PARAMETER_THRESHOLD_RELATIVE_TO_VSS = 0;
     private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 1;
     private static final int PARAMETER_MINIMUM_CONDUCTANCE = 2;
+
+    private static final int OBSERVER_OUTPUT_VOLTAGE = 0;
+    private static final int OBSERVER_INPUT_VOLTAGE = 1;
+    private static final int OBSERVER_OUTPUT_CURRENT = 2;
 
     private Not() {
     }
@@ -77,5 +78,23 @@ public final class Not extends Device {
 
     public void detachInput(Wire wire) {
         detachTerminal(TERMINAL_INPUT, wire);
+    }
+
+    public ObservationSubscription observeOutputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeInputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_INPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeOutputCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_CURRENT, listener);
     }
 }

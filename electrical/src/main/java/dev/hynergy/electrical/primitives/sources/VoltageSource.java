@@ -1,17 +1,19 @@
 package dev.hynergy.electrical.primitives.sources;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class VoltageSource extends Device {
     public static final DeviceType<VoltageSource> TYPE = DeviceType.primitive(3, VoltageSource::new);
+
 
     private static final int TERMINAL_POSITIVE = 0;
     private static final int TERMINAL_NEGATIVE = 1;
 
     private static final int PARAMETER_VOLTAGE = 0;
+
+    private static final int OBSERVER_VOLTAGE = 0;
+    private static final int OBSERVER_CURRENT = 1;
+
 
     private VoltageSource() {
     }
@@ -24,9 +26,11 @@ public final class VoltageSource extends Device {
         return device;
     }
 
+
     public void setVoltage(double voltage) {
         setParameter(PARAMETER_VOLTAGE, voltage);
     }
+
 
     public void attachPositive(Wire wire) {
         attachTerminal(TERMINAL_POSITIVE, wire);
@@ -42,5 +46,18 @@ public final class VoltageSource extends Device {
 
     public void detachNegative(Wire wire) {
         detachTerminal(TERMINAL_NEGATIVE, wire);
+    }
+
+
+    public ObservationSubscription observeVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_CURRENT, listener);
     }
 }
