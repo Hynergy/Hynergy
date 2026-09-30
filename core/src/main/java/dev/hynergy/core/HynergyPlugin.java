@@ -4,7 +4,7 @@ import com.hypixel.hytale.logger.HytaleLogger;
 import com.hypixel.hytale.server.core.plugin.JavaPlugin;
 import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
 import dev.hynergy.core.electricity.ElectricityModule;
-import org.jspecify.annotations.Nullable;
+import org.jspecify.annotations.NonNull;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -12,15 +12,21 @@ import java.util.logging.Level;
 
 public class HynergyPlugin extends JavaPlugin {
 
-    public static final HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
+    public static final @NonNull HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
 
-    private final List<HynergyModule> modules = new ArrayList<>();
-    public @Nullable ElectricityModule electricityModule;
+    private static HynergyPlugin INSTANCE;
+
+    private final @NonNull List<HynergyModule> modules = new ArrayList<>();
+    public ElectricityModule electricityModule;
 
     public HynergyPlugin(JavaPluginInit init) {
         super(init);
+        INSTANCE = this;
     }
 
+    public static HynergyPlugin get() {
+        return INSTANCE;
+    }
 
     @Override
     protected void setup() {
@@ -34,7 +40,9 @@ public class HynergyPlugin extends JavaPlugin {
 
     @Override
     protected void start() {
+        super.start();
         LOGGER.at(Level.INFO).log("Starting Hynergy!");
+
         for (HynergyModule module : modules) {
             module.start();
         }
@@ -42,6 +50,8 @@ public class HynergyPlugin extends JavaPlugin {
 
     @Override
     protected void shutdown() {
+        super.shutdown();
+
         LOGGER.at(Level.INFO).log("Shutting down Hynergy!");
 
         for (int index = modules.size() - 1; index >= 0; index--) {
@@ -49,7 +59,7 @@ public class HynergyPlugin extends JavaPlugin {
         }
     }
 
-    private <T extends HynergyModule> T registerModule(T module) {
+    private <T extends HynergyModule> T registerModule(@NonNull T module) {
         modules.add(module);
         return module;
     }
