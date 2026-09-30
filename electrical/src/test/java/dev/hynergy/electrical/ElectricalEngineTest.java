@@ -44,7 +44,7 @@ final class ElectricalEngineTest {
             DeviceDefinition definition = engine.registerDefinition(builder);
 
             assertNotNull(definition);
-            assertNotEquals(0, definition.getId());
+            assertNotEquals(0, definition.id());
         }
     }
 
@@ -55,7 +55,7 @@ final class ElectricalEngineTest {
             DeviceDefinition first = engine.registerDefinition(builder);
             DeviceDefinition second = engine.registerDefinition(builder);
 
-            assertNotEquals(first.getId(), second.getId());
+            assertNotEquals(first.id(), second.id());
         }
     }
 
@@ -77,7 +77,7 @@ final class ElectricalEngineTest {
 
             DeviceDefinition definition = engine.registerDefinition(builder);
 
-            assertNotEquals(0, definition.getId());
+            assertNotEquals(0, definition.id());
             assertEquals(byteSize, builder.byteSize());
             assertEquals(commandCount, builder.commandCount());
             assertEquals(3, builder.commandCount());
@@ -97,7 +97,7 @@ final class ElectricalEngineTest {
 
             DeviceDefinition definition = assertDoesNotThrow(() -> engine.registerDefinition(builder));
 
-            assertNotEquals(0, definition.getId());
+            assertNotEquals(0, definition.id());
         }
     }
 }
