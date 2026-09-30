@@ -29,7 +29,7 @@ jobs:
 
     outputs:
       rust: ${{ steps.changes.outputs.rust }}
-      mna: ${{ steps.changes.outputs.mna }}
+      electrical: ${{ steps.changes.outputs.electrical }}
       gradle: ${{ steps.changes.outputs.gradle }}
 
     steps:
@@ -51,11 +51,11 @@ jobs:
 
           write_outputs() {
             echo "rust=$1" >> "$GITHUB_OUTPUT"
-            echo "mna=$2" >> "$GITHUB_OUTPUT"
+            echo "electrical=$2" >> "$GITHUB_OUTPUT"
             echo "gradle=$3" >> "$GITHUB_OUTPUT"
 
             echo "Rust checks: $1"
-            echo "MNA integration: $2"
+            echo "Electrical integration: $2"
             echo "Gradle build: $3"
           }
 
@@ -87,7 +87,7 @@ jobs:
           trap 'rm -f "$runs_file" "$jobs_file" "$diff_file"' EXIT
 
           rust_base=""
-          mna_base=""
+          electrical_base=""
           gradle_base=""
 
           scan_branch_for_baselines() {
@@ -130,11 +130,11 @@ jobs:
                 rust_base="$head_sha"
               fi
 
-              if [[ -z "$mna_base" ]] &&
-                 grep -Fqx $'MNA integration (ubuntu-latest)\tsuccess' "$jobs_file" &&
-                 grep -Fqx $'MNA integration (windows-latest)\tsuccess' "$jobs_file" &&
-                 grep -Fqx $'MNA integration (macos-latest)\tsuccess' "$jobs_file"; then
-                mna_base="$head_sha"
+              if [[ -z "$electrical_base" ]] &&
+                 grep -Fqx $'Electrical integration (ubuntu-latest)\tsuccess' "$jobs_file" &&
+                 grep -Fqx $'Electrical integration (windows-latest)\tsuccess' "$jobs_file" &&
+                 grep -Fqx $'Electrical integration (macos-latest)\tsuccess' "$jobs_file"; then
+                electrical_base="$head_sha"
               fi
 
               if [[ -z "$gradle_base" ]] &&
@@ -142,7 +142,7 @@ jobs:
                 gradle_base="$head_sha"
               fi
 
-              if [[ -n "$rust_base" && -n "$mna_base" && -n "$gradle_base" ]]; then
+              if [[ -n "$rust_base" && -n "$electrical_base" && -n "$gradle_base" ]]; then
                 return 0
               fi
             done < "$runs_file"
@@ -151,12 +151,12 @@ jobs:
           scan_branch_for_baselines "$ci_branch"
 
           if [[ "$EVENT_NAME" == "pull_request" &&
-                ( -z "$rust_base" || -z "$mna_base" || -z "$gradle_base" ) ]]; then
+                ( -z "$rust_base" || -z "$electrical_base" || -z "$gradle_base" ) ]]; then
             scan_branch_for_baselines "$PR_BASE_REF"
           fi
 
           echo "Last successful Rust check: ${rust_base:-none}"
-          echo "Last successful MNA integration: ${mna_base:-none}"
+          echo "Last successful Electrical integration: ${electrical_base:-none}"
           echo "Last successful Gradle build: ${gradle_base:-none}"
 
           has_matching_change() {
@@ -202,20 +202,20 @@ jobs:
           }
 
           rust=false
-          mna=false
+          electrical=false
           gradle=false
 
           if has_matching_change \
             "$rust_base" \
-            'mna/native/*' \
+            'electrical/native/*' \
             '.github/workflows/ci.yml'
           then
             rust=true
           fi
 
           if has_matching_change \
-            "$mna_base" \
-            'mna/*' \
+            "$electrical_base" \
+            'electrical/*' \
             'build.gradle.kts' \
             'settings.gradle.kts' \
             'gradle.properties' \
@@ -224,13 +224,13 @@ jobs:
             'gradle/*' \
             '.github/workflows/ci.yml'
           then
-            mna=true
+            electrical=true
           fi
 
           if has_matching_change \
             "$gradle_base" \
             'core/*' \
-            'mna/*' \
+            'electrical/*' \
             'build.gradle.kts' \
             'settings.gradle.kts' \
             'gradle.properties' \
@@ -242,7 +242,7 @@ jobs:
             gradle=true
           fi
 
-          write_outputs "$rust" "$mna" "$gradle"
+          write_outputs "$rust" "$electrical" "$gradle"
 
   validate-gradle-wrapper:
     name: Validate Gradle wrapper
@@ -265,7 +265,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: mna/native
+        working-directory: electrical/native
 
     steps:
       - uses: actions/checkout@v7
@@ -279,8 +279,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            mna/native/target
-          key: cargo-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mna/native/Cargo.lock') }}
+            electrical/native/target
+          key: cargo-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('electrical/native/Cargo.lock') }}
           restore-keys: |
             cargo-rust-${{ runner.os }}-${{ runner.arch }}-
 
@@ -293,12 +293,12 @@ jobs:
       - name: Run Rust tests
         run: cargo +stable test --workspace --all-features --locked
 
-  mna-integration:
-    name: MNA integration (${{ matrix.os }})
+  electrical-integration:
+    name: Electrical integration (${{ matrix.os }})
     needs:
       - changes
       - validate-gradle-wrapper
-    if: needs.changes.outputs.mna == 'true'
+    if: needs.changes.outputs.electrical == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
@@ -329,8 +329,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            mna/build/cargo-target
-          key: cargo-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mna/native/Cargo.lock') }}
+            electrical/build/cargo-target
+          key: cargo-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('electrical/native/Cargo.lock') }}
           restore-keys: |
             cargo-native-${{ runner.os }}-${{ runner.arch }}-
 
@@ -346,9 +346,9 @@ jobs:
           java -version
           ./gradlew --version
 
-      - name: Run MNA integration tests
+      - name: Run electrical integration tests
         shell: bash
-        run: ./gradlew :mna:test --stacktrace
+        run: ./gradlew :electrical:test --stacktrace
 
   gradle-build:
     name: Gradle build
@@ -377,8 +377,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            mna/build/cargo-target
-          key: cargo-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mna/native/Cargo.lock') }}
+            electrical/build/cargo-target
+          key: cargo-native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('electrical/native/Cargo.lock') }}
           restore-keys: |
             cargo-native-${{ runner.os }}-${{ runner.arch }}-
 
@@ -402,7 +402,7 @@ jobs:
       - changes
       - validate-gradle-wrapper
       - rust
-      - mna-integration
+      - electrical-integration
       - gradle-build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -413,13 +413,13 @@ jobs:
         shell: bash
         env:
           RUST_REQUIRED: ${{ needs.changes.outputs.rust }}
-          MNA_REQUIRED: ${{ needs.changes.outputs.mna }}
+          ELECTRICAL_REQUIRED: ${{ needs.changes.outputs.electrical }}
           GRADLE_REQUIRED: ${{ needs.changes.outputs.gradle }}
 
           CHANGES_RESULT: ${{ needs.changes.result }}
           WRAPPER_RESULT: ${{ needs.validate-gradle-wrapper.result }}
           RUST_RESULT: ${{ needs.rust.result }}
-          MNA_RESULT: ${{ needs.mna-integration.result }}
+          ELECTRICAL_RESULT: ${{ needs.electrical-integration.result }}
           GRADLE_RESULT: ${{ needs.gradle-build.result }}
         run: |
           set -euo pipefail
@@ -427,7 +427,7 @@ jobs:
           echo "Change detection:          $CHANGES_RESULT"
           echo "Gradle wrapper validation: $WRAPPER_RESULT"
           echo "Rust checks:               $RUST_RESULT (required: ${RUST_REQUIRED:-unknown})"
-          echo "MNA integration:           $MNA_RESULT (required: ${MNA_REQUIRED:-unknown})"
+          echo "Electrical integration:    $ELECTRICAL_RESULT (required: ${ELECTRICAL_REQUIRED:-unknown})"
           echo "Gradle build:              $GRADLE_RESULT (required: ${GRADLE_REQUIRED:-unknown})"
 
           [[ "$CHANGES_RESULT" == "success" ]] || {
@@ -466,7 +466,7 @@ jobs:
           }
 
           verify_conditional_job "Rust checks" "$RUST_REQUIRED" "$RUST_RESULT"
-          verify_conditional_job "MNA integration" "$MNA_REQUIRED" "$MNA_RESULT"
+          verify_conditional_job "Electrical integration" "$ELECTRICAL_REQUIRED" "$ELECTRICAL_RESULT"
           verify_conditional_job "Gradle build" "$GRADLE_REQUIRED" "$GRADLE_RESULT"
 
           echo "All required CI checks passed."
