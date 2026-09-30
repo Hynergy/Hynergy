@@ -67,10 +67,10 @@ public final class NativeBindings {
     private static final MethodHandle ENGINE_REGISTER_DEFINITION = downcall(
         "hynergy_engine_register_definition", FunctionDescriptor.of(
             ValueLayout.JAVA_INT, // return u32
-            ValueLayout.ADDRESS, // EngineHandle*
-            ValueLayout.ADDRESS, // input
+            ValueLayout.ADDRESS,  // EngineHandle*
+            ValueLayout.ADDRESS,  // input
             ValueLayout.JAVA_INT, // input_len
-            ValueLayout.ADDRESS // DefinitionRegistrationResult*
+            ValueLayout.ADDRESS   // DefinitionRegistrationResult*
         )
     );
 
@@ -116,6 +116,26 @@ public final class NativeBindings {
             WORLD_DESTROY.invokeExact(world);
         } catch (Throwable throwable) {
             throw new IllegalStateException("Failed to destroy native electrical world", throwable);
+        }
+    }
+
+
+
+    private static final MethodHandle WORLD_TICK = downcall(
+        "hynergy_world_tick", FunctionDescriptor.of(
+            ValueLayout.JAVA_INT, //return u32
+            ValueLayout.ADDRESS,  // WorldHandle*
+            ValueLayout.ADDRESS,  // SubscriptionRecord*
+            ValueLayout.JAVA_INT, // record_capacity
+            ValueLayout.ADDRESS   // TickResult*
+        )
+    );
+
+    public static int tickWorld(MemorySegment world, MemorySegment records, int record_capacity, MemorySegment result) {
+        try {
+            return (int) WORLD_TICK.invokeExact(world, records, record_capacity, result);
+        } catch (Throwable throwable) {
+            throw new IllegalStateException("Failed to tick native electrical world", throwable);
         }
     }
 
