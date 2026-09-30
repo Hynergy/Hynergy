@@ -1,12 +1,17 @@
 package dev.hynergy.electrical;
 
+import org.jspecify.annotations.Nullable;
+
 import java.util.Objects;
 
 public final class ElectricSystem implements AutoCloseable {
     private final ElectricalRuntime runtime;
     private final ElectricalWorld world;
 
+    private final ObservationSubscriptionRegistry subscriptions = new ObservationSubscriptionRegistry();
+
     private boolean closed;
+    private boolean poisoned;
 
     ElectricSystem(ElectricalRuntime runtime, ElectricalWorld world) {
         this.runtime = runtime;
@@ -14,7 +19,7 @@ public final class ElectricSystem implements AutoCloseable {
     }
 
     public Wire createWire() {
-        requireOpen();
+        requireUsable();
 
         int id = world.addWire();
         int generation = world.wireGeneration(id);
@@ -43,11 +48,12 @@ public final class ElectricSystem implements AutoCloseable {
     }
 
     public <T extends Device> T create(DeviceType<T> type) {
-        requireOpen();
+        requireUsable();
 
         Objects.requireNonNull(type, "type");
 
         DeviceDefinition definition = runtime.requireDefinition(type);
+
         T device = type.construct();
 
         device.requireUnbound();
@@ -80,14 +86,82 @@ public final class ElectricSystem implements AutoCloseable {
         world.detachTerminal(wire.id(), wire.generation(), device.id(), device.generation(), terminalId);
     }
 
+    ObservationSubscription subscribe(Device device, int observerId, ObservationListener listener) {
+        requireOwned(device);
+
+        Objects.requireNonNull(listener, "listener");
+
+        int deviceId = device.id();
+        int deviceGeneration = device.generation();
+
+        int subscriptionId = world.subscribeObserver(deviceId, deviceGeneration, observerId);
+
+        try {
+            ObservationSubscription subscription =
+                new ObservationSubscription(this, subscriptionId, deviceId, listener);
+
+            subscriptions.add(subscription);
+
+            return subscription;
+        } catch (RuntimeException | Error failure) {
+            try {
+                world.unsubscribe(subscriptionId);
+            } catch (RuntimeException | Error rollbackFailure) {
+                poisoned = true;
+                failure.addSuppressed(rollbackFailure);
+            }
+
+            throw failure;
+        }
+    }
+
+    void unsubscribe(
+        ObservationSubscription subscription
+    ) {
+        requireUsable();
+
+        Objects.requireNonNull(subscription, "subscription");
+
+        if (!subscription.belongsTo(this)) {
+            throw new IllegalArgumentException("Observation subscription does not belong to this electrical system");
+        }
+
+        try {
+            world.unsubscribe(subscription.nativeId());
+        } catch (ElectricalWorld.SubscriptionOperationException failure) {
+            if (failure.isOwnershipConsistencyFailure()) {
+                poisoned = true;
+            }
+
+            throw failure;
+        }
+
+        try {
+            subscriptions.remove(subscription);
+        } catch (RuntimeException | Error failure) {
+
+            poisoned = true;
+            throw failure;
+        }
+    }
+
     void remove(Device device) {
         requireOwned(device);
 
-        world.removeDevice(device.id(), device.generation());
+        int deviceId = device.id();
+
+        world.removeDevice(deviceId, device.generation());
+
+        try {
+            subscriptions.invalidateDevice(deviceId);
+        } catch (RuntimeException | Error failure) {
+            poisoned = true;
+            throw failure;
+        }
     }
 
     private void requireOwned(Wire wire) {
-        requireOpen();
+        requireUsable();
 
         if (!wire.belongsTo(this)) {
             throw new IllegalArgumentException("Wire belongs to another electrical system");
@@ -95,17 +169,42 @@ public final class ElectricSystem implements AutoCloseable {
     }
 
     private void requireOwned(Device device) {
-        requireOpen();
+        requireUsable();
 
         if (!device.belongsTo(this)) {
             throw new IllegalArgumentException("Device belongs to another electrical system");
         }
     }
 
-    private void requireOpen() {
+    private void requireUsable() {
         if (closed) {
             throw new IllegalStateException("Electrical system is closed");
         }
+
+        if (poisoned) {
+            throw new IllegalStateException("Electrical system is unusable after an unrecoverable failure");
+        }
+    }
+
+    private static Throwable appendFailure(@Nullable Throwable existing, Throwable additional) {
+        if (existing == null) {
+            return additional;
+        }
+
+        existing.addSuppressed(additional);
+        return existing;
+    }
+
+    private static void rethrow(Throwable failure) {
+        if (failure instanceof RuntimeException exception) {
+            throw exception;
+        }
+
+        if (failure instanceof Error error) {
+            throw error;
+        }
+
+        throw new AssertionError(failure);
     }
 
     @Override
@@ -114,9 +213,50 @@ public final class ElectricSystem implements AutoCloseable {
             return;
         }
 
-        world.close();
+        Throwable failure = null;
+
+        try {
+            world.close();
+        } catch (RuntimeException | Error closeFailure) {
+
+            if (world.isOpen()) {
+                poisoned = true;
+                throw closeFailure;
+            }
+
+            failure = closeFailure;
+        }
+
+        if (world.isOpen()) {
+            poisoned = true;
+
+            throw new IllegalStateException("Electrical world remained open after close completed");
+        }
+
+        try {
+            subscriptions.invalidateAll();
+        } catch (RuntimeException | Error cleanupFailure) {
+            if (failure == null) {
+                failure = cleanupFailure;
+            } else {
+                failure.addSuppressed(cleanupFailure);
+            }
+        }
+
         closed = true;
 
-        runtime.releaseSystem();
+        try {
+            runtime.releaseSystem();
+        } catch (RuntimeException | Error releaseFailure) {
+            if (failure == null) {
+                failure = releaseFailure;
+            } else {
+                failure.addSuppressed(releaseFailure);
+            }
+        }
+
+        if (failure != null) {
+            rethrow(failure);
+        }
     }
 }
