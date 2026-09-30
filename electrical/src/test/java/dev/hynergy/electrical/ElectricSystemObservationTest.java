@@ -247,11 +247,6 @@ final class ElectricSystemObservationTest {
 
             system.tick();
 
-            /*
-             * Whichever native record is published first unsubscribes the
-             * other subscription. The second record must nevertheless still
-             * be delivered because it belongs to the already-completed tick.
-             */
             assertEquals(2, callbacks.get());
 
             assertTrue(first.isActive() ^ second.isActive(), "Exactly one subscription should have been unsubscribed");
@@ -313,11 +308,6 @@ final class ElectricSystemObservationTest {
             assertSame(listenerFailure, thrown);
             assertEquals(1, otherCallbacks.get());
 
-            /*
-             * Both observations were already published natively, so an
-             * unchanged following tick has no records. More importantly,
-             * the callback exception must not have poisoned the system.
-             */
             assertDoesNotThrow(system::tick);
             assertDoesNotThrow(system::createWire);
         }
@@ -383,7 +373,6 @@ final class ElectricSystemObservationTest {
             assertEquals(1, recursiveFailures.get());
             assertEquals(1, otherCallbacks.get());
 
-            // ticking must have been cleared after the outer call.
             assertDoesNotThrow(system::tick);
         }
     }
@@ -456,6 +445,82 @@ final class ElectricSystemObservationTest {
             assertThrows(IllegalStateException.class, second::listener);
 
             assertDoesNotThrow(system::tick);
+        }
+    }
+
+    @Test
+    void tickGrowsSubscriptionBufferAndPublishesAllRecords() {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+            Resistance resistor = Resistance.create(system, 10.0);
+
+            int subscriptionCount = 20;
+            AtomicInteger callbacks = new AtomicInteger();
+
+            for (int index = 0; index < subscriptionCount; index++) {
+                resistor.observeVoltage((status, value) -> {
+                    assertEquals(ObservationStatus.AVAILABLE, status);
+
+                    callbacks.incrementAndGet();
+                });
+            }
+
+            assertDoesNotThrow(system::tick);
+
+            assertEquals(subscriptionCount, callbacks.get());
+
+            system.tick();
+
+            assertEquals(subscriptionCount, callbacks.get());
+        }
+    }
+
+    @Test
+    void singularIslandPublishesUnavailableAndRecoversWhenTopologyIsRestored() {
+        try (ElectricalRuntime runtime = ElectricalRuntime.create(); ElectricSystem system = runtime.createSystem(20)) {
+            VoltageSource source = VoltageSource.create(system, 5.0);
+
+            Wire positive = system.createWire();
+            Wire negative = system.createWire();
+
+            source.attachPositive(positive);
+            source.attachNegative(negative);
+
+            ArrayList<ObservationStatus> statuses = new ArrayList<>();
+
+            ArrayList<Double> values = new ArrayList<>();
+
+            source.observeVoltage((status, value) -> {
+                statuses.add(status);
+                values.add(value);
+            });
+
+            system.tick();
+
+            assertEquals(1, statuses.size());
+            assertEquals(ObservationStatus.AVAILABLE, statuses.getFirst());
+            assertEquals(5.0, values.getFirst(), 1e-9);
+
+            system.connect(positive, negative);
+
+            assertDoesNotThrow(system::tick);
+
+            assertEquals(2, statuses.size());
+            assertEquals(ObservationStatus.UNAVAILABLE, statuses.get(1));
+
+            assertEquals(0.0, values.get(1));
+
+            system.disconnect(positive, negative);
+
+            assertDoesNotThrow(system::tick);
+
+            assertEquals(3, statuses.size());
+            assertEquals(ObservationStatus.AVAILABLE, statuses.get(2));
+            assertEquals(5.0, values.get(2), 1e-9);
+
+            system.tick();
+
+            assertEquals(3, statuses.size());
+            assertEquals(3, values.size());
         }
     }
 
