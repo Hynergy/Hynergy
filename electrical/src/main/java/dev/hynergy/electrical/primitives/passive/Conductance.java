@@ -1,17 +1,19 @@
 package dev.hynergy.electrical.primitives.passive;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class Conductance extends Device {
     public static final DeviceType<Conductance> TYPE = DeviceType.primitive(2, Conductance::new);
+
 
     private static final int TERMINAL_POSITIVE = 0;
     private static final int TERMINAL_NEGATIVE = 1;
 
     private static final int PARAMETER_CONDUCTANCE = 0;
+
+    private static final int OBSERVER_VOLTAGE = 0;
+    private static final int OBSERVER_CURRENT = 1;
+
 
     private Conductance() {
     }
@@ -24,9 +26,11 @@ public final class Conductance extends Device {
         return device;
     }
 
+
     public void setConductance(double conductance) {
         setParameter(PARAMETER_CONDUCTANCE, conductance);
     }
+
 
     public void attachPositive(Wire wire) {
         attachTerminal(TERMINAL_POSITIVE, wire);
@@ -42,5 +46,18 @@ public final class Conductance extends Device {
 
     public void detachNegative(Wire wire) {
         detachTerminal(TERMINAL_NEGATIVE, wire);
+    }
+
+
+    public ObservationSubscription observeVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_CURRENT, listener);
     }
 }

@@ -1,9 +1,6 @@
 package dev.hynergy.electrical.primitives.controlled;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class VoltageControlledConductance extends Device {
     public static final DeviceType<VoltageControlledConductance> TYPE =
@@ -17,6 +14,10 @@ public final class VoltageControlledConductance extends Device {
     private static final int PARAMETER_TRANSITION_VOLTAGE = 1;
     private static final int PARAMETER_MINIMUM_CONDUCTANCE = 2;
     private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 3;
+
+    private static final int OBSERVER_OUTPUT_VOLTAGE = 0;
+    private static final int OBSERVER_CONTROL_VOLTAGE = 1;
+    private static final int OBSERVER_OUTPUT_CURRENT = 2;
 
     private VoltageControlledConductance() {
     }
@@ -76,5 +77,24 @@ public final class VoltageControlledConductance extends Device {
 
     public void detachControl(Wire wire) {
         detachTerminal(TERMINAL_CONTROL, wire);
+    }
+
+
+    public ObservationSubscription observeOutputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeControlVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_CONTROL_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeOutputCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_CURRENT, listener);
     }
 }

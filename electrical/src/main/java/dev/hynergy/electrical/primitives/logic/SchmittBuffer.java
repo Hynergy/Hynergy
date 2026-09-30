@@ -1,9 +1,6 @@
 package dev.hynergy.electrical.primitives.logic;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class SchmittBuffer extends Device {
     public static final DeviceType<SchmittBuffer> TYPE = DeviceType.primitive(18, SchmittBuffer::new);
@@ -17,6 +14,10 @@ public final class SchmittBuffer extends Device {
     private static final int PARAMETER_HYSTERESIS_WIDTH = 1;
     private static final int PARAMETER_MAXIMUM_CONDUCTANCE = 2;
     private static final int PARAMETER_MINIMUM_CONDUCTANCE = 3;
+
+    private static final int OBSERVER_OUTPUT_VOLTAGE = 0;
+    private static final int OBSERVER_INPUT_VOLTAGE = 1;
+    private static final int OBSERVER_OUTPUT_CURRENT = 2;
 
     private SchmittBuffer() {
     }
@@ -84,5 +85,23 @@ public final class SchmittBuffer extends Device {
 
     public void detachInput(Wire wire) {
         detachTerminal(TERMINAL_INPUT, wire);
+    }
+
+    public ObservationSubscription observeOutputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeInputVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_INPUT_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeOutputCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_OUTPUT_CURRENT, listener);
     }
 }

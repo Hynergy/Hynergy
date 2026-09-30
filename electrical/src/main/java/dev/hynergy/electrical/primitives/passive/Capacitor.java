@@ -1,17 +1,19 @@
 package dev.hynergy.electrical.primitives.passive;
 
-import dev.hynergy.electrical.Device;
-import dev.hynergy.electrical.DeviceType;
-import dev.hynergy.electrical.ElectricSystem;
-import dev.hynergy.electrical.Wire;
+import dev.hynergy.electrical.*;
 
 public final class Capacitor extends Device {
     public static final DeviceType<Capacitor> TYPE = DeviceType.primitive(7, Capacitor::new);
+
 
     private static final int TERMINAL_POSITIVE = 0;
     private static final int TERMINAL_NEGATIVE = 1;
 
     private static final int PARAMETER_CAPACITANCE = 0;
+
+    private static final int OBSERVER_VOLTAGE = 0;
+    private static final int OBSERVER_CURRENT = 1;
+
 
     private Capacitor() {
     }
@@ -24,10 +26,12 @@ public final class Capacitor extends Device {
         return device;
     }
 
+
     public void setCapacitance(double capacitance) {
         setParameter(PARAMETER_CAPACITANCE, capacitance);
     }
 
+    
     public void attachPositive(Wire wire) {
         attachTerminal(TERMINAL_POSITIVE, wire);
     }
@@ -42,5 +46,19 @@ public final class Capacitor extends Device {
 
     public void detachNegative(Wire wire) {
         detachTerminal(TERMINAL_NEGATIVE, wire);
+    }
+
+
+
+    public ObservationSubscription observeVoltage(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_VOLTAGE, listener);
+    }
+
+    public ObservationSubscription observeCurrent(
+        ObservationListener listener
+    ) {
+        return observe(OBSERVER_CURRENT, listener);
     }
 }
