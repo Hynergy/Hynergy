@@ -57,7 +57,7 @@ public final class ElectricalSystem implements AutoCloseable {
      * <p>Do not call this method from an observation callback.</p>
      *
      * @throws IllegalStateException if the system is closed, if the system is
-     *     unusable, or if a tick is already in progress
+     *                               unusable, or if a tick is already in progress
      */
     public void tick() {
         requireUsable();
@@ -94,7 +94,7 @@ public final class ElectricalSystem implements AutoCloseable {
 
                     if (subscription == null) {
                         throw new IllegalStateException(
-                            "Native tick returned unknown subscription ID: " + Integer.toUnsignedLong(subscriptionId));
+                                "Native tick returned unknown subscription ID: " + Integer.toUnsignedLong(subscriptionId));
                     }
 
                     try {
@@ -139,7 +139,7 @@ public final class ElectricalSystem implements AutoCloseable {
             case ElectricalWorld.SubscriptionStatusCode.UNAVAILABLE -> ObservationStatus.UNAVAILABLE;
 
             default -> throw new IllegalStateException(
-                "Unknown native observation status: " + Integer.toUnsignedLong(statusCode));
+                    "Unknown native observation status: " + Integer.toUnsignedLong(statusCode));
         };
     }
 
@@ -149,36 +149,35 @@ public final class ElectricalSystem implements AutoCloseable {
      * <p>The wire belongs to this system.</p>
      *
      * @return the new wire
-     *
      * @throws IllegalStateException if the system is closed or unusable
      */
     public Wire createWire() {
         requireUsable();
 
         int id = world.addWire();
-        int generation = world.wireGeneration(id);
+        WireId wireId = new WireId(id, world.wireGeneration(id));
 
-        return new Wire(this, id, generation);
+        return new Wire(this, wireId);
     }
 
     void connect(Wire first, Wire second) {
         requireOwned(first);
         requireOwned(second);
 
-        world.connectWires(first.id(), first.generation(), second.id(), second.generation());
+        world.connectWires(first.id(), second.id());
     }
 
     void disconnect(Wire first, Wire second) {
         requireOwned(first);
         requireOwned(second);
 
-        world.disconnectWires(first.id(), first.generation(), second.id(), second.generation());
+        world.disconnectWires(first.id(), second.id());
     }
 
     void remove(Wire wire) {
         requireOwned(wire);
 
-        world.removeWire(wire.id(), wire.generation());
+        world.removeWire(wire.id());
     }
 
     /**
@@ -188,13 +187,11 @@ public final class ElectricalSystem implements AutoCloseable {
      * this system.</p>
      *
      * @param type the device type
-     * @param <T> the device class
-     *
+     * @param <T>  the device class
      * @return the new device
-     *
-     * @throws NullPointerException if {@code type} is null
+     * @throws NullPointerException  if {@code type} is null
      * @throws IllegalStateException if the system is closed or unusable, or
-     *     if the device type is not registered in this runtime
+     *                               if the device type is not registered in this runtime
      */
     public <T extends Device> T create(DeviceType<T> type) {
         requireUsable();
@@ -225,14 +222,14 @@ public final class ElectricalSystem implements AutoCloseable {
         requireOwned(device);
         requireOwned(wire);
 
-        world.attachTerminal(wire.id(), wire.generation(), device.id(), device.generation(), terminalId);
+        world.attachTerminal(wire.id(), device.id(), device.generation(), terminalId);
     }
 
     void detachTerminal(Device device, int terminalId, Wire wire) {
         requireOwned(device);
         requireOwned(wire);
 
-        world.detachTerminal(wire.id(), wire.generation(), device.id(), device.generation(), terminalId);
+        world.detachTerminal(wire.id(), device.id(), device.generation(), terminalId);
     }
 
     ObservationSubscription subscribe(Device device, int observerId, ObservationListener listener) {
@@ -247,7 +244,7 @@ public final class ElectricalSystem implements AutoCloseable {
 
         try {
             ObservationSubscription subscription =
-                new ObservationSubscription(this, subscriptionId, deviceId, listener);
+                    new ObservationSubscription(this, subscriptionId, deviceId, listener);
 
             subscriptions.add(subscription);
 
@@ -265,7 +262,7 @@ public final class ElectricalSystem implements AutoCloseable {
     }
 
     void unsubscribe(
-        ObservationSubscription subscription
+            ObservationSubscription subscription
     ) {
         requireUsable();
 

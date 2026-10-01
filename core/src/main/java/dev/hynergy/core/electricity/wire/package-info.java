@@ -1,0 +1,1 @@
+package dev.hynergy.core.electricity.wire;

@@ -1,14 +1,21 @@
 package dev.hynergy.core.electricity;
 
+import com.hypixel.hytale.assetstore.map.DefaultAssetMap;
+import com.hypixel.hytale.builtin.asseteditor.event.AssetEditorRequestDataSetEvent;
 import com.hypixel.hytale.component.ComponentRegistryProxy;
 import com.hypixel.hytale.component.ResourceType;
 import com.hypixel.hytale.logger.HytaleLogger;
+import com.hypixel.hytale.server.core.asset.HytaleAssetStore;
 import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import dev.hynergy.core.HynergyModule;
+import dev.hynergy.core.electricity.wire.WireComponent;
+import dev.hynergy.core.electricity.wire.WireConfig;
+import dev.hynergy.core.port.*;
 import dev.hynergy.electrical.Device;
 import dev.hynergy.electrical.DeviceDefinition;
 import dev.hynergy.electrical.DeviceType;
 import dev.hynergy.electrical.ElectricalRuntime;
+import org.joml.Vector3i;
 import org.jspecify.annotations.Nullable;
 
 import java.util.logging.Level;
@@ -18,13 +25,16 @@ public final class ElectricityModule extends HynergyModule {
     private static final HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
 
     private final ComponentRegistryProxy<ChunkStore> chunkStoreRegistry;
+
     private @Nullable ElectricalRuntime runtime;
+    private @Nullable PortDomain<ElectricalPortConnection> electricalPortDomain;
+    private @Nullable PortStandard<ElectricalPortProfile, ElectricalPortConnection> conductorPortStandard;
 
     private boolean started;
 
 
     public ElectricityModule(
-        ComponentRegistryProxy<ChunkStore> chunkStoreRegistry
+            ComponentRegistryProxy<ChunkStore> chunkStoreRegistry
     ) {
         this.chunkStoreRegistry = chunkStoreRegistry;
     }
@@ -33,10 +43,45 @@ public final class ElectricityModule extends HynergyModule {
     public void setup() {
         LOGGER.at(Level.INFO).log("Setting up electricity module");
 
-        runtime = ElectricalRuntime.create();
+        PortModule portModule = HYNERGY_PLUGIN.getPortModule();
 
+        electricalPortDomain = portModule.registerDomain("hynergy:electrical");
+        conductorPortStandard = portModule.registerStandard(
+                "hynergy:electrical/conductor",
+                electricalPortDomain,
+                ElectricalPortProfile.class,
+                ElectricityModule::resolveConductorConnection
+        );
+
+
+        registerSystems();
+
+        chunkStoreRegistry.registerComponent(WireComponent.class, "HynergyWire", WireComponent.CODEC);
+
+        HYNERGY_PLUGIN.getAssetRegistry().register(
+                HytaleAssetStore.builder(
+                                        WireConfig.class,
+                                        new DefaultAssetMap<>()
+                                )
+                                .setPath("Hynergy/Electricity/Wires")
+                                .setCodec(WireConfig.CODEC)
+                                .setKeyFunction(WireConfig::getId)
+                                .build()
+        );
+
+        HYNERGY_PLUGIN.getEventRegistry().register(
+                AssetEditorRequestDataSetEvent.class,
+                WireConfig.DATA_SET,
+                WireConfig::populateDataSet
+        );
+    }
+
+
+    private void registerSystems() {
         ResourceType<ChunkStore, ElectricalSystemResource> resourceType =
-            chunkStoreRegistry.registerResource(ElectricalSystemResource.class, ElectricalSystemResource::new);
+                chunkStoreRegistry.registerResource(ElectricalSystemResource.class, ElectricalSystemResource::new);
+        
+        runtime = ElectricalRuntime.create();
 
         chunkStoreRegistry.registerSystem(new ElectricalSystemLifecycleSystem(resourceType));
         chunkStoreRegistry.registerSystem(new ElectricalTickSystem(runtime, resourceType));
@@ -56,8 +101,79 @@ public final class ElectricityModule extends HynergyModule {
         runtime.requestClose();
     }
 
+    public PortDomain<ElectricalPortConnection> electricalPortDomain() {
+        PortDomain<ElectricalPortConnection> domain = electricalPortDomain;
+        if (domain == null) {
+            throw new IllegalStateException("Electrical port domain is unavailable before module setup");
+        }
+        return domain;
+    }
+
+    public PortStandard<ElectricalPortProfile, ElectricalPortConnection> conductorPortStandard() {
+        PortStandard<ElectricalPortProfile, ElectricalPortConnection> standard = conductorPortStandard;
+        if (standard == null) {
+            throw new IllegalStateException("Electrical conductor port standard is unavailable before module setup");
+        }
+        return standard;
+    }
+
+
+    /**
+     * Creates one asset/runtime definition for a direct electrical conductor port.
+     *
+     * <p>The terminal ID maps this physical block port to the fixed terminal index
+     * of the electrical device represented by the block asset. The generic port
+     * subsystem never interprets that mapping.</p>
+     */
+    public PortDefinition<ElectricalPortProfile, ElectricalPortConnection> conductorPort(
+            int localPortId,
+            PortOffset anchor,
+            int terminalId,
+            int normalX,
+            int normalY,
+            int normalZ
+    ) {
+        ElectricalPortProfile profile = new ElectricalPortProfile(terminalId, normalX, normalY, normalZ);
+        return new PortDefinition<>(
+                localPortId,
+                anchor,
+                PortReach.single(normalX, normalY, normalZ),
+                conductorPortStandard(),
+                profile
+        );
+    }
+
+    private static @Nullable ElectricalPortConnection resolveConductorConnection(
+            ElectricalPortProfile first,
+            ElectricalPortProfile second,
+            PortGeometry geometry
+    ) {
+        Vector3i firstNormal = new Vector3i(first.normalX(), first.normalY(), first.normalZ());
+        geometry.firstRotation().applyRotationTo(firstNormal);
+
+        if (geometry.ownerDx() != firstNormal.x()
+                || geometry.ownerDy() != firstNormal.y()
+                || geometry.ownerDz() != firstNormal.z()
+                || geometry.anchorDx() != firstNormal.x()
+                || geometry.anchorDy() != firstNormal.y()
+                || geometry.anchorDz() != firstNormal.z()) {
+            return null;
+        }
+
+        Vector3i secondNormal = new Vector3i(second.normalX(), second.normalY(), second.normalZ());
+        geometry.secondRotation().applyRotationTo(secondNormal);
+
+        if (secondNormal.x() != -firstNormal.x()
+                || secondNormal.y() != -firstNormal.y()
+                || secondNormal.z() != -firstNormal.z()) {
+            return null;
+        }
+
+        return ElectricalPortConnection.DIRECT;
+    }
+
     public <T extends Device> DeviceDefinition register(
-        DeviceType<T> type
+            DeviceType<T> type
     ) {
         if (started) {
             throw new IllegalStateException("Electrical device types must be registered during setup");
