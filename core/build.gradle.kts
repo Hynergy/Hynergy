@@ -32,6 +32,9 @@ hytaleTools {
 dependencies {
     implementation(project(":electrical"))
     compileOnly(libs.jspecify)
+    
+    compileOnly(libs.lombok)
+    annotationProcessor(libs.lombok)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
