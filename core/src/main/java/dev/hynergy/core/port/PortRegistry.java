@@ -2,14 +2,16 @@ package dev.hynergy.core.port;
 
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 
-import java.util.*;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.Objects;
 
 final class PortRegistry {
     private final Map<String, PortDomain<?>> domains = new Object2ObjectLinkedOpenHashMap<>();
     private final Map<String, PortStandard<?, ?>> standards = new Object2ObjectLinkedOpenHashMap<>();
     private final Map<StandardPair, Rule<?, ?, ?>> rules = new Object2ObjectLinkedOpenHashMap<>();
 
-    private Map<PortStandard<?, ?>, List<RuleSide<?, ?, ?>>> ruleSidesByStandard;
+    private Map<PortStandard<?, ?>, Map<PortStandard<?, ?>, RuleSide<?, ?, ?>>> ruleSidesByPair;
     private boolean frozen;
 
     <R> PortDomain<R> registerDomain(String id) {
@@ -73,34 +75,42 @@ final class PortRegistry {
 
     void freeze() {
         requireOpen();
-        ruleSidesByStandard = compileRuleSides();
+        ruleSidesByPair = compileRuleSides();
         frozen = true;
     }
 
-    private Map<PortStandard<?, ?>, List<RuleSide<?, ?, ?>>> compileRuleSides() {
-        Map<PortStandard<?, ?>, List<RuleSide<?, ?, ?>>> compiled = new IdentityHashMap<>();
+    private Map<PortStandard<?, ?>, Map<PortStandard<?, ?>, RuleSide<?, ?, ?>>> compileRuleSides() {
+        IdentityHashMap<PortStandard<?, ?>, Map<PortStandard<?, ?>, RuleSide<?, ?, ?>>> compiled =
+                new IdentityHashMap<>();
 
         for (Rule<?, ?, ?> rule : rules.values()) {
-            compiled.computeIfAbsent(rule.first, ignored -> new ArrayList<>())
-                    .add(new RuleSide<>(rule, true));
+            putRuleSide(compiled, rule.first(), rule.second(), new RuleSide<>(rule, true));
 
-            if (rule.first != rule.second) {
-                compiled.computeIfAbsent(rule.second, ignored -> new ArrayList<>())
-                        .add(new RuleSide<>(rule, false));
+            if (rule.first() != rule.second()) {
+                putRuleSide(compiled, rule.second(), rule.first(), new RuleSide<>(rule, false));
             }
         }
 
-        compiled.replaceAll((standard, sides) -> List.copyOf(sides));
         return compiled;
     }
 
-    List<RuleSide<?, ?, ?>> ruleSidesFor(PortStandard<?, ?> standard) {
+    private static void putRuleSide(
+            IdentityHashMap<PortStandard<?, ?>, Map<PortStandard<?, ?>, RuleSide<?, ?, ?>>> compiled,
+            PortStandard<?, ?> source,
+            PortStandard<?, ?> target,
+            RuleSide<?, ?, ?> side
+    ) {
+        compiled.computeIfAbsent(source, ignored -> new IdentityHashMap<>())
+                .put(target, side);
+    }
+
+    RuleSide<?, ?, ?> ruleSide(PortStandard<?, ?> source, PortStandard<?, ?> target) {
         if (!frozen) {
             throw new IllegalStateException("Port registry must be frozen before discovery");
         }
 
-        List<RuleSide<?, ?, ?>> sides = ruleSidesByStandard.get(standard);
-        return sides == null ? List.of() : sides;
+        Map<PortStandard<?, ?>, RuleSide<?, ?, ?>> targets = ruleSidesByPair.get(source);
+        return targets == null ? null : targets.get(target);
     }
 
     PortStandard<?, ?> standard(String id) {
@@ -148,10 +158,6 @@ final class PortRegistry {
     }
 
     record RuleSide<A, B, R>(Rule<A, B, R> rule, boolean sourceIsFirst) {
-
-        PortStandard<?, R> targetStandard() {
-            return sourceIsFirst ? rule.second : rule.first;
-        }
     }
 
     private static final class StandardPair {

@@ -99,6 +99,53 @@ final class PortDiscoveryTest {
         assertEquals(2, calls.get());
     }
 
+
+    @Test
+    void candidateBlockIsReadOnceWhenSourceHasMultipleCompatibleRules() {
+        PortModule module = new PortModule();
+        PortDomain<Result> domain = module.registerDomain("test:domain");
+        PortStandard<Profile, Result> source = module.registerStandard(
+                "test:source", domain, Profile.class,
+                (first, second, geometry) -> new Result("self")
+        );
+        PortStandard<OtherProfile, Result> firstTarget = module.registerStandard(
+                "test:first-target", domain, OtherProfile.class,
+                (first, second, geometry) -> new Result("first-self")
+        );
+        PortStandard<OtherProfile, Result> secondTarget = module.registerStandard(
+                "test:second-target", domain, OtherProfile.class,
+                (first, second, geometry) -> new Result("second-self")
+        );
+        module.registerAdapter(
+                source, firstTarget,
+                (sourceProfile, targetProfile, geometry) -> new Result("first")
+        );
+        module.registerAdapter(
+                source, secondTarget,
+                (sourceProfile, targetProfile, geometry) -> new Result("second")
+        );
+        PortModuleTestAccess.freeze(module);
+        module.setBlockPorts(1, BlockPortDefinition.of(
+                port(0, 1, source, new Profile("source"))
+        ));
+        module.setBlockPorts(2, BlockPortDefinition.of(
+                port(4, -1, firstTarget, new OtherProfile("first")),
+                port(5, -1, secondTarget, new OtherProfile("second"))
+        ));
+        CountingWorld world = new CountingWorld();
+        world.put(0, 0, 0, 1);
+        world.put(1, 0, 0, 2);
+
+        List<Match> matches = discover(module.discovery(), world, 0, 0, 0, 0, domain);
+
+        assertEquals(2, matches.size());
+        assertEquals(List.of(4, 5), matches.stream().map(Match::targetPortId).sorted().toList());
+        assertEquals(1, world.blockTypeReads(0, 0, 0));
+        assertEquals(1, world.blockTypeReads(1, 0, 0));
+        assertEquals(1, world.rotationReads(0, 0, 0));
+        assertEquals(1, world.rotationReads(1, 0, 0));
+    }
+
     @Test
     void resolverRejectionDoesNotStopLaterCandidateOffset() {
         PortModule module = new PortModule();
@@ -272,7 +319,7 @@ final class PortDiscoveryTest {
     private record Match(int targetPortId, Object result, boolean sourceIsResolverFirst) {
     }
 
-    private static final class TestWorld implements PortWorldView {
+    private static class TestWorld implements PortWorldView {
         private final Map<Position, Integer> blocks = new HashMap<>();
 
         void put(int x, int y, int z, int blockTypeId) {
@@ -287,6 +334,34 @@ final class PortDiscoveryTest {
         @Override
         public RotationTuple rotation(int x, int y, int z) {
             return RotationTuple.NONE;
+        }
+    }
+
+
+    private static final class CountingWorld extends TestWorld {
+        private final Map<Position, Integer> blockTypeReads = new HashMap<>();
+        private final Map<Position, Integer> rotationReads = new HashMap<>();
+
+        @Override
+        public int blockTypeId(int x, int y, int z) {
+            Position position = new Position(x, y, z);
+            blockTypeReads.merge(position, 1, Integer::sum);
+            return super.blockTypeId(x, y, z);
+        }
+
+        @Override
+        public RotationTuple rotation(int x, int y, int z) {
+            Position position = new Position(x, y, z);
+            rotationReads.merge(position, 1, Integer::sum);
+            return super.rotation(x, y, z);
+        }
+
+        int blockTypeReads(int x, int y, int z) {
+            return blockTypeReads.getOrDefault(new Position(x, y, z), 0);
+        }
+
+        int rotationReads(int x, int y, int z) {
+            return rotationReads.getOrDefault(new Position(x, y, z), 0);
         }
     }
 

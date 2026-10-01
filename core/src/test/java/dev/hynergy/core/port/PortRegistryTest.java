@@ -2,7 +2,7 @@ package dev.hynergy.core.port;
 
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 
 final class PortRegistryTest {
     private record ProfileA(int value) {}
@@ -62,6 +62,40 @@ final class PortRegistryTest {
             IllegalStateException.class,
             () -> registry.registerAdapter(second, first, (b, a, geometry) -> Result.CONNECTED)
         );
+    }
+
+
+    @Test
+    void frozenRuleLookupPreservesCanonicalDirectionAndIdentity() {
+        PortRegistry registry = new PortRegistry();
+        PortDomain<Result> domain = registry.registerDomain("test:mechanical");
+        PortStandard<ProfileA, Result> first =
+            registry.registerStandard("test:a", domain, ProfileA.class, RESOLVER_A);
+        PortStandard<ProfileB, Result> second =
+            registry.registerStandard("test:b", domain, ProfileB.class, RESOLVER_B);
+        PortStandard<ProfileA, Result> unrelated =
+            registry.registerStandard("test:unrelated", domain, ProfileA.class, RESOLVER_A);
+        registry.registerAdapter(first, second, (a, b, geometry) -> Result.CONNECTED);
+        registry.freeze();
+
+        PortRegistry.RuleSide<?, ?, ?> same = registry.ruleSide(first, first);
+        PortRegistry.RuleSide<?, ?, ?> forward = registry.ruleSide(first, second);
+        PortRegistry.RuleSide<?, ?, ?> reverse = registry.ruleSide(second, first);
+
+        assertNotNull(same);
+        assertTrue(same.sourceIsFirst());
+        assertNotNull(forward);
+        assertTrue(forward.sourceIsFirst());
+        assertNotNull(reverse);
+        assertFalse(reverse.sourceIsFirst());
+        assertSame(forward.rule(), reverse.rule());
+        assertNull(registry.ruleSide(first, unrelated));
+
+        PortRegistry foreign = new PortRegistry();
+        PortDomain<Result> foreignDomain = foreign.registerDomain("test:foreign");
+        PortStandard<ProfileA, Result> foreignFirst =
+            foreign.registerStandard("test:a", foreignDomain, ProfileA.class, RESOLVER_A);
+        assertNull(registry.ruleSide(first, foreignFirst));
     }
 
     @Test

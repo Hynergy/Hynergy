@@ -37,7 +37,12 @@ public class HynergyPlugin extends JavaPlugin {
         LOGGER.at(Level.INFO).log("Setting up Hynergy!");
 
         this.portModule = registerModule(new PortModule());
-        this.electricityModule = registerModule(new ElectricityModule(portModule, getChunkStoreRegistry()));
+        this.electricityModule = registerModule(new ElectricityModule(
+                portModule,
+                getChunkStoreRegistry(),
+                getAssetRegistry(),
+                getEventRegistry()
+        ));
 
         for (HynergyModule module : modules) {
             module.setup();

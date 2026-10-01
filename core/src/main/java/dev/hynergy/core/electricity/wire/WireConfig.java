@@ -17,8 +17,14 @@ import com.hypixel.hytale.codec.validation.ValidationResults;
 import com.hypixel.hytale.codec.validation.Validator;
 import com.hypixel.hytale.codec.validation.ValidatorCache;
 import com.hypixel.hytale.codec.validation.Validators;
+import dev.hynergy.core.electricity.ElectricalPortConnection;
+import dev.hynergy.core.electricity.ElectricalPortProfile;
+import dev.hynergy.core.port.*;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import lombok.Getter;
+import org.joml.Vector3i;
+
+import java.util.Objects;
 
 public class WireConfig implements JsonAssetWithMap<String, DefaultAssetMap<String, WireConfig>> {
     public static final String DATA_SET = "WireConfigs";
@@ -115,6 +121,32 @@ public class WireConfig implements JsonAssetWithMap<String, DefaultAssetMap<Stri
 
 
     private WireConfig() {
+    }
+
+
+    public BlockPortDefinition buildPortDefinition(
+            PortStandard<ElectricalPortProfile, ElectricalPortConnection> conductorStandard
+    ) {
+        Objects.requireNonNull(conductorStandard, "conductorStandard");
+
+        PortDefinition<?, ?>[] definitions = new PortDefinition[ports.length];
+        for (int index = 0; index < ports.length; index++) {
+            WirePortConfig port = ports[index];
+            Vector3i anchor = port.getAnchor();
+            Vector3i normal = port.getNormal();
+
+            definitions[index] = new PortDefinition<>(
+                    port.getId(),
+                    anchor == null
+                            ? PortOffset.ZERO
+                            : new PortOffset(anchor.x, anchor.y, anchor.z),
+                    PortReach.single(normal.x, normal.y, normal.z),
+                    conductorStandard,
+                    new ElectricalPortProfile(normal.x, normal.y, normal.z)
+            );
+        }
+
+        return BlockPortDefinition.of(definitions);
     }
 
     public static AssetStore<

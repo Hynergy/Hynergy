@@ -1,7 +1,12 @@
 package dev.hynergy.core.electricity;
 
+import com.hypixel.hytale.component.ComponentRegistryProxy;
+import com.hypixel.hytale.event.EventBus;
+import com.hypixel.hytale.event.EventRegistry;
+import com.hypixel.hytale.function.consumer.BooleanConsumer;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.Rotation;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
+import com.hypixel.hytale.server.core.plugin.registry.AssetRegistry;
 import dev.hynergy.core.port.*;
 import org.joml.Vector3i;
 import org.junit.jupiter.api.Test;
@@ -18,8 +23,8 @@ final class ElectricalPortDiscoveryTest {
     @Test
     void opposingConductorFacesConnectDirectly() {
         Fixture fixture = Fixture.create(
-                2, 1, 0, 0, RotationTuple.NONE,
-                5, -1, 0, 0, RotationTuple.NONE
+                1, 0, 0, RotationTuple.NONE,
+                -1, 0, 0, RotationTuple.NONE
         );
 
         assertEquals(List.of(ElectricalPortConnection.DIRECT), fixture.discover());
@@ -28,8 +33,8 @@ final class ElectricalPortDiscoveryTest {
     @Test
     void sameFacingConductorFacesDoNotConnect() {
         Fixture fixture = Fixture.create(
-                2, 1, 0, 0, RotationTuple.NONE,
-                5, 1, 0, 0, RotationTuple.NONE
+                1, 0, 0, RotationTuple.NONE,
+                1, 0, 0, RotationTuple.NONE
         );
 
         assertTrue(fixture.discover().isEmpty());
@@ -38,8 +43,8 @@ final class ElectricalPortDiscoveryTest {
     @Test
     void perpendicularConductorFacesDoNotConnect() {
         Fixture fixture = Fixture.create(
-                2, 1, 0, 0, RotationTuple.NONE,
-                5, 0, 0, 1, RotationTuple.NONE
+                1, 0, 0, RotationTuple.NONE,
+                0, 0, 1, RotationTuple.NONE
         );
 
         assertTrue(fixture.discover().isEmpty());
@@ -52,8 +57,8 @@ final class ElectricalPortDiscoveryTest {
         rotation.applyRotationTo(offset);
 
         Fixture fixture = Fixture.create(
-                2, 1, 0, 0, rotation,
-                5, -1, 0, 0, rotation,
+                1, 0, 0, rotation,
+                -1, 0, 0, rotation,
                 offset.x(), offset.y(), offset.z()
         );
 
@@ -61,30 +66,22 @@ final class ElectricalPortDiscoveryTest {
     }
 
     @Test
-    void electricalAssetProfileCarriesTerminalMapping() {
+    void conductorPortCarriesLocalIdStandardAndNormal() {
         PortModule ports = new PortModule();
-        ElectricityModule electricity = new ElectricityModule(
-                ports,
-                new com.hypixel.hytale.component.ComponentRegistryProxy<>()
-        );
-        electricity.setup();
+        ElectricityModule electricity = createElectricityModule(ports);
 
         PortDefinition<ElectricalPortProfile, ElectricalPortConnection> port =
-                electricity.conductorPort(7, PortOffset.ZERO, 3, 1, 0, 0);
+                electricity.conductorPort(7, PortOffset.ZERO, 1, 0, 0);
 
         assertEquals(7, port.localId());
-        assertEquals(3, port.profile().terminalId());
+        assertEquals(new ElectricalPortProfile(1, 0, 0), port.profile());
         assertEquals(electricity.conductorPortStandard(), port.standard());
     }
 
     @Test
     void pluginStandardCanRegisterAdapterToBuiltInConductorWithoutChangingElectricalModule() {
         PortModule ports = new PortModule();
-        ElectricityModule electricity = new ElectricityModule(
-                ports,
-                new com.hypixel.hytale.component.ComponentRegistryProxy<>()
-        );
-        electricity.setup();
+        ElectricityModule electricity = createElectricityModule(ports);
 
         PortDomain<ElectricalPortConnection> domain = electricity.electricalPortDomain();
         record PluginProfile(int kind) {
@@ -111,7 +108,7 @@ final class ElectricalPortDiscoveryTest {
                 )
         ));
         ports.setBlockPorts(2, BlockPortDefinition.of(
-                electricity.conductorPort(1, PortOffset.ZERO, 4, -1, 0, 0)
+                electricity.conductorPort(1, PortOffset.ZERO, -1, 0, 0)
         ));
         TestWorld world = new TestWorld();
         world.put(0, 0, 0, 1, RotationTuple.NONE);
@@ -127,41 +124,48 @@ final class ElectricalPortDiscoveryTest {
     }
 
     @Test
-    void profileRequiresNonNegativeTerminalAndOneUnitCardinalNormal() {
-        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(-1, 1, 0, 0));
-        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(0, 0, 0, 0));
-        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(0, 1, 1, 0));
-        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(0, 2, 0, 0));
+    void profileRequiresOneUnitCardinalNormal() {
+        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(0, 0, 0));
+        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(1, 1, 0));
+        assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(2, 0, 0));
+    }
+
+    private static ElectricityModule createElectricityModule(PortModule ports) {
+        List<BooleanConsumer> registrations = new ArrayList<>();
+        ElectricityModule electricity = new ElectricityModule(
+                ports,
+                new ComponentRegistryProxy<>(),
+                new AssetRegistry(registrations),
+                new EventRegistry(registrations, () -> true, null, new EventBus(false))
+        );
+        electricity.registerPortProtocols();
+        return electricity;
     }
 
     private record Fixture(PortModule ports, PortDomain<ElectricalPortConnection> domain, TestWorld world) {
 
         static Fixture create(
-                int sourceTerminal,
-                int sourceX,
-                int sourceY,
-                int sourceZ,
+                int sourceNormalX,
+                int sourceNormalY,
+                int sourceNormalZ,
                 RotationTuple sourceRotation,
-                int targetTerminal,
                 int targetNormalX,
                 int targetNormalY,
                 int targetNormalZ,
                 RotationTuple targetRotation
         ) {
             return create(
-                    sourceTerminal, sourceX, sourceY, sourceZ, sourceRotation,
-                    targetTerminal, targetNormalX, targetNormalY, targetNormalZ, targetRotation,
+                    sourceNormalX, sourceNormalY, sourceNormalZ, sourceRotation,
+                    targetNormalX, targetNormalY, targetNormalZ, targetRotation,
                     1, 0, 0
             );
         }
 
         static Fixture create(
-                int sourceTerminal,
                 int sourceNormalX,
                 int sourceNormalY,
                 int sourceNormalZ,
                 RotationTuple sourceRotation,
-                int targetTerminal,
                 int targetNormalX,
                 int targetNormalY,
                 int targetNormalZ,
@@ -171,21 +175,17 @@ final class ElectricalPortDiscoveryTest {
                 int targetZ
         ) {
             PortModule ports = new PortModule();
-            ElectricityModule electricity = new ElectricityModule(
-                    ports,
-                    new com.hypixel.hytale.component.ComponentRegistryProxy<>()
-            );
-            electricity.setup();
+            ElectricityModule electricity = createElectricityModule(ports);
             PortModuleTestAccess.freeze(ports);
             ports.setBlockPorts(1, BlockPortDefinition.of(
                     electricity.conductorPort(
-                            0, PortOffset.ZERO, sourceTerminal,
+                            0, PortOffset.ZERO,
                             sourceNormalX, sourceNormalY, sourceNormalZ
                     )
             ));
             ports.setBlockPorts(2, BlockPortDefinition.of(
                     electricity.conductorPort(
-                            1, PortOffset.ZERO, targetTerminal,
+                            1, PortOffset.ZERO,
                             targetNormalX, targetNormalY, targetNormalZ
                     )
             ));

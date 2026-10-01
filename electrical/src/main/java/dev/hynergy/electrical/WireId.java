@@ -18,6 +18,15 @@ package dev.hynergy.electrical;
  */
 public record WireId(int value, int generation) {
 
+    public WireId {
+        if (value <= 0) {
+            throw new IllegalArgumentException("Wire ID must be positive");
+        }
+        if (generation == 0) {
+            throw new IllegalArgumentException("Wire generation must not be zero");
+        }
+    }
+
     public long packed() {
         return ((long) value << 32)
                 | Integer.toUnsignedLong(generation);

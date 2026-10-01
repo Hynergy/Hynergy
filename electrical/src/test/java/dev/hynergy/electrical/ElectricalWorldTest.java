@@ -50,7 +50,7 @@ final class ElectricalWorldTest {
 
             world.applyCommands();
 
-            world.removeWire(first, firstGeneration);
+            world.removeWire(new WireId(first, firstGeneration));
 
             int third = world.addWire();
 
@@ -77,7 +77,7 @@ final class ElectricalWorldTest {
 
             world.applyCommands();
 
-            world.removeWire(id, oldGeneration);
+            world.removeWire(new WireId(id, oldGeneration));
 
             world.applyCommands();
 
@@ -89,7 +89,7 @@ final class ElectricalWorldTest {
 
             assertNotEquals(oldGeneration, newGeneration);
 
-            assertThrows(IllegalStateException.class, () -> world.removeWire(reused, oldGeneration));
+            assertThrows(IllegalStateException.class, () -> world.removeWire(new WireId(reused, oldGeneration)));
         }
     }
 
@@ -100,7 +100,7 @@ final class ElectricalWorldTest {
             ElectricalWorld world = engine.createWorld(30)) {
             int first = world.addWire();
 
-            world.removeWire(first, world.wireGeneration(first));
+            world.removeWire(new WireId(first, world.wireGeneration(first)));
 
             int second = world.addWire();
 
@@ -120,7 +120,10 @@ final class ElectricalWorldTest {
             int first = world.addWire();
             int second = world.addWire();
 
-            world.connectWires(first, world.wireGeneration(first), second, world.wireGeneration(second));
+            world.connectWires(
+                    new WireId(first, world.wireGeneration(first)),
+                    new WireId(second, world.wireGeneration(second))
+            );
 
             assertDoesNotThrow(world::applyCommands);
         }
@@ -139,11 +142,13 @@ final class ElectricalWorldTest {
 
             world.applyCommands();
 
-            world.removeWire(first, firstGeneration);
+            WireId firstId = new WireId(first, firstGeneration);
+            WireId secondId = new WireId(second, secondGeneration);
+            world.removeWire(firstId);
 
             assertThrows(
                 IllegalStateException.class,
-                () -> world.connectWires(first, firstGeneration, second, secondGeneration)
+                () -> world.connectWires(firstId, secondId)
             );
         }
     }
@@ -155,8 +160,13 @@ final class ElectricalWorldTest {
             ElectricalWorld world = engine.createWorld(30)) {
             int wire = world.addWire();
             int generation = world.wireGeneration(wire);
+            WireId first = new WireId(wire, generation);
+            WireId same = new WireId(wire, generation);
 
-            assertThrows(IllegalArgumentException.class, () -> world.connectWires(wire, generation, wire, generation));
+            assertNotSame(first, same);
+            assertEquals(first, same);
+            assertThrows(IllegalArgumentException.class, () -> world.connectWires(first, same));
+            assertThrows(IllegalArgumentException.class, () -> world.disconnectWires(first, same));
 
             assertDoesNotThrow(world::applyCommands);
         }

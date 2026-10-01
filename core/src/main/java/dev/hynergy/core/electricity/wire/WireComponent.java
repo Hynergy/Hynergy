@@ -39,11 +39,6 @@ public class WireComponent implements Component<ChunkStore> {
                                         .getValidator()
                                         .late()
                         )
-                        .addValidatorLate(
-                                () -> WireConfig.VALIDATOR_CACHE
-                                        .getValidator()
-                                        .late()
-                        )
                         .add()
                         .append(
                                 new KeyedCodec<>("WireId", ElectricalCodecs.WIRE_ID),

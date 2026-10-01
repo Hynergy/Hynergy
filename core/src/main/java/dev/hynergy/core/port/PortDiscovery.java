@@ -3,7 +3,6 @@ package dev.hynergy.core.port;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
 import org.joml.Vector3i;
 
-import java.util.List;
 import java.util.Objects;
 
 /**
@@ -56,7 +55,6 @@ public final class PortDiscovery {
         private int sourceAnchorX;
         private int sourceAnchorY;
         private int sourceAnchorZ;
-        private PortRegistry.RuleSide<?, ?, ?> activeSide;
 
         private int targetX;
         private int targetY;
@@ -129,16 +127,11 @@ public final class PortDiscovery {
                 this.sourceProfile = sourcePort.profile();
                 this.sourceRotation = rotation;
 
-                List<PortRegistry.RuleSide<?, ?, ?>> sides = registry.ruleSidesFor(sourcePort.standard());
                 PortReach reach = sourcePort.reach();
-                for (PortRegistry.RuleSide<?, ?, ?> side : sides) {
-                    activeSide = side;
-                    for (int index = 0; index < reach.size(); index++) {
-                        visitCandidate(reach.x(index), reach.y(index), reach.z(index));
-                    }
+                for (int index = 0; index < reach.size(); index++) {
+                    visitCandidate(reach.x(index), reach.y(index), reach.z(index));
                 }
             } finally {
-                activeSide = null;
                 sourceProfile = null;
                 sourcePort = null;
                 sourceRotation = null;
@@ -174,17 +167,18 @@ public final class PortDiscovery {
             }
 
             targetRotation = Objects.requireNonNull(world.rotation(targetX, targetY, targetZ), "target rotation");
-            PortStandard<?, ?> expectedTarget = activeSide.targetStandard();
 
             for (int index = 0; index < targetDefinition.size(); index++) {
                 PortDefinition<?, ?> targetPort = targetDefinition.portAt(index);
-                if (targetPort.standard() != expectedTarget) {
+                PortRegistry.RuleSide<?, ?, ?> side =
+                        registry.ruleSide(sourcePort.standard(), targetPort.standard());
+                if (side == null) {
                     continue;
                 }
                 if (!targetCanReachSource(targetPort, worldOwnerDx, worldOwnerDy, worldOwnerDz)) {
                     continue;
                 }
-                resolveTarget(worldOwnerDx, worldOwnerDy, worldOwnerDz, targetPort);
+                resolveTarget(worldOwnerDx, worldOwnerDy, worldOwnerDz, targetPort, side);
             }
         }
 
@@ -212,9 +206,9 @@ public final class PortDiscovery {
                 int ownerDx,
                 int ownerDy,
                 int ownerDz,
-                PortDefinition<?, ?> targetPort
+                PortDefinition<?, ?> targetPort,
+                PortRegistry.RuleSide side
         ) {
-            PortRegistry.RuleSide side = activeSide;
             PortRegistry.Rule rule = side.rule();
 
             PortOffset targetAnchor = targetPort.anchor();

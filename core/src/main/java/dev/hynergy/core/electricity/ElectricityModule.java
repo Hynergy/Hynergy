@@ -4,8 +4,10 @@ import com.hypixel.hytale.assetstore.map.DefaultAssetMap;
 import com.hypixel.hytale.builtin.asseteditor.event.AssetEditorRequestDataSetEvent;
 import com.hypixel.hytale.component.ComponentRegistryProxy;
 import com.hypixel.hytale.component.ResourceType;
+import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.logger.HytaleLogger;
 import com.hypixel.hytale.server.core.asset.HytaleAssetStore;
+import com.hypixel.hytale.server.core.plugin.registry.AssetRegistry;
 import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import dev.hynergy.core.HynergyModule;
 import dev.hynergy.core.electricity.wire.WireComponent;
@@ -18,13 +20,17 @@ import dev.hynergy.electrical.ElectricalRuntime;
 import org.joml.Vector3i;
 import org.jspecify.annotations.Nullable;
 
+import java.util.Objects;
 import java.util.logging.Level;
 
 public final class ElectricityModule extends HynergyModule {
 
     private static final HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
 
+    private final PortModule portModule;
     private final ComponentRegistryProxy<ChunkStore> chunkStoreRegistry;
+    private final AssetRegistry assetRegistry;
+    private final EventRegistry eventRegistry;
 
     private @Nullable ElectricalRuntime runtime;
     private @Nullable PortDomain<ElectricalPortConnection> electricalPortDomain;
@@ -32,19 +38,46 @@ public final class ElectricityModule extends HynergyModule {
 
     private boolean started;
 
-
     public ElectricityModule(
-            ComponentRegistryProxy<ChunkStore> chunkStoreRegistry
+            PortModule portModule,
+            ComponentRegistryProxy<ChunkStore> chunkStoreRegistry,
+            AssetRegistry assetRegistry,
+            EventRegistry eventRegistry
     ) {
-        this.chunkStoreRegistry = chunkStoreRegistry;
+        this.portModule = Objects.requireNonNull(portModule, "portModule");
+        this.chunkStoreRegistry = Objects.requireNonNull(chunkStoreRegistry, "chunkStoreRegistry");
+        this.assetRegistry = Objects.requireNonNull(assetRegistry, "assetRegistry");
+        this.eventRegistry = Objects.requireNonNull(eventRegistry, "eventRegistry");
     }
 
     @Override
     public void setup() {
         LOGGER.at(Level.INFO).log("Setting up electricity module");
 
-        PortModule portModule = HYNERGY_PLUGIN.getPortModule();
+        registerPortProtocols();
+        registerSystems();
 
+        chunkStoreRegistry.registerComponent(WireComponent.class, "HynergyWire", WireComponent.CODEC);
+
+        assetRegistry.register(
+                HytaleAssetStore.builder(
+                                WireConfig.class,
+                                new DefaultAssetMap<>()
+                        )
+                        .setPath("Hynergy/Electricity/Wires")
+                        .setCodec(WireConfig.CODEC)
+                        .setKeyFunction(WireConfig::getId)
+                        .build()
+        );
+
+        eventRegistry.register(
+                AssetEditorRequestDataSetEvent.class,
+                WireConfig.DATA_SET,
+                WireConfig::populateDataSet
+        );
+    }
+
+    void registerPortProtocols() {
         electricalPortDomain = portModule.registerDomain("hynergy:electrical");
         conductorPortStandard = portModule.registerStandard(
                 "hynergy:electrical/conductor",
@@ -52,35 +85,12 @@ public final class ElectricityModule extends HynergyModule {
                 ElectricalPortProfile.class,
                 ElectricityModule::resolveConductorConnection
         );
-
-
-        registerSystems();
-
-        chunkStoreRegistry.registerComponent(WireComponent.class, "HynergyWire", WireComponent.CODEC);
-
-        HYNERGY_PLUGIN.getAssetRegistry().register(
-                HytaleAssetStore.builder(
-                                        WireConfig.class,
-                                        new DefaultAssetMap<>()
-                                )
-                                .setPath("Hynergy/Electricity/Wires")
-                                .setCodec(WireConfig.CODEC)
-                                .setKeyFunction(WireConfig::getId)
-                                .build()
-        );
-
-        HYNERGY_PLUGIN.getEventRegistry().register(
-                AssetEditorRequestDataSetEvent.class,
-                WireConfig.DATA_SET,
-                WireConfig::populateDataSet
-        );
     }
-
 
     private void registerSystems() {
         ResourceType<ChunkStore, ElectricalSystemResource> resourceType =
                 chunkStoreRegistry.registerResource(ElectricalSystemResource.class, ElectricalSystemResource::new);
-        
+
         runtime = ElectricalRuntime.create();
 
         chunkStoreRegistry.registerSystem(new ElectricalSystemLifecycleSystem(resourceType));
@@ -117,23 +127,15 @@ public final class ElectricityModule extends HynergyModule {
         return standard;
     }
 
-
-    /**
-     * Creates one asset/runtime definition for a direct electrical conductor port.
-     *
-     * <p>The terminal ID maps this physical block port to the fixed terminal index
-     * of the electrical device represented by the block asset. The generic port
-     * subsystem never interprets that mapping.</p>
-     */
+    /** Creates one runtime definition for a direct electrical conductor port. */
     public PortDefinition<ElectricalPortProfile, ElectricalPortConnection> conductorPort(
             int localPortId,
             PortOffset anchor,
-            int terminalId,
             int normalX,
             int normalY,
             int normalZ
     ) {
-        ElectricalPortProfile profile = new ElectricalPortProfile(terminalId, normalX, normalY, normalZ);
+        ElectricalPortProfile profile = new ElectricalPortProfile(normalX, normalY, normalZ);
         return new PortDefinition<>(
                 localPortId,
                 anchor,

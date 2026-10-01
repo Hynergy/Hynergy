@@ -272,7 +272,7 @@ final class ElectricalWorld implements AutoCloseable {
         wireIds.requireUsable(wireAId.value(), wireAId.generation());
         wireIds.requireUsable(wireBId.value(), wireBId.generation());
 
-        if (wireAId == wireBId) {
+        if (wireAId.equals(wireBId)) {
             throw new IllegalArgumentException("A wire cannot be connected to itself");
         }
 
@@ -285,7 +285,7 @@ final class ElectricalWorld implements AutoCloseable {
         wireIds.requireUsable(wireAId.value(), wireAId.generation());
         wireIds.requireUsable(wireBId.value(), wireBId.generation());
 
-        if (wireAId == wireBId) {
+        if (wireAId.equals(wireBId)) {
             throw new IllegalArgumentException("A wire cannot be disconnected from itself");
         }
 
