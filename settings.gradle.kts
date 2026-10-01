@@ -26,5 +26,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Hynergy"
+rootProject.name = "hynergy"
 include("core", "electrical")
