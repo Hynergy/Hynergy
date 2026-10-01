@@ -1,12 +1,7 @@
 package dev.hynergy.core.electricity;
 
-import com.hypixel.hytale.component.ComponentRegistryProxy;
-import com.hypixel.hytale.event.EventBus;
-import com.hypixel.hytale.event.EventRegistry;
-import com.hypixel.hytale.function.consumer.BooleanConsumer;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.Rotation;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
-import com.hypixel.hytale.server.core.plugin.registry.AssetRegistry;
 import dev.hynergy.core.port.*;
 import org.joml.Vector3i;
 import org.junit.jupiter.api.Test;
@@ -66,36 +61,30 @@ final class ElectricalPortDiscoveryTest {
     }
 
     @Test
-    void conductorPortCarriesLocalIdStandardAndNormal() {
-        PortModule ports = new PortModule();
-        ElectricityModule electricity = createElectricityModule(ports);
-
-        PortDefinition<ElectricalPortProfile, ElectricalPortConnection> port =
-                electricity.conductorPort(7, PortOffset.ZERO, 1, 0, 0);
-
-        assertEquals(7, port.localId());
-        assertEquals(new ElectricalPortProfile(1, 0, 0), port.profile());
-        assertEquals(electricity.conductorPortStandard(), port.standard());
-    }
-
-    @Test
     void pluginStandardCanRegisterAdapterToBuiltInConductorWithoutChangingElectricalModule() {
         PortModule ports = new PortModule();
-        ElectricityModule electricity = createElectricityModule(ports);
 
-        PortDomain<ElectricalPortConnection> domain = electricity.electricalPortDomain();
+        PortStandard<ElectricalPortProfile, ElectricalPortConnection> conductor =
+                registerConductorStandard(ports);
+
+        PortDomain<ElectricalPortConnection> domain = conductor.domain();
+
         record PluginProfile(int kind) {
         }
-        PortStandard<PluginProfile, ElectricalPortConnection> plugin = ports.registerStandard(
-                "plugin:connector",
-                domain,
-                PluginProfile.class,
-                (first, second, geometry) -> null
-        );
+
+        PortStandard<PluginProfile, ElectricalPortConnection> plugin =
+                ports.registerStandard(
+                        "plugin:connector",
+                        domain,
+                        PluginProfile.class,
+                        (first, second, geometry) -> null
+                );
+
         ports.registerAdapter(
                 plugin,
-                electricity.conductorPortStandard(),
-                (pluginProfile, conductor, geometry) -> ElectricalPortConnection.DIRECT
+                conductor,
+                (pluginProfile, conductorProfile, geometry) ->
+                        ElectricalPortConnection.DIRECT
         );
         PortModuleTestAccess.freeze(ports);
         ports.setBlockPorts(1, BlockPortDefinition.of(
@@ -107,9 +96,12 @@ final class ElectricalPortDiscoveryTest {
                         new PluginProfile(1)
                 )
         ));
-        ports.setBlockPorts(2, BlockPortDefinition.of(
-                electricity.conductorPort(1, PortOffset.ZERO, -1, 0, 0)
-        ));
+        ports.setBlockPorts(
+                2,
+                BlockPortDefinition.of(
+                        conductorPort(conductor, 1, -1, 0, 0)
+                )
+        );
         TestWorld world = new TestWorld();
         world.put(0, 0, 0, 1, RotationTuple.NONE);
         world.put(1, 0, 0, 2, RotationTuple.NONE);
@@ -130,17 +122,6 @@ final class ElectricalPortDiscoveryTest {
         assertThrows(IllegalArgumentException.class, () -> new ElectricalPortProfile(2, 0, 0));
     }
 
-    private static ElectricityModule createElectricityModule(PortModule ports) {
-        List<BooleanConsumer> registrations = new ArrayList<>();
-        ElectricityModule electricity = new ElectricityModule(
-                ports,
-                new ComponentRegistryProxy<>(),
-                new AssetRegistry(registrations),
-                new EventRegistry(registrations, () -> true, null, new EventBus(false))
-        );
-        electricity.registerPortProtocols();
-        return electricity;
-    }
 
     private record Fixture(PortModule ports, PortDomain<ElectricalPortConnection> domain, TestWorld world) {
 
@@ -175,24 +156,47 @@ final class ElectricalPortDiscoveryTest {
                 int targetZ
         ) {
             PortModule ports = new PortModule();
-            ElectricityModule electricity = createElectricityModule(ports);
+
+            PortStandard<ElectricalPortProfile, ElectricalPortConnection> conductor =
+                    registerConductorStandard(ports);
+
             PortModuleTestAccess.freeze(ports);
-            ports.setBlockPorts(1, BlockPortDefinition.of(
-                    electricity.conductorPort(
-                            0, PortOffset.ZERO,
-                            sourceNormalX, sourceNormalY, sourceNormalZ
+
+            ports.setBlockPorts(
+                    1,
+                    BlockPortDefinition.of(
+                            conductorPort(
+                                    conductor,
+                                    0,
+                                    sourceNormalX,
+                                    sourceNormalY,
+                                    sourceNormalZ
+                            )
                     )
-            ));
-            ports.setBlockPorts(2, BlockPortDefinition.of(
-                    electricity.conductorPort(
-                            1, PortOffset.ZERO,
-                            targetNormalX, targetNormalY, targetNormalZ
+            );
+
+            ports.setBlockPorts(
+                    2,
+                    BlockPortDefinition.of(
+                            conductorPort(
+                                    conductor,
+                                    1,
+                                    targetNormalX,
+                                    targetNormalY,
+                                    targetNormalZ
+                            )
                     )
-            ));
+            );
+
             TestWorld world = new TestWorld();
             world.put(0, 0, 0, 1, sourceRotation);
             world.put(targetX, targetY, targetZ, 2, targetRotation);
-            return new Fixture(ports, electricity.electricalPortDomain(), world);
+
+            return new Fixture(
+                    ports,
+                    conductor.domain(),
+                    world
+            );
         }
 
         List<ElectricalPortConnection> discover() {
@@ -203,6 +207,36 @@ final class ElectricalPortDiscoveryTest {
             );
             return results;
         }
+    }
+
+    private static PortStandard<ElectricalPortProfile, ElectricalPortConnection>
+    registerConductorStandard(PortModule ports) {
+        PortDomain<ElectricalPortConnection> domain =
+                ports.registerDomain("test:electrical");
+
+        return ports.registerStandard(
+                "test:electrical/conductor",
+                domain,
+                ElectricalPortProfile.class,
+                ElectricityModule::resolveConductorConnection
+        );
+    }
+
+    private static PortDefinition<ElectricalPortProfile, ElectricalPortConnection>
+    conductorPort(
+            PortStandard<ElectricalPortProfile, ElectricalPortConnection> standard,
+            int localId,
+            int normalX,
+            int normalY,
+            int normalZ
+    ) {
+        return new PortDefinition<>(
+                localId,
+                PortOffset.ZERO,
+                PortReach.single(normalX, normalY, normalZ),
+                standard,
+                new ElectricalPortProfile(normalX, normalY, normalZ)
+        );
     }
 
     private static final class TestWorld implements PortWorldView {

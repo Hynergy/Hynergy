@@ -12,7 +12,10 @@ import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import dev.hynergy.core.HynergyModule;
 import dev.hynergy.core.electricity.wire.WireComponent;
 import dev.hynergy.core.electricity.wire.WireConfig;
-import dev.hynergy.core.port.*;
+import dev.hynergy.core.port.PortDomain;
+import dev.hynergy.core.port.PortGeometry;
+import dev.hynergy.core.port.PortModule;
+import dev.hynergy.core.port.PortStandard;
 import dev.hynergy.electrical.Device;
 import dev.hynergy.electrical.DeviceDefinition;
 import dev.hynergy.electrical.DeviceType;
@@ -61,13 +64,13 @@ public final class ElectricityModule extends HynergyModule {
 
         assetRegistry.register(
                 HytaleAssetStore.builder(
-                                WireConfig.class,
-                                new DefaultAssetMap<>()
-                        )
-                        .setPath("Hynergy/Electricity/Wires")
-                        .setCodec(WireConfig.CODEC)
-                        .setKeyFunction(WireConfig::getId)
-                        .build()
+                                        WireConfig.class,
+                                        new DefaultAssetMap<>()
+                                )
+                                .setPath("Hynergy/Electricity/Wires")
+                                .setCodec(WireConfig.CODEC)
+                                .setKeyFunction(WireConfig::getId)
+                                .build()
         );
 
         eventRegistry.register(
@@ -77,7 +80,7 @@ public final class ElectricityModule extends HynergyModule {
         );
     }
 
-    void registerPortProtocols() {
+    private void registerPortProtocols() {
         electricalPortDomain = portModule.registerDomain("hynergy:electrical");
         conductorPortStandard = portModule.registerStandard(
                 "hynergy:electrical/conductor",
@@ -127,25 +130,7 @@ public final class ElectricityModule extends HynergyModule {
         return standard;
     }
 
-    /** Creates one runtime definition for a direct electrical conductor port. */
-    public PortDefinition<ElectricalPortProfile, ElectricalPortConnection> conductorPort(
-            int localPortId,
-            PortOffset anchor,
-            int normalX,
-            int normalY,
-            int normalZ
-    ) {
-        ElectricalPortProfile profile = new ElectricalPortProfile(normalX, normalY, normalZ);
-        return new PortDefinition<>(
-                localPortId,
-                anchor,
-                PortReach.single(normalX, normalY, normalZ),
-                conductorPortStandard(),
-                profile
-        );
-    }
-
-    private static @Nullable ElectricalPortConnection resolveConductorConnection(
+    static @Nullable ElectricalPortConnection resolveConductorConnection(
             ElectricalPortProfile first,
             ElectricalPortProfile second,
             PortGeometry geometry

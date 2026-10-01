@@ -29,10 +29,22 @@ hytaleTools {
     )
 }
 
+
+configurations.named("testImplementation") {
+    extendsFrom(configurations.named("compileOnly").get())
+}
+
+tasks.withType<Test>().configureEach {
+    systemProperty(
+        "java.util.logging.manager",
+        "com.hypixel.hytale.logger.backend.HytaleLogManager"
+    )
+}
+
 dependencies {
     implementation(project(":electrical"))
     compileOnly(libs.jspecify)
-    
+
     compileOnly(libs.lombok)
     annotationProcessor(libs.lombok)
 
