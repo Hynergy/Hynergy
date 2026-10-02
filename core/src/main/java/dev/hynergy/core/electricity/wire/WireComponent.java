@@ -23,34 +23,22 @@ public class WireComponent implements Component<ChunkStore> {
                         .append(
                                 new KeyedCodec<>("Config", Codec.STRING),
                                 WireComponent::setConfigId,
-                                WireComponent::getConfigId
-                        )
-                        .metadata(
-                                new UIEditor(
-                                        new UIEditor.Dropdown(
-                                                WireConfig.DATA_SET
-                                        )
-                                )
-                        )
+                                WireComponent::getConfigId)
+                        .metadata(new UIEditor(new UIEditor.Dropdown(WireConfig.DATA_SET)))
                         .addValidator(Validators.nonNull())
                         .addValidator(Validators.nonEmptyString())
-                        .addValidatorLate(
-                                () -> WireConfig.VALIDATOR_CACHE
-                                        .getValidator()
-                                        .late()
-                        )
+                        .addValidatorLate(() -> WireConfig.VALIDATOR_CACHE.getValidator().late())
                         .add()
                         .append(
                                 new KeyedCodec<>("WireId", ElectricalCodecs.WIRE_ID),
                                 (component, id) -> component.wireId = id,
-                                component -> component.wireId
-                        )
+                                component -> component.wireId)
                         .add()
                         .build();
 
     @Getter @Setter private String configId;
-    @Getter @Setter private @Nullable WireId wireId;
-    @Getter @Setter private transient @Nullable Wire wire;
+    @Getter private @Nullable WireId wireId;
+    @Getter private transient @Nullable Wire wire;
 
     private WireComponent(String configId) {
         this.configId = configId;
@@ -75,5 +63,13 @@ public class WireComponent implements Component<ChunkStore> {
         } catch (CloneNotSupportedException e) {
             throw new AssertionError(e);
         }
+    }
+
+    void setWire(@Nullable Wire wire) {
+        this.wire = wire;
+    }
+
+    void setWireId(@Nullable WireId wireId) {
+        this.wireId = wireId;
     }
 }

@@ -21,10 +21,18 @@ public final class Wire {
         this.wireId = wireId;
     }
 
-    boolean belongsTo(ElectricalSystem system) {
-        return this.system == system;
+    public void connect(Wire other) {
+        system.connect(this, other);
     }
 
+    public void disconnect(Wire other) {
+        system.disconnect(this, other);
+    }
+
+    public void destroy() {
+        system.remove(this);
+    }
+    
     /**
      * Returns the persistent identity of this wire.
      *
@@ -32,5 +40,10 @@ public final class Wire {
      */
     public WireId id() {
         return wireId;
+    }
+
+
+    boolean belongsTo(ElectricalSystem system) {
+        return this.system == system;
     }
 }

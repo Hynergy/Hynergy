@@ -104,7 +104,7 @@ final class WorldIdAllocator {
             case PENDING_ADD -> states[index] = PENDING_ADD_REMOVE;
 
             case PENDING_REMOVE, PENDING_ADD_REMOVE, FREE, RETIRED, UNUSED ->
-                throw new IllegalStateException("World object is not removable");
+                    throw new IllegalStateException("World object is not removable");
 
             default -> throw new IllegalStateException("Unknown world ID state");
         }
@@ -124,7 +124,7 @@ final class WorldIdAllocator {
         if (id > committedHighWaterMark) {
             if (id != highWaterMark) {
                 throw new IllegalStateException(
-                    "Speculative tail allocation is not the high-water ID");
+                        "Speculative tail allocation is not the high-water ID");
             }
 
             pendingCount--;
@@ -152,7 +152,7 @@ final class WorldIdAllocator {
             case PENDING_REMOVE -> {
                 if (pendingCount == 0 || pendingIds[pendingCount - 1] != id) {
                     throw new IllegalStateException(
-                        "Only the most recent pending removal can be cancelled");
+                            "Only the most recent pending removal can be cancelled");
                 }
 
                 pendingCount--;
@@ -161,8 +161,7 @@ final class WorldIdAllocator {
 
             case PENDING_ADD_REMOVE -> states[index] = PENDING_ADD;
 
-            default ->
-                throw new IllegalStateException("World object does not have a pending removal");
+            default -> throw new IllegalStateException("World object does not have a pending removal");
         }
     }
 
@@ -182,8 +181,7 @@ final class WorldIdAllocator {
 
                 case PENDING_REMOVE, PENDING_ADD_REMOVE -> releaseCommitted(id, index);
 
-                default ->
-                    throw new AssertionError("Pending ID state changed after commit preparation");
+                default -> throw new AssertionError("Pending ID state changed after commit preparation");
             }
         }
 

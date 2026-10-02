@@ -160,6 +160,16 @@ public final class ElectricalSystem implements AutoCloseable {
         return new Wire(this, wireId);
     }
 
+
+    public Wire resolveWire(WireId id) {
+        requireUsable();
+        Objects.requireNonNull(id, "id");
+
+        world.requireWire(id);
+
+        return new Wire(this, id);
+    }
+
     void connect(Wire first, Wire second) {
         requireOwned(first);
         requireOwned(second);

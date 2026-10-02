@@ -39,11 +39,11 @@ public final class BlockPortDefinition {
         return null;
     }
 
-    int size() {
+    public int size() {
         return ports.length;
     }
 
-    PortDefinition<?, ?> portAt(int index) {
+    public PortDefinition<?, ?> portAt(int index) {
         return ports[index];
     }
 

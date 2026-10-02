@@ -1,17 +1,24 @@
 package dev.hynergy.core.electricity;
 
+import com.hypixel.hytale.assetstore.event.LoadedAssetsEvent;
+import com.hypixel.hytale.assetstore.event.RemovedAssetsEvent;
+import com.hypixel.hytale.assetstore.map.BlockTypeAssetMap;
 import com.hypixel.hytale.assetstore.map.DefaultAssetMap;
 import com.hypixel.hytale.builtin.asseteditor.event.AssetEditorRequestDataSetEvent;
 import com.hypixel.hytale.component.ComponentRegistryProxy;
+import com.hypixel.hytale.component.ComponentType;
 import com.hypixel.hytale.component.ResourceType;
 import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.logger.HytaleLogger;
 import com.hypixel.hytale.server.core.asset.HytaleAssetStore;
+import com.hypixel.hytale.server.core.asset.type.blocktype.config.BlockType;
 import com.hypixel.hytale.server.core.plugin.registry.AssetRegistry;
 import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import dev.hynergy.core.HynergyModule;
+import dev.hynergy.core.electricity.wire.WireBlockPortDefinitions;
 import dev.hynergy.core.electricity.wire.WireComponent;
 import dev.hynergy.core.electricity.wire.WireConfig;
+import dev.hynergy.core.electricity.wire.WireSystem;
 import dev.hynergy.core.port.PortDomain;
 import dev.hynergy.core.port.PortGeometry;
 import dev.hynergy.core.port.PortModule;
@@ -24,6 +31,7 @@ import org.joml.Vector3i;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 
 public final class ElectricityModule extends HynergyModule {
@@ -38,6 +46,8 @@ public final class ElectricityModule extends HynergyModule {
     private @Nullable ElectricalRuntime runtime;
     private @Nullable PortDomain<ElectricalPortConnection> electricalPortDomain;
     private @Nullable PortStandard<ElectricalPortProfile, ElectricalPortConnection> conductorPortStandard;
+
+    private @Nullable WireBlockPortDefinitions wireBlockPortDefinitions;
 
     private boolean started;
 
@@ -58,9 +68,20 @@ public final class ElectricityModule extends HynergyModule {
         LOGGER.at(Level.INFO).log("Setting up electricity module");
 
         registerPortProtocols();
-        registerSystems();
 
-        chunkStoreRegistry.registerComponent(WireComponent.class, "HynergyWire", WireComponent.CODEC);
+        ComponentType<ChunkStore, WireComponent> wireComponentType =
+                chunkStoreRegistry.registerComponent(
+                        WireComponent.class,
+                        "HynergyWire",
+                        WireComponent.CODEC
+                );
+
+        wireBlockPortDefinitions =
+                new WireBlockPortDefinitions(
+                        portModule,
+                        conductorPortStandard(),
+                        wireComponentType
+                );
 
         assetRegistry.register(
                 HytaleAssetStore.builder(
@@ -78,6 +99,50 @@ public final class ElectricityModule extends HynergyModule {
                 WireConfig.DATA_SET,
                 WireConfig::populateDataSet
         );
+
+
+        eventRegistry.register(
+                LoadedAssetsEvent.class,
+                WireConfig.class,
+                (Consumer<LoadedAssetsEvent<
+                        String,
+                        WireConfig,
+                        DefaultAssetMap<String, WireConfig>
+                        >>) event -> rebuildWireBlockPorts()
+        );
+
+        eventRegistry.register(
+                RemovedAssetsEvent.class,
+                WireConfig.class,
+                (Consumer<RemovedAssetsEvent<
+                        String,
+                        WireConfig,
+                        DefaultAssetMap<String, WireConfig>
+                        >>) event -> rebuildWireBlockPorts()
+        );
+
+
+        eventRegistry.register(
+                LoadedAssetsEvent.class,
+                BlockType.class,
+                (Consumer<LoadedAssetsEvent<
+                        String,
+                        BlockType,
+                        BlockTypeAssetMap<String, BlockType>
+                        >>) event -> rebuildWireBlockPorts()
+        );
+
+        eventRegistry.register(
+                RemovedAssetsEvent.class,
+                BlockType.class,
+                (Consumer<RemovedAssetsEvent<
+                        String,
+                        BlockType,
+                        BlockTypeAssetMap<String, BlockType>
+                        >>) event -> rebuildWireBlockPorts()
+        );
+
+        registerSystems(wireComponentType);
     }
 
     private void registerPortProtocols() {
@@ -90,18 +155,52 @@ public final class ElectricityModule extends HynergyModule {
         );
     }
 
-    private void registerSystems() {
+    private void registerSystems(
+            ComponentType<ChunkStore, WireComponent> wireComponentType
+    ) {
         ResourceType<ChunkStore, ElectricalSystemResource> resourceType =
-                chunkStoreRegistry.registerResource(ElectricalSystemResource.class, ElectricalSystemResource::new);
+                chunkStoreRegistry.registerResource(
+                        ElectricalSystemResource.class,
+                        ElectricalSystemResource::new
+                );
 
         runtime = ElectricalRuntime.create();
 
-        chunkStoreRegistry.registerSystem(new ElectricalSystemLifecycleSystem(resourceType));
-        chunkStoreRegistry.registerSystem(new ElectricalTickSystem(runtime, resourceType));
+        chunkStoreRegistry.registerSystem(
+                new ElectricalSystemLifecycleSystem(resourceType)
+        );
+
+        chunkStoreRegistry.registerSystem(
+                new WireSystem(
+                        runtime,
+                        resourceType,
+                        wireComponentType,
+                        portModule,
+                        electricalPortDomain()
+                )
+        );
+
+        chunkStoreRegistry.registerSystem(
+                new ElectricalTickSystem(runtime, resourceType)
+        );
+    }
+
+    private void rebuildWireBlockPorts() {
+        WireBlockPortDefinitions definitions =
+                wireBlockPortDefinitions;
+
+        if (definitions == null) {
+            throw new IllegalStateException(
+                    "Wire block port definitions are unavailable before module setup"
+            );
+        }
+
+        definitions.rebuild();
     }
 
     @Override
     public void start() {
+        rebuildWireBlockPorts();
         started = true;
     }
 

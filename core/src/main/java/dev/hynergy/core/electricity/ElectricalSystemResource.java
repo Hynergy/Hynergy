@@ -11,7 +11,7 @@ import org.jspecify.annotations.Nullable;
 public class ElectricalSystemResource implements Resource<ChunkStore> {
     private @Nullable ElectricalSystem system;
 
-    ElectricalSystem getOrCreate(ElectricalRuntime runtime, World world) {
+    public ElectricalSystem getOrCreate(ElectricalRuntime runtime, World world) {
         ElectricalSystem system = this.system;
 
         if (system == null) {

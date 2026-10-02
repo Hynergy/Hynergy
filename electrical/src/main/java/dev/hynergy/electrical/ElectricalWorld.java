@@ -228,6 +228,11 @@ final class ElectricalWorld implements AutoCloseable {
         return id;
     }
 
+    void requireWire(WireId id) {
+        requireUsable();
+        wireIds.requireUsable(id.value(), id.generation());
+    }
+
     int wireGeneration(int wireId) {
         requireUsable();
         return wireIds.generation(wireId);
