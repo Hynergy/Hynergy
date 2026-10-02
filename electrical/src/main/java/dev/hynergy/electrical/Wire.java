@@ -1,31 +1,36 @@
 package dev.hynergy.electrical;
 
 /**
- * Identifies one wire in an {@link ElectricalSystem}.
+ * Provides a runtime handle to a wire in an {@link ElectricalSystem}.
  *
  * <p>A wire connects device terminals to the same electrical network.
- * The wire belongs to the system that created it.</p>
+ * Each handle is bound to the electrical system that created or resolved it
+ * and must not be used with another system.</p>
+ *
+ * <p>The {@link WireId} identifies the underlying wire independently of this
+ * Java handle. Persist a wire ID rather than a {@code Wire}; the handle itself
+ * is valid only for the lifetime of its electrical system. After an electrical
+ * world is restored, a new handle can be obtained for the persisted wire ID.</p>
  */
 public final class Wire {
     private final ElectricalSystem system;
-    private final int id;
-    private final int generation;
+    private final WireId wireId;
 
-    Wire(ElectricalSystem system, int id, int generation) {
+    Wire(ElectricalSystem system, WireId wireId) {
         this.system = system;
-        this.id = id;
-        this.generation = generation;
+        this.wireId = wireId;
     }
 
     boolean belongsTo(ElectricalSystem system) {
         return this.system == system;
     }
 
-    int id() {
-        return id;
-    }
-
-    int generation() {
-        return generation;
+    /**
+     * Returns the persistent identity of this wire.
+     *
+     * @return the wire ID
+     */
+    public WireId id() {
+        return wireId;
     }
 }

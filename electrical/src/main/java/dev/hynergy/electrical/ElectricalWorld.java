@@ -77,10 +77,10 @@ final class ElectricalWorld implements AutoCloseable {
 
             try {
                 code = NativeBindings.tickWorld(
-                    world,
-                    subscriptionBuffer.segment(),
-                    subscriptionBuffer.capacity(),
-                    tickResult
+                        world,
+                        subscriptionBuffer.segment(),
+                        subscriptionBuffer.capacity(),
+                        tickResult
                 );
             } catch (RuntimeException | Error failure) {
                 poisoned = true;
@@ -96,23 +96,23 @@ final class ElectricalWorld implements AutoCloseable {
                     poisoned = true;
 
                     throw new IllegalStateException(
-                        "Native world still requires a larger subscription buffer after resize");
+                            "Native world still requires a larger subscription buffer after resize");
                 }
 
                 int requiredCapacity =
-                    tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_REQUIRED_CAPACITY_OFFSET);
+                        tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_REQUIRED_CAPACITY_OFFSET);
 
                 if (requiredCapacity < 0) {
                     throw new IllegalStateException(
-                        "Native subscription count exceeds the supported Java capacity: " + Integer.toUnsignedLong(
-                            requiredCapacity));
+                            "Native subscription count exceeds the supported Java capacity: " + Integer.toUnsignedLong(
+                                    requiredCapacity));
                 }
 
                 if (requiredCapacity <= subscriptionBuffer.capacity()) {
                     poisoned = true;
 
                     throw new IllegalStateException(
-                        "Native world reported an invalid required subscription capacity: " + requiredCapacity);
+                            "Native world reported an invalid required subscription capacity: " + requiredCapacity);
                 }
 
                 subscriptionBuffer.ensureCapacity(requiredCapacity);
@@ -133,7 +133,7 @@ final class ElectricalWorld implements AutoCloseable {
         int requiredCapacity = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_REQUIRED_CAPACITY_OFFSET);
 
         if (recordCount < 0 || requiredCapacity < 0 || recordCount > requiredCapacity
-            || requiredCapacity > subscriptionBuffer.capacity()) {
+                || requiredCapacity > subscriptionBuffer.capacity()) {
             poisoned = true;
 
             throw new IllegalStateException("Native world returned invalid subscription record counts");
@@ -156,7 +156,7 @@ final class ElectricalWorld implements AutoCloseable {
                 int parameterId = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_PARAMETER_ID_OFFSET);
 
                 yield "device " + Integer.toUnsignedLong(deviceId) + " is missing parameter " + Integer.toUnsignedLong(
-                    parameterId);
+                        parameterId);
             }
 
             case TickCode.SINGULAR -> "native solver reported a singular system";
@@ -165,7 +165,7 @@ final class ElectricalWorld implements AutoCloseable {
                 int iterations = tickResult.get(ValueLayout.JAVA_INT, NativeLayouts.TICK_RESULT_ITERATIONS_OFFSET);
 
                 yield "native nonlinear solver did not converge after " + Integer.toUnsignedLong(iterations)
-                    + " iterations";
+                        + " iterations";
             }
 
             case TickCode.NON_FINITE_MATRIX -> "native solver produced a non-finite matrix";
@@ -186,7 +186,7 @@ final class ElectricalWorld implements AutoCloseable {
         };
 
         return new IllegalStateException(
-            "Failed to tick electrical world: " + reason + " (code=" + Integer.toUnsignedLong(code) + ")");
+                "Failed to tick electrical world: " + reason + " (code=" + Integer.toUnsignedLong(code) + ")");
     }
 
 
@@ -238,15 +238,15 @@ final class ElectricalWorld implements AutoCloseable {
         return deviceIds.generation(deviceId);
     }
 
-    void removeWire(int wireId, int generation) {
+    void removeWire(WireId wireId) {
         requireUsable();
 
-        wireIds.remove(wireId, generation);
+        wireIds.remove(wireId.value(), wireId.generation());
 
         try {
-            commandBuffer.removeWire(wireId);
+            commandBuffer.removeWire(wireId.value());
         } catch (RuntimeException | Error failure) {
-            cancelPendingRemove(wireIds, wireId, generation, failure);
+            cancelPendingRemove(wireIds, wireId.value(), wireId.generation(), failure);
 
             throw failure;
         }
@@ -266,52 +266,50 @@ final class ElectricalWorld implements AutoCloseable {
         }
     }
 
-    void connectWires(int wireAId, int wireAGeneration, int wireBId, int wireBGeneration) {
+    void connectWires(WireId wireAId, WireId wireBId) {
         requireUsable();
 
-        wireIds.requireUsable(wireAId, wireAGeneration);
+        wireIds.requireUsable(wireAId.value(), wireAId.generation());
+        wireIds.requireUsable(wireBId.value(), wireBId.generation());
 
-        wireIds.requireUsable(wireBId, wireBGeneration);
-
-        if (wireAId == wireBId) {
+        if (wireAId.equals(wireBId)) {
             throw new IllegalArgumentException("A wire cannot be connected to itself");
         }
 
-        commandBuffer.connectWires(wireAId, wireBId);
+        commandBuffer.connectWires(wireAId.value(), wireBId.value());
     }
 
-    void disconnectWires(int wireAId, int wireAGeneration, int wireBId, int wireBGeneration) {
+    void disconnectWires(WireId wireAId, WireId wireBId) {
         requireUsable();
 
-        wireIds.requireUsable(wireAId, wireAGeneration);
+        wireIds.requireUsable(wireAId.value(), wireAId.generation());
+        wireIds.requireUsable(wireBId.value(), wireBId.generation());
 
-        wireIds.requireUsable(wireBId, wireBGeneration);
-
-        if (wireAId == wireBId) {
+        if (wireAId.equals(wireBId)) {
             throw new IllegalArgumentException("A wire cannot be disconnected from itself");
         }
 
-        commandBuffer.disconnectWires(wireAId, wireBId);
+        commandBuffer.disconnectWires(wireAId.value(), wireBId.value());
     }
 
-    void attachTerminal(int wireId, int wireGeneration, int deviceId, int deviceGeneration, int terminalId) {
+    void attachTerminal(WireId wireId, int deviceId, int deviceGeneration, int terminalId) {
         requireUsable();
 
-        wireIds.requireUsable(wireId, wireGeneration);
+        wireIds.requireUsable(wireId.value(), wireId.generation());
 
         deviceIds.requireUsable(deviceId, deviceGeneration);
 
-        commandBuffer.attachTerminal(wireId, deviceId, terminalId);
+        commandBuffer.attachTerminal(wireId.value(), deviceId, terminalId);
     }
 
-    void detachTerminal(int wireId, int wireGeneration, int deviceId, int deviceGeneration, int terminalId) {
+    void detachTerminal(WireId wireId, int deviceId, int deviceGeneration, int terminalId) {
         requireUsable();
 
-        wireIds.requireUsable(wireId, wireGeneration);
+        wireIds.requireUsable(wireId.value(), wireId.generation());
 
         deviceIds.requireUsable(deviceId, deviceGeneration);
 
-        commandBuffer.detachTerminal(wireId, deviceId, terminalId);
+        commandBuffer.detachTerminal(wireId.value(), deviceId, terminalId);
     }
 
     void setDeviceParameter(int deviceId, int deviceGeneration, int parameterId, double value) {
@@ -350,13 +348,13 @@ final class ElectricalWorld implements AutoCloseable {
                 poisoned = true;
 
                 int commandIndex =
-                    commandResult.get(ValueLayout.JAVA_INT, NativeLayouts.COMMAND_RESULT_COMMAND_INDEX_OFFSET);
+                        commandResult.get(ValueLayout.JAVA_INT, NativeLayouts.COMMAND_RESULT_COMMAND_INDEX_OFFSET);
 
                 int byteOffset = commandResult.get(ValueLayout.JAVA_INT, NativeLayouts.COMMAND_RESULT_BYTE_OFFSET);
 
                 throw new IllegalStateException(
-                    "Native world command application failed: code=" + Integer.toUnsignedLong(code) + ", commandIndex="
-                        + Integer.toUnsignedLong(commandIndex) + ", byteOffset=" + Integer.toUnsignedLong(byteOffset));
+                        "Native world command application failed: code=" + Integer.toUnsignedLong(code) + ", commandIndex="
+                                + Integer.toUnsignedLong(commandIndex) + ", byteOffset=" + Integer.toUnsignedLong(byteOffset));
             }
 
             try {
@@ -366,8 +364,8 @@ final class ElectricalWorld implements AutoCloseable {
                 poisoned = true;
 
                 throw new IllegalStateException(
-                    "Native commands were applied, but Java ID state could " + "not be committed",
-                                                failure
+                        "Native commands were applied, but Java ID state could " + "not be committed",
+                        failure
                 );
             }
         } finally {
@@ -465,7 +463,7 @@ final class ElectricalWorld implements AutoCloseable {
 
     private void handleSubscriptionFailure(String operation, int code) {
         boolean ownershipConsistencyFailure =
-            code == SubscriptionCode.INVALID_SUBSCRIPTION_ID || code == SubscriptionCode.UNKNOWN_SUBSCRIPTION;
+                code == SubscriptionCode.INVALID_SUBSCRIPTION_ID || code == SubscriptionCode.UNKNOWN_SUBSCRIPTION;
 
         String reason = switch (code) {
             case SubscriptionCode.NULL_WORLD -> "native world handle is null";
@@ -496,8 +494,8 @@ final class ElectricalWorld implements AutoCloseable {
         };
 
         throw new SubscriptionOperationException(
-            "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code) + ")",
-            ownershipConsistencyFailure
+                "Failed to " + operation + ": " + reason + " (code=" + Integer.toUnsignedLong(code) + ")",
+                ownershipConsistencyFailure
         );
     }
 
@@ -577,7 +575,6 @@ final class ElectricalWorld implements AutoCloseable {
             throw failure;
         }
     }
-
 
 
     private static final class SubscriptionCode {

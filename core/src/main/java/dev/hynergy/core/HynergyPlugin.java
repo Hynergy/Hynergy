@@ -4,6 +4,8 @@ import com.hypixel.hytale.logger.HytaleLogger;
 import com.hypixel.hytale.server.core.plugin.JavaPlugin;
 import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
 import dev.hynergy.core.electricity.ElectricityModule;
+import dev.hynergy.core.port.PortModule;
+import lombok.Getter;
 import org.jspecify.annotations.NonNull;
 
 import java.util.ArrayList;
@@ -18,6 +20,7 @@ public class HynergyPlugin extends JavaPlugin {
     private static HynergyPlugin INSTANCE;
 
     private final @NonNull List<HynergyModule> modules = new ArrayList<>();
+    @Getter private PortModule portModule;
     public ElectricityModule electricityModule;
 
     public HynergyPlugin(JavaPluginInit init) {
@@ -33,7 +36,14 @@ public class HynergyPlugin extends JavaPlugin {
     protected void setup() {
         LOGGER.at(Level.INFO).log("Setting up Hynergy!");
 
-        this.electricityModule = registerModule(new ElectricityModule(getChunkStoreRegistry()));
+        this.portModule = registerModule(new PortModule());
+        this.electricityModule = registerModule(new ElectricityModule(
+                portModule,
+                getChunkStoreRegistry(),
+                getAssetRegistry(),
+                getEventRegistry()
+        ));
+
         for (HynergyModule module : modules) {
             module.setup();
         }
