@@ -1,4 +1,4 @@
-package dev.hynergy.core.electricity.wire;
+package dev.hynergy.core.electricity.wires;
 
 import com.hypixel.hytale.component.ComponentType;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.BlockType;

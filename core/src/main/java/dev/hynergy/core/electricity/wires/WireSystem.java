@@ -1,4 +1,4 @@
-package dev.hynergy.core.electricity.wire;
+package dev.hynergy.core.electricity.wires;
 
 import com.hypixel.hytale.component.*;
 import com.hypixel.hytale.component.query.Query;
