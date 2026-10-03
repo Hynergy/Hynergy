@@ -1,6 +1,7 @@
 package dev.hynergy.core.port;
 
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -36,7 +37,7 @@ final class PortAssetDefinitionTest {
                 new PortDefinition<>(5, new PortOffset(0, 0, 0), PortReach.single(-1, 0, 0), standard, new Profile("target"))
         ));
 
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
         world.put(1, 0, 0, 2);
         List<Result> results = new ArrayList<>();
@@ -67,7 +68,7 @@ final class PortAssetDefinitionTest {
                 new PortDefinition<>(4, PortOffset.ZERO, PortReach.single(-1, 0, 0), standard, new Profile("first"))
         ));
 
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
         world.put(1, 0, 0, 2);
         assertEquals(List.of(new Result("first")), discover(module, world, domain));
@@ -98,7 +99,7 @@ final class PortAssetDefinitionTest {
                 new PortDefinition<>(1, PortOffset.ZERO, PortReach.single(0, 1, 0), standard, new Profile("target"))
         ));
 
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
         world.put(1, 0, 0, 2);
 
@@ -158,15 +159,21 @@ final class PortAssetDefinitionTest {
     }
 
     private static final class TestWorld implements PortWorldView {
+        private final PortModule module;
+
         private final Map<Position, Integer> blocks = new HashMap<>();
+
+        TestWorld(PortModule module) {
+            this.module = module;
+        }
 
         void put(int x, int y, int z, int blockTypeId) {
             blocks.put(new Position(x, y, z), blockTypeId);
         }
 
         @Override
-        public int blockTypeId(int x, int y, int z) {
-            return blocks.getOrDefault(new Position(x, y, z), -1);
+        public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
+            return module.blockPorts(blocks.getOrDefault(new Position(x, y, z), -1));
         }
 
         @Override

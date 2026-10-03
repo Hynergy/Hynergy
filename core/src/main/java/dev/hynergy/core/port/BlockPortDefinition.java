@@ -4,10 +4,9 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * Immutable port layout for one runtime block type.
+ * Stores a fixed port layout that blocks can share.
  *
- * <p>This is data, not connection state. Asset loaders may replace the definition
- * at runtime; subsequent discovery observes the replacement.</p>
+ * <p>Each port must have a unique local ID within the layout.</p>
  */
 public final class BlockPortDefinition {
     private final PortDefinition<?, ?>[] ports;
@@ -19,8 +18,10 @@ public final class BlockPortDefinition {
     public static BlockPortDefinition of(PortDefinition<?, ?>... ports) {
         Objects.requireNonNull(ports, "ports");
         PortDefinition<?, ?>[] copy = ports.clone();
+
         for (int index = 0; index < copy.length; index++) {
             Objects.requireNonNull(copy[index], "ports[" + index + "]");
+
             for (int previous = 0; previous < index; previous++) {
                 if (copy[previous].localId() == copy[index].localId()) {
                     throw new IllegalArgumentException("Duplicate local port ID: " + copy[index].localId());

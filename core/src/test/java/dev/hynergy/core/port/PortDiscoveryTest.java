@@ -1,6 +1,7 @@
 package dev.hynergy.core.port;
 
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -23,6 +24,37 @@ final class PortDiscoveryTest {
     }
 
     @Test
+    void worldSelectedDefinitionsAreDiscoveredWithoutBlockTypeRegistration() {
+        PortModule module = new PortModule();
+        PortDomain<Result> domain = module.registerDomain("test:domain");
+        PortStandard<Profile, Result> standard = module.registerStandard(
+                "test:standard", domain, Profile.class,
+                (first, second, geometry) -> new Result(first.name() + ":" + second.name())
+        );
+        PortModuleTestAccess.freeze(module);
+        BlockPortDefinition source = BlockPortDefinition.of(port(0, 1, standard, new Profile("source")));
+        BlockPortDefinition target = BlockPortDefinition.of(port(5, -1, standard, new Profile("target")));
+        PortWorldView world = new TestWorld(module) {
+            @Override
+            public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
+                if (y != 0 || z != 0) {
+                    return null;
+                }
+                return switch (x) {
+                    case 0 -> source;
+                    case 1 -> target;
+                    default -> null;
+                };
+            }
+        };
+
+        List<Match> matches = discover(module.discovery(), world, 0, 0, 0, 0, domain);
+
+        assertEquals(List.of(new Match(5, new Result("source:target"), true)), matches);
+        assertTrue(discover(module.discovery(), world, 2, 0, 0, 0, domain).isEmpty());
+    }
+
+    @Test
     void sameStandardConnectionIsDiscovered() {
         PortModule module = new PortModule();
         PortDomain<Result> domain = module.registerDomain("test:domain");
@@ -32,7 +64,7 @@ final class PortDiscoveryTest {
         );
         PortModuleTestAccess.freeze(module);
         installPair(module, standard, new Profile("source"), new Profile("target"));
-        TestWorld world = pairWorld();
+        TestWorld world = pairWorld(module);
 
         List<Match> matches = discover(module.discovery(), world, 0, 0, 0, 0, domain);
 
@@ -58,7 +90,7 @@ final class PortDiscoveryTest {
         module.setBlockPorts(1, BlockPortDefinition.of(port(0, 1, first, new Profile("source"))));
         module.setBlockPorts(2, BlockPortDefinition.of(port(5, -1, second, new OtherProfile("target"))));
 
-        assertTrue(discover(module.discovery(), pairWorld(), 0, 0, 0, 0, domain).isEmpty());
+        assertTrue(discover(module.discovery(), pairWorld(module), 0, 0, 0, 0, domain).isEmpty());
     }
 
     @Test
@@ -85,7 +117,7 @@ final class PortDiscoveryTest {
         PortModuleTestAccess.freeze(module);
         module.setBlockPorts(1, BlockPortDefinition.of(port(3, -1, existing, new OtherProfile("existing"))));
         module.setBlockPorts(2, BlockPortDefinition.of(port(7, 1, plugin, new Profile("plugin"))));
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 2);
         world.put(1, 0, 0, 1);
 
@@ -101,7 +133,7 @@ final class PortDiscoveryTest {
 
 
     @Test
-    void candidateBlockIsReadOnceWhenSourceHasMultipleCompatibleRules() {
+    void candidateDefinitionIsReadOnceWhenSourceHasMultipleCompatibleRules() {
         PortModule module = new PortModule();
         PortDomain<Result> domain = module.registerDomain("test:domain");
         PortStandard<Profile, Result> source = module.registerStandard(
@@ -132,7 +164,7 @@ final class PortDiscoveryTest {
                 port(4, -1, firstTarget, new OtherProfile("first")),
                 port(5, -1, secondTarget, new OtherProfile("second"))
         ));
-        CountingWorld world = new CountingWorld();
+        CountingWorld world = new CountingWorld(module);
         world.put(0, 0, 0, 1);
         world.put(1, 0, 0, 2);
 
@@ -140,8 +172,8 @@ final class PortDiscoveryTest {
 
         assertEquals(2, matches.size());
         assertEquals(List.of(4, 5), matches.stream().map(Match::targetPortId).sorted().toList());
-        assertEquals(1, world.blockTypeReads(0, 0, 0));
-        assertEquals(1, world.blockTypeReads(1, 0, 0));
+        assertEquals(1, world.definitionReads(0, 0, 0));
+        assertEquals(1, world.definitionReads(1, 0, 0));
         assertEquals(1, world.rotationReads(0, 0, 0));
         assertEquals(1, world.rotationReads(1, 0, 0));
     }
@@ -163,7 +195,7 @@ final class PortDiscoveryTest {
         module.setBlockPorts(3, BlockPortDefinition.of(
                 new PortDefinition<>(2, PortOffset.ZERO, PortReach.single(-2, 0, 0), standard, new Profile("accept"))
         ));
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
         world.put(1, 0, 0, 2);
         world.put(2, 0, 0, 3);
@@ -187,7 +219,7 @@ final class PortDiscoveryTest {
         );
         PortModuleTestAccess.freeze(module);
         module.setBlockPorts(1, BlockPortDefinition.of(port(0, 1, standard, new Profile("source"))));
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
 
         assertTrue(discover(module.discovery(), world, 0, 0, 0, 0, domain).isEmpty());
@@ -205,7 +237,7 @@ final class PortDiscoveryTest {
         );
         PortModuleTestAccess.freeze(module);
         module.setBlockPorts(1, BlockPortDefinition.of(port(0, 1, standard, new Profile("source"))));
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
 
         assertThrows(
@@ -225,7 +257,7 @@ final class PortDiscoveryTest {
         );
         PortModuleTestAccess.freeze(module);
         installPair(module, standard, new Profile("source"), new Profile("target"));
-        TestWorld world = pairWorld();
+        TestWorld world = pairWorld(module);
 
         CountDownLatch entered = new CountDownLatch(2);
         CountDownLatch release = new CountDownLatch(1);
@@ -291,8 +323,8 @@ final class PortDiscoveryTest {
         module.setBlockPorts(2, BlockPortDefinition.of(port(5, -1, standard, target)));
     }
 
-    private static TestWorld pairWorld() {
-        TestWorld world = new TestWorld();
+    private static TestWorld pairWorld(PortModule module) {
+        TestWorld world = new TestWorld(module);
         world.put(0, 0, 0, 1);
         world.put(1, 0, 0, 2);
         return world;
@@ -320,15 +352,21 @@ final class PortDiscoveryTest {
     }
 
     private static class TestWorld implements PortWorldView {
+        private final PortModule module;
+
         private final Map<Position, Integer> blocks = new HashMap<>();
+
+        TestWorld(PortModule module) {
+            this.module = module;
+        }
 
         void put(int x, int y, int z, int blockTypeId) {
             blocks.put(new Position(x, y, z), blockTypeId);
         }
 
         @Override
-        public int blockTypeId(int x, int y, int z) {
-            return blocks.getOrDefault(new Position(x, y, z), -1);
+        public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
+            return module.blockPorts(blocks.getOrDefault(new Position(x, y, z), -1));
         }
 
         @Override
@@ -339,14 +377,18 @@ final class PortDiscoveryTest {
 
 
     private static final class CountingWorld extends TestWorld {
-        private final Map<Position, Integer> blockTypeReads = new HashMap<>();
+        private final Map<Position, Integer> definitionReads = new HashMap<>();
         private final Map<Position, Integer> rotationReads = new HashMap<>();
 
+        CountingWorld(PortModule module) {
+            super(module);
+        }
+
         @Override
-        public int blockTypeId(int x, int y, int z) {
+        public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
             Position position = new Position(x, y, z);
-            blockTypeReads.merge(position, 1, Integer::sum);
-            return super.blockTypeId(x, y, z);
+            definitionReads.merge(position, 1, Integer::sum);
+            return super.portsAt(x, y, z);
         }
 
         @Override
@@ -356,8 +398,8 @@ final class PortDiscoveryTest {
             return super.rotation(x, y, z);
         }
 
-        int blockTypeReads(int x, int y, int z) {
-            return blockTypeReads.getOrDefault(new Position(x, y, z), 0);
+        int definitionReads(int x, int y, int z) {
+            return definitionReads.getOrDefault(new Position(x, y, z), 0);
         }
 
         int rotationReads(int x, int y, int z) {

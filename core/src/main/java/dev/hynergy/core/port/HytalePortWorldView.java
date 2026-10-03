@@ -9,32 +9,37 @@ import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Objects;
+import java.util.function.IntFunction;
 
 /**
- * Reads port-discovery block data from already-loaded Hytale chunk sections.
+ * Selects port layouts from block types in loaded Hytale chunk sections.
  *
- * <p>This view never loads or generates chunks. Positions whose section is not
- * currently available are reported as unavailable through a negative block ID.</p>
+ * <p>The supplied lookup maps each block type ID to a port layout. This view
+ * does not load or generate chunks. A position has no discoverable ports if
+ * its section is unavailable.</p>
  */
 public final class HytalePortWorldView implements PortWorldView {
     private final ChunkStore chunkStore;
+    private final IntFunction<@Nullable BlockPortDefinition> blockPorts;
 
-    public HytalePortWorldView(World world) {
-        this(Objects.requireNonNull(world, "world").getChunkStore());
+    public HytalePortWorldView(World world, IntFunction<@Nullable BlockPortDefinition> blockPorts) {
+        this(Objects.requireNonNull(world, "world").getChunkStore(), blockPorts);
     }
 
-    HytalePortWorldView(ChunkStore chunkStore) {
+    HytalePortWorldView(ChunkStore chunkStore, IntFunction<@Nullable BlockPortDefinition> blockPorts) {
         this.chunkStore = Objects.requireNonNull(chunkStore, "chunkStore");
+        this.blockPorts = Objects.requireNonNull(blockPorts, "blockPorts");
     }
 
     @Override
-    public int blockTypeId(int x, int y, int z) {
-        return blockTypeIdFromSection(
-            loadedSection(x, y, z),
-            localCoordinate(x),
-            localCoordinate(y),
-            localCoordinate(z)
+    public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
+        int blockTypeId = blockTypeIdFromSection(
+                loadedSection(x, y, z),
+                localCoordinate(x),
+                localCoordinate(y),
+                localCoordinate(z)
         );
+        return blockTypeId < 0 ? null : blockPorts.apply(blockTypeId);
     }
 
     @Override

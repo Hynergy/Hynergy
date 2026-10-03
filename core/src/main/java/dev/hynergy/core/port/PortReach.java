@@ -4,10 +4,11 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * Immutable bounded broad-phase reach for one logical port.
+ * Defines candidate block positions for one port.
  *
- * <p>Offsets are block-local owner-to-owner candidate positions. Discovery rotates
- * them with the owning block before reading the world.</p>
+ * <p>Each offset locates a candidate block relative to the block that owns the
+ * port. The offsets use the block's local coordinates. Discovery applies the
+ * block rotation to each offset before it reads the world.</p>
  */
 public final class PortReach {
     private final int[] offsets;

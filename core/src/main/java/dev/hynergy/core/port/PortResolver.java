@@ -3,12 +3,10 @@ package dev.hynergy.core.port;
 import org.jspecify.annotations.Nullable;
 
 /**
- * Performs domain-specific narrow-phase resolution for one candidate pair.
+ * Evaluates one candidate port pair.
  *
- * <p>Resolvers should be side-effect free with respect to connection ownership.
- * Returning {@code null} rejects only the current candidate. A non-null result is
- * snapshot information returned to the discovery caller; the Port API does not
- * retain it.</p>
+ * <p>Return {@code null} to reject the pair. Otherwise, return a result for the
+ * consumer. The resolver should not change connection state.</p>
  */
 @FunctionalInterface
 public interface PortResolver<A, B, R> {

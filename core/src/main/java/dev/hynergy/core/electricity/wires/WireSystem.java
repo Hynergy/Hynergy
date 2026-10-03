@@ -253,7 +253,7 @@ public final class WireSystem extends RefSystem<ChunkStore> {
         World world = chunkStore.getWorld();
 
         HytalePortWorldView worldView =
-                new HytalePortWorldView(world);
+                new HytalePortWorldView(world, portModule::blockPorts);
 
         LongOpenHashSet connectedWires =
                 connectionScratch.get();

@@ -4,6 +4,7 @@ import com.hypixel.hytale.server.core.asset.type.blocktype.config.Rotation;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
 import dev.hynergy.core.port.*;
 import org.joml.Vector3i;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -102,7 +103,7 @@ final class ElectricalPortDiscoveryTest {
                         conductorPort(conductor, 1, -1, 0, 0)
                 )
         );
-        TestWorld world = new TestWorld();
+        TestWorld world = new TestWorld(ports);
         world.put(0, 0, 0, 1, RotationTuple.NONE);
         world.put(1, 0, 0, 2, RotationTuple.NONE);
         List<ElectricalPortConnection> results = new ArrayList<>();
@@ -188,7 +189,7 @@ final class ElectricalPortDiscoveryTest {
                     )
             );
 
-            TestWorld world = new TestWorld();
+            TestWorld world = new TestWorld(ports);
             world.put(0, 0, 0, 1, sourceRotation);
             world.put(targetX, targetY, targetZ, 2, targetRotation);
 
@@ -240,8 +241,14 @@ final class ElectricalPortDiscoveryTest {
     }
 
     private static final class TestWorld implements PortWorldView {
+        private final PortModule module;
+
         private final Map<Position, Integer> ids = new HashMap<>();
         private final Map<Position, RotationTuple> rotations = new HashMap<>();
+
+        TestWorld(PortModule module) {
+            this.module = module;
+        }
 
         void put(int x, int y, int z, int blockTypeId, RotationTuple rotation) {
             Position position = new Position(x, y, z);
@@ -250,8 +257,8 @@ final class ElectricalPortDiscoveryTest {
         }
 
         @Override
-        public int blockTypeId(int x, int y, int z) {
-            return ids.getOrDefault(new Position(x, y, z), -1);
+        public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
+            return module.blockPorts(ids.getOrDefault(new Position(x, y, z), -1));
         }
 
         @Override

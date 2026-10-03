@@ -3,7 +3,13 @@ package dev.hynergy.core.port;
 import java.util.Objects;
 
 /**
- * Immutable asset/runtime definition of one logical block port.
+ * Defines one port in a block layout.
+ *
+ * <p>The anchor and reach use the block's local coordinates. The profile supplies
+ * the data required by the port standard.</p>
+ *
+ * @param <P> profile type required by the standard
+ * @param <R> result type for the domain
  */
 public record PortDefinition<P, R>(
         int localId,

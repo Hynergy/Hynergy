@@ -1,9 +1,11 @@
 /**
- * Discovery-only block interaction ports.
+ * Defines ports and discovers compatible port pairs.
  *
- * <p>This package answers which currently exposed endpoints can interact and
- * what a domain-specific resolver says that interaction means. It deliberately
- * does not own connection lifetime: callers choose whether to use results once,
- * cache neighbours, or maintain their own topology.</p>
+ * <p>A world view selects the port layout at each position. Discovery applies
+ * block rotations and checks whether each port can reach the other block.
+ * A registered resolver evaluates each compatible pair and produces a result.</p>
+ *
+ * <p>The caller owns connection state. The caller must check stored results
+ * again after a relevant change to the world or a port layout.</p>
  */
 package dev.hynergy.core.port;

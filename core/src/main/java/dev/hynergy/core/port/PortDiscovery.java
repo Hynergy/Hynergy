@@ -6,21 +6,22 @@ import org.joml.Vector3i;
 import java.util.Objects;
 
 /**
- * Performs bounded, rotation-aware snapshot discovery against frozen protocols
- * and runtime block-port definitions.
+ * Finds compatible port pairs through a {@link PortWorldView}.
  *
- * <p>This class never owns discovered relationships. Runtime block definitions
- * may be replaced between calls; each invocation observes the definitions read
- * during that invocation.</p>
+ * <p>The world view selects the source and target layouts. Discovery applies
+ * block rotations and checks each port's reach before it calls a resolver.
+ * Discovery passes each result to the consumer and does not retain the result.</p>
+ *
+ * <p>Calls on this instance can run on different threads. Each caller must
+ * satisfy the world view's thread restrictions. A nested call on this instance
+ * on the same thread is not permitted.</p>
  */
 public final class PortDiscovery {
     private final PortRegistry registry;
-    private final RuntimePortDefinitions blockPorts;
     private final ThreadLocal<Scratch> scratch = ThreadLocal.withInitial(Scratch::new);
 
-    PortDiscovery(PortRegistry registry, RuntimePortDefinitions blockPorts) {
+    PortDiscovery(PortRegistry registry) {
         this.registry = Objects.requireNonNull(registry, "registry");
-        this.blockPorts = Objects.requireNonNull(blockPorts, "blockPorts");
         if (!registry.isFrozen()) {
             throw new IllegalStateException("Port registry must be frozen before discovery is created");
         }
@@ -35,7 +36,7 @@ public final class PortDiscovery {
             PortDomain<R> domain,
             PortConnectionConsumer<? super R> out
     ) {
-        scratch.get().discover(registry, blockPorts, world, x, y, z, sourcePortId, domain, out);
+        scratch.get().discover(registry, world, x, y, z, sourcePortId, domain, out);
     }
 
     private static final class Scratch {
@@ -43,7 +44,6 @@ public final class PortDiscovery {
         private boolean inUse;
 
         private PortRegistry registry;
-        private RuntimePortDefinitions blockPorts;
         private PortWorldView world;
         private PortConnectionConsumer<Object> output;
         private int sourceX;
@@ -63,7 +63,6 @@ public final class PortDiscovery {
 
         <R> void discover(
                 PortRegistry registry,
-                RuntimePortDefinitions blockPorts,
                 PortWorldView world,
                 int x,
                 int y,
@@ -82,12 +81,7 @@ public final class PortDiscovery {
 
             inUse = true;
             try {
-                int sourceBlockTypeId = world.blockTypeId(x, y, z);
-                if (sourceBlockTypeId < 0) {
-                    return;
-                }
-
-                BlockPortDefinition sourceDefinition = blockPorts.get(sourceBlockTypeId);
+                BlockPortDefinition sourceDefinition = world.portsAt(x, y, z);
                 if (sourceDefinition == null) {
                     return;
                 }
@@ -117,7 +111,6 @@ public final class PortDiscovery {
                 PortConnectionConsumer<Object> rawOutput = (PortConnectionConsumer<Object>) out;
 
                 this.registry = registry;
-                this.blockPorts = blockPorts;
                 this.world = world;
                 this.output = rawOutput;
                 this.sourceX = x;
@@ -138,7 +131,6 @@ public final class PortDiscovery {
                 targetRotation = null;
                 output = null;
                 this.world = null;
-                this.blockPorts = null;
                 this.registry = null;
                 inUse = false;
             }
@@ -156,12 +148,7 @@ public final class PortDiscovery {
             targetY = sourceY + worldOwnerDy;
             targetZ = sourceZ + worldOwnerDz;
 
-            int targetBlockTypeId = world.blockTypeId(targetX, targetY, targetZ);
-            if (targetBlockTypeId < 0) {
-                return;
-            }
-
-            BlockPortDefinition targetDefinition = blockPorts.get(targetBlockTypeId);
+            BlockPortDefinition targetDefinition = world.portsAt(targetX, targetY, targetZ);
             if (targetDefinition == null) {
                 return;
             }

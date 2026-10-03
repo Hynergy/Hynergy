@@ -3,21 +3,24 @@ package dev.hynergy.core.port;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
 
 /**
- * Exact world-oriented pair geometry supplied to a narrow-phase resolver.
+ * Describes a port pair in world coordinates.
  *
- * <p>{@code ownerD*} is the second owner position relative to the first.
- * {@code anchorD*} is the second transformed anchor relative to the first.
- * The first/second ordering is the registered resolver ordering, which can be
- * opposite to the queried source/target ordering for reverse adapter discovery.</p>
+ * <p>{@code ownerDx}, {@code ownerDy}, and {@code ownerDz} locate the second block
+ * relative to the first block. {@code anchorDx}, {@code anchorDy}, and
+ * {@code anchorDz} locate the second rotated anchor relative to the first
+ * rotated anchor.</p>
+ *
+ * <p>The first and second ports follow the resolver argument order. This order
+ * can differ from the discovery source and target order.</p>
  */
 public record PortGeometry(
-    int ownerDx,
-    int ownerDy,
-    int ownerDz,
-    int anchorDx,
-    int anchorDy,
-    int anchorDz,
-    RotationTuple firstRotation,
-    RotationTuple secondRotation
+        int ownerDx,
+        int ownerDy,
+        int ownerDz,
+        int anchorDx,
+        int anchorDy,
+        int anchorDz,
+        RotationTuple firstRotation,
+        RotationTuple secondRotation
 ) {
 }

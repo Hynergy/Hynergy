@@ -2,6 +2,7 @@ package dev.hynergy.core.port;
 
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
 import org.joml.Vector3i;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -13,16 +14,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MechanicalDiscoveryShapeTest {
-    private enum GearSize { SMALL, LARGE }
-    private enum Axis { X, Y, Z }
-    private record GearProfile(int teeth, GearSize size, Axis axis) {}
-    private record MechanicalRelation(int numerator, int denominator) {}
+    private enum GearSize {SMALL, LARGE}
+
+    private enum Axis {X, Y, Z}
+
+    private record GearProfile(int teeth, GearSize size, Axis axis) {
+    }
+
+    private record MechanicalRelation(int numerator, int denominator) {
+    }
 
     @Test
     void smallAndLargeGearCanMeshAtDiagonalOffset() {
         Fixture fixture = Fixture.create(
-            new GearProfile(12, GearSize.SMALL, Axis.Z),
-            new GearProfile(36, GearSize.LARGE, Axis.Z)
+                new GearProfile(12, GearSize.SMALL, Axis.Z),
+                new GearProfile(36, GearSize.LARGE, Axis.Z)
         );
         assertEquals(1, fixture.discover().size());
     }
@@ -30,8 +36,8 @@ final class MechanicalDiscoveryShapeTest {
     @Test
     void smallAndSmallGearDoNotMeshAtThatDiagonalOffset() {
         Fixture fixture = Fixture.create(
-            new GearProfile(12, GearSize.SMALL, Axis.Z),
-            new GearProfile(12, GearSize.SMALL, Axis.Z)
+                new GearProfile(12, GearSize.SMALL, Axis.Z),
+                new GearProfile(12, GearSize.SMALL, Axis.Z)
         );
         assertTrue(fixture.discover().isEmpty());
     }
@@ -39,8 +45,8 @@ final class MechanicalDiscoveryShapeTest {
     @Test
     void largeAndLargeGearDoNotMeshAtThatDiagonalOffset() {
         Fixture fixture = Fixture.create(
-            new GearProfile(36, GearSize.LARGE, Axis.Z),
-            new GearProfile(36, GearSize.LARGE, Axis.Z)
+                new GearProfile(36, GearSize.LARGE, Axis.Z),
+                new GearProfile(36, GearSize.LARGE, Axis.Z)
         );
         assertTrue(fixture.discover().isEmpty());
     }
@@ -48,17 +54,17 @@ final class MechanicalDiscoveryShapeTest {
     @Test
     void validGearResolutionCarriesSignedRatio() {
         MechanicalRelation relation = Fixture.create(
-            new GearProfile(12, GearSize.SMALL, Axis.Z),
-            new GearProfile(36, GearSize.LARGE, Axis.Z)
+                new GearProfile(12, GearSize.SMALL, Axis.Z),
+                new GearProfile(36, GearSize.LARGE, Axis.Z)
         ).discover().getFirst();
         assertEquals(-1, relation.numerator());
         assertEquals(3, relation.denominator());
     }
 
     private static MechanicalRelation resolve(
-        GearProfile first,
-        GearProfile second,
-        PortGeometry geometry
+            GearProfile first,
+            GearProfile second,
+            PortGeometry geometry
     ) {
         if (Math.abs(geometry.ownerDx()) != 1 || Math.abs(geometry.ownerDy()) != 1 || geometry.ownerDz() != 0) {
             return null;
@@ -100,10 +106,11 @@ final class MechanicalDiscoveryShapeTest {
     private static final class Fixture {
         final PortModule module;
         final PortDomain<MechanicalRelation> domain;
-        final TestWorld world = new TestWorld();
+        final TestWorld world;
 
         private Fixture(PortModule module, PortDomain<MechanicalRelation> domain) {
             this.module = module;
+            this.world = new TestWorld(module);
             this.domain = domain;
             world.put(0, 0, 0, 1);
             world.put(1, 1, 0, 2);
@@ -113,21 +120,21 @@ final class MechanicalDiscoveryShapeTest {
             PortModule module = new PortModule();
             PortDomain<MechanicalRelation> domain = module.registerDomain("test:mechanical");
             PortStandard<GearProfile, MechanicalRelation> standard = module.registerStandard(
-                "test:spur-gear",
-                domain,
-                GearProfile.class,
-                MechanicalDiscoveryShapeTest::resolve
+                    "test:spur-gear",
+                    domain,
+                    GearProfile.class,
+                    MechanicalDiscoveryShapeTest::resolve
             );
             PortModuleTestAccess.freeze(module);
             PortReach diagonal = PortReach.of(
-                new PortOffset(1, 1, 0), new PortOffset(1, -1, 0),
-                new PortOffset(-1, 1, 0), new PortOffset(-1, -1, 0)
+                    new PortOffset(1, 1, 0), new PortOffset(1, -1, 0),
+                    new PortOffset(-1, 1, 0), new PortOffset(-1, -1, 0)
             );
             module.setBlockPorts(1, BlockPortDefinition.of(
-                new PortDefinition<>(0, PortOffset.ZERO, diagonal, standard, source)
+                    new PortDefinition<>(0, PortOffset.ZERO, diagonal, standard, source)
             ));
             module.setBlockPorts(2, BlockPortDefinition.of(
-                new PortDefinition<>(1, PortOffset.ZERO, diagonal, standard, target)
+                    new PortDefinition<>(1, PortOffset.ZERO, diagonal, standard, target)
             ));
             return new Fixture(module, domain);
         }
@@ -135,23 +142,29 @@ final class MechanicalDiscoveryShapeTest {
         List<MechanicalRelation> discover() {
             List<MechanicalRelation> relations = new ArrayList<>();
             module.discovery().discover(
-                world, 0, 0, 0, 0, domain,
-                (x, y, z, targetPort, relation, sourceFirst) -> relations.add(relation)
+                    world, 0, 0, 0, 0, domain,
+                    (x, y, z, targetPort, relation, sourceFirst) -> relations.add(relation)
             );
             return relations;
         }
     }
 
     private static final class TestWorld implements PortWorldView {
+        private final PortModule module;
+
         private final Map<Position, Integer> blocks = new HashMap<>();
+
+        TestWorld(PortModule module) {
+            this.module = module;
+        }
 
         void put(int x, int y, int z, int id) {
             blocks.put(new Position(x, y, z), id);
         }
 
         @Override
-        public int blockTypeId(int x, int y, int z) {
-            return blocks.getOrDefault(new Position(x, y, z), -1);
+        public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
+            return module.blockPorts(blocks.getOrDefault(new Position(x, y, z), -1));
         }
 
         @Override
@@ -160,5 +173,6 @@ final class MechanicalDiscoveryShapeTest {
         }
     }
 
-    private record Position(int x, int y, int z) {}
+    private record Position(int x, int y, int z) {
+    }
 }

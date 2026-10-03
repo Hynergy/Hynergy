@@ -3,13 +3,13 @@ package dev.hynergy.core.port;
 import java.util.Objects;
 
 /**
- * Identifies one connection protocol within a {@link PortDomain}.
+ * Identifies a port standard within a {@link PortDomain}.
  *
- * <p>A logical port exposes exactly one standard. Different standards can
- * interoperate only through an adapter registered during setup.</p>
+ * <p>Each port has one standard. Ports with different standards require a
+ * registered adapter to interact.</p>
  *
- * @param <P> typed profile supplied by ports of this standard
- * @param <R> domain resolution type
+ * @param <P> profile type required by the standard
+ * @param <R> result type for the domain
  */
 public final class PortStandard<P, R> {
     private final String id;

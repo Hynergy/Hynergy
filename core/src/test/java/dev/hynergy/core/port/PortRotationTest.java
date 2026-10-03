@@ -3,6 +3,7 @@ package dev.hynergy.core.port;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.Rotation;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.RotationTuple;
 import org.joml.Vector3i;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -14,7 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class PortRotationTest {
-    private record Profile(String name) {}
+    private record Profile(String name) {
+    }
 
     @Test
     void candidateOwnerOffsetRotatesWithSourceBlock() {
@@ -31,7 +33,7 @@ final class PortRotationTest {
         assertEquals(rotated.y(), geometries.getFirst().ownerDy());
         assertEquals(rotated.z(), geometries.getFirst().ownerDz());
     }
-
+  
     @Test
     void sourceAndTargetAnchorsAreRotatedBeforeAnchorDeltaIsBuilt() {
         RotationTuple sourceRotation = RotationTuple.of(Rotation.Ninety, Rotation.None);
@@ -74,12 +76,13 @@ final class PortRotationTest {
     }
 
     private static final class Fixture {
-        final TestWorld world = new TestWorld();
+        final TestWorld world;
         final PortModule module;
         final PortDomain<PortGeometry> domain;
 
         private Fixture(PortModule module, PortDomain<PortGeometry> domain) {
             this.module = module;
+            this.world = new TestWorld(module);
             this.domain = domain;
         }
 
@@ -87,28 +90,28 @@ final class PortRotationTest {
             PortModule module = new PortModule();
             PortDomain<PortGeometry> domain = module.registerDomain("test:rotation");
             PortStandard<Profile, PortGeometry> standard = module.registerStandard(
-                "test:rotation-standard",
-                domain,
-                Profile.class,
-                (first, second, geometry) -> geometry
+                    "test:rotation-standard",
+                    domain,
+                    Profile.class,
+                    (first, second, geometry) -> geometry
             );
             PortModuleTestAccess.freeze(module);
             module.setBlockPorts(1, BlockPortDefinition.of(
-                new PortDefinition<>(
-                    0, sourceAnchor, PortReach.single(1, 0, 0), standard, new Profile("source")
-                )
+                    new PortDefinition<>(
+                            0, sourceAnchor, PortReach.single(1, 0, 0), standard, new Profile("source")
+                    )
             ));
             // Reach is the inverse in the target's local coordinates. For tests with
             // target rotation we derive it exactly from Hytale's transform.
             module.setBlockPorts(2, BlockPortDefinition.of(
-                new PortDefinition<>(
-                    1, targetAnchor, PortReach.of(
-                        new PortOffset(-1, 0, 0),
-                        new PortOffset(1, 0, 0),
-                        new PortOffset(0, 0, -1),
-                        new PortOffset(0, 0, 1)
+                    new PortDefinition<>(
+                            1, targetAnchor, PortReach.of(
+                            new PortOffset(-1, 0, 0),
+                            new PortOffset(1, 0, 0),
+                            new PortOffset(0, 0, -1),
+                            new PortOffset(0, 0, 1)
                     ), standard, new Profile("target")
-                )
+                    )
             ));
             return new Fixture(module, domain);
         }
@@ -116,29 +119,35 @@ final class PortRotationTest {
         List<PortGeometry> discover() {
             List<PortGeometry> geometries = new ArrayList<>();
             module.discovery().discover(
-                world,
-                0,
-                0,
-                0,
-                0,
-                domain,
-                (x, y, z, port, geometry, sourceFirst) -> geometries.add(geometry)
+                    world,
+                    0,
+                    0,
+                    0,
+                    0,
+                    domain,
+                    (x, y, z, port, geometry, sourceFirst) -> geometries.add(geometry)
             );
             return geometries;
         }
     }
 
     private static final class TestWorld implements PortWorldView {
+        private final PortModule module;
+
         private final Map<Position, Block> blocks = new HashMap<>();
+
+        TestWorld(PortModule module) {
+            this.module = module;
+        }
 
         void put(int x, int y, int z, int blockTypeId, RotationTuple rotation) {
             blocks.put(new Position(x, y, z), new Block(blockTypeId, rotation));
         }
 
         @Override
-        public int blockTypeId(int x, int y, int z) {
+        public @Nullable BlockPortDefinition portsAt(int x, int y, int z) {
             Block block = blocks.get(new Position(x, y, z));
-            return block == null ? -1 : block.id();
+            return block == null ? null : module.blockPorts(block.id());
         }
 
         @Override
@@ -147,6 +156,9 @@ final class PortRotationTest {
         }
     }
 
-    private record Position(int x, int y, int z) {}
-    private record Block(int id, RotationTuple rotation) {}
+    private record Position(int x, int y, int z) {
+    }
+
+    private record Block(int id, RotationTuple rotation) {
+    }
 }
